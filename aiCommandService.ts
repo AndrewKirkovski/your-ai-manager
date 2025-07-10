@@ -6,6 +6,7 @@ import {
     updateUserMemory,
     generateShortId, getTask, getRoutine
 } from './userStore';
+import sanitizeHtml from 'sanitize-html';
 
 // Helper to parse attribute string like: key="value" key2="value2"
 function parseAttributes(attrString: string): Record<string, string> {
@@ -43,7 +44,10 @@ const updateRoutine = async (userId: number, routine: Partial<Routine>): Promise
         throw new Error('Routine ID is required to update a routine');
     }
     await updateUserRoutine(userId, routine.id, (r) => {
-       Object.assign(r, routine); 
+       Object.assign(r, {
+           ...routine,
+           requiresAction: routine.requiresAction ?? r.requiresAction,
+       });
     });
     const updated = await getRoutine(userId, routine.id);
     return `✅ Обновлена рутина: "${updated!.name}" (${updated!.cron})`;
@@ -58,6 +62,7 @@ const createTask = async (userId: number, task: Partial<Task>): Promise<string> 
     }
     const newTask: Task = {
         id: generateShortId(),
+        status: 'pending',
         ...task,
     } as Task;
     await addUserTask(userId, newTask);
@@ -69,7 +74,10 @@ const updateTask = async (userId: number, task: Partial<Task>): Promise<string> 
         throw new Error('Task ID is required to update a task');
     }
     await updateUserTask(userId, task.id, (r) => {
-        Object.assign(r, task);
+        Object.assign(r, {
+            ...task,
+            requiresAction: task.requiresAction ?? r.requiresAction,
+        });
     });
     const updated = await getTask(userId, task.id);
     return `✅ Обновлена рутина: "${updated!.name}" (${updated?.pingAt})`;
@@ -109,7 +117,7 @@ export class AICommandService {
             const attrs = parseAttributes(match[1]);
             const routine: Partial<Routine> = {
                 ...attrs,
-                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : true,
+                requiresAction: attrs.requiresAction ? attrs.requiresAction !== 'false' : undefined,
                 name: match[2]
             };
             commands.push(() => createRoutine(userId, routine));
@@ -122,7 +130,7 @@ export class AICommandService {
             const attrs = parseAttributes(match[1]);
             const routine: Partial<Routine> = {
                 ...attrs,
-                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : true,
+                requiresAction: attrs.requiresAction ? attrs.requiresAction !== 'false' : undefined,
                 name: match[2]
             };
             commands.push(() => updateRoutine(userId, routine));
@@ -146,7 +154,7 @@ export class AICommandService {
             const attrs = parseAttributes(match[1]);
             const task: Partial<Task> = {
                 ...attrs,
-                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : false,
+                requiresAction: attrs.requiresAction ? attrs.requiresAction !== 'false' : undefined,
                 name: match[2]
             };
             commands.push(() => createTask(userId, task));
@@ -159,7 +167,7 @@ export class AICommandService {
             const attrs = parseAttributes(match[1]);
             const task: Partial<Task> = {
                 ...attrs,
-                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : false,
+                requiresAction: attrs.requiresAction ? attrs.requiresAction !== 'false' : undefined,
                 name: match[2]
             };
             commands.push(() => updateTask(userId, task));
@@ -222,7 +230,7 @@ export class AICommandService {
         }
 
         // Extend cleanText removal for new tags (simple all-tags strip for safety)
-        const cleanText = text.replace(/<[^>]+>/g, '').replace(/\n\s*\n/g, '\n').trim();
+        const cleanText = sanitizeHtml(text, { allowedTags: [] });
 
         if (commands.length > 0) {
             console.log(`🤖 Total AI commands parsed: ${commands.length}`);
@@ -235,7 +243,6 @@ export class AICommandService {
      * Execute AI commands for a user
      */
     static async executeCommands(userId: number, commands: Array<()=>Promise<string>>): Promise<string[]> {
-        const results: string[] = [];
 
         if (commands.length > 0) {
             console.log(`🚀 Executing ${commands.length} AI commands for user ${userId}`);
