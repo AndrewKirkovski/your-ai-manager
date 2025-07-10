@@ -1,0 +1,30 @@
+{
+  "name": "ai-manager-bot",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "repository": "git@git.spiralscout.com:ryotsuke/ai-managers.git",
+  "author": "Andrei Kirkouski <andrew@spiralscout.com>",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "chrono-node": "^2.8.3",
+    "cron-parser": "^5.3.0",
+    "dotenv": "^17.1.0",
+    "lowdb": "^6.0.1",
+    "node-cron": "^4.2.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "openai": "^5.8.3",
+    "uuid": "^11.1.0"
+  },
+  "scripts": {
+    "start": "tsx index.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.12",
+    "@types/node-telegram-bot-api": "^0.64.9",
+    "@types/uuid": "^10.0.0",
+    "tsup": "^8.0.1",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.5"
+  }
+}
