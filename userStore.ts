@@ -1,20 +1,50 @@
 import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 
-export type ReminderSchedule = {
-    id: string;
-    humanText: string; // "every Monday at 9am", "daily at 2pm"
-    cronExpression?: string; // "0 9 * * 1" for every Monday at 9am
-    nextFireTime?: Date; // calculated next execution time
-    isActive: boolean;
-    reminderText: string; // what to remind about
-    createdAt: Date;
-};
+// Generate shorter IDs (8 characters)
+function generateShortId(): string {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < 8; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+}
+
+export { generateShortId };
 
 export type MessageHistory = {
     role: 'user' | 'assistant';
     content: string;
     timestamp: Date;
+};
+
+export type AnnoyanceLevel = 'low' | 'med' | 'high';
+
+export type Routine = {
+    id: string;
+    name: string;
+    cron: string;                   // cron schedule, always recurring
+    defaultAnnoyance: AnnoyanceLevel;
+    requiresAction: boolean;        // if false – generated tasks auto-complete
+    isActive: boolean;
+    stats: { completed: number; failed: number };
+    createdAt: Date;
+};
+
+export type TaskStatus = 'pending' | 'completed' | 'failed';
+export type Task = {
+    id: string;
+    name: string;
+    routineId?: string;             // undefined => ad-hoc/non-routine task
+    firstTriggered: Date;           // original due time, never changes
+    due: Date;                      // current due time (can be postponed)
+    requiresAction: boolean;
+    status: TaskStatus;
+    annoyance: AnnoyanceLevel;
+    nextPing: Date;                 // scheduler will ping when <= now
+    postponeCount: number;
+    createdAt: Date;
 };
 
 export type UserData = {
@@ -24,7 +54,11 @@ export type UserData = {
         goal: string;
         timezone?: string; // user's timezone, default to UTC
     };
-    reminders: ReminderSchedule[];
+    // NEW collections
+    routines?: Routine[];
+    tasks?: Task[];
+    // Arbitrary key/value memory for AI
+    memory?: Record<string, string>;
     messageHistory: MessageHistory[];
 };
 
@@ -34,10 +68,21 @@ export type DBData = {
 
 const adapter = new JSONFile<DBData>('db.json');
 const db = new Low(adapter, { users: [] });
-await db.read();
+
+// Initialize database
+async function initDB() {
+    await db.read();
+}
+
+// Initialize immediately 
+initDB().catch(console.error);
 
 export async function getUser(userId: number): Promise<UserData | undefined> {
     const user = db.data?.users.find(u => u.userId === userId);
+    if (user) {
+        // Convert string dates back to Date objects
+        parseDatesInUser(user);
+    }
     return user;
 }
 
@@ -52,38 +97,48 @@ export async function setUser(user: UserData): Promise<void> {
 }
 
 export async function getAllUsers(): Promise<UserData[]> {
-    return db.data?.users || [];
+    const users = db.data?.users || [];
+    // Convert string dates back to Date objects for all users
+    users.forEach(user => parseDatesInUser(user));
+    return users;
 }
 
-export async function getUserReminders(userId: number): Promise<ReminderSchedule[]> {
-    const user = await getUser(userId);
-    return user?.reminders || [];
-}
-
-export async function addUserReminder(userId: number, reminder: ReminderSchedule): Promise<void> {
-    const user = await getUser(userId);
-    if (user) {
-        user.reminders.push(reminder);
-        await setUser(user);
+// Helper function to parse dates in user data
+function parseDatesInUser(user: UserData): void {
+    // Parse message history dates
+    if (user.messageHistory) {
+        user.messageHistory.forEach(msg => {
+            if (typeof msg.timestamp === 'string') {
+                msg.timestamp = new Date(msg.timestamp);
+            }
+        });
     }
-}
-
-export async function removeUserReminder(userId: number, reminderId: string): Promise<void> {
-    const user = await getUser(userId);
-    if (user) {
-        user.reminders = user.reminders.filter(r => r.id !== reminderId);
-        await setUser(user);
+    
+    // Parse routine dates
+    if (user.routines) {
+        user.routines.forEach(routine => {
+            if (typeof routine.createdAt === 'string') {
+                routine.createdAt = new Date(routine.createdAt);
+            }
+        });
     }
-}
-
-export async function updateReminderNextFireTime(userId: number, reminderId: string, nextFireTime: Date): Promise<void> {
-    const user = await getUser(userId);
-    if (user) {
-        const reminder = user.reminders.find(r => r.id === reminderId);
-        if (reminder) {
-            reminder.nextFireTime = nextFireTime;
-            await setUser(user);
-        }
+    
+    // Parse task dates
+    if (user.tasks) {
+        user.tasks.forEach(task => {
+            if (typeof task.firstTriggered === 'string') {
+                task.firstTriggered = new Date(task.firstTriggered);
+            }
+            if (typeof task.due === 'string') {
+                task.due = new Date(task.due);
+            }
+            if (typeof task.nextPing === 'string') {
+                task.nextPing = new Date(task.nextPing);
+            }
+            if (typeof task.createdAt === 'string') {
+                task.createdAt = new Date(task.createdAt);
+            }
+        });
     }
 }
 
@@ -114,28 +169,99 @@ export async function getUserMessageHistory(userId: number): Promise<MessageHist
     return user?.messageHistory || [];
 }
 
-export async function cleanupExpiredReminders(userId: number): Promise<string[]> {
+// HELPER: ensure user has arrays initialised (for legacy data)
+function ensureUserCollections(user: UserData): void {
+    if (!user.routines) user.routines = [];
+    if (!user.tasks) user.tasks = [];
+    if (!user.memory) user.memory = {};
+}
+
+// NEW ROUTINE HELPERS -------------------------------------------------------
+export async function getUserRoutines(userId: number): Promise<Routine[]> {
     const user = await getUser(userId);
-    if (!user) return [];
-    
-    const removedReminders: string[] = [];
-    const activeReminders: ReminderSchedule[] = [];
-    
-    for (const reminder of user.reminders) {
-        // Check if reminder is one-time and has already fired
-        if (!reminder.cronExpression && reminder.nextFireTime && reminder.nextFireTime <= new Date()) {
-            // One-time reminder that has fired - mark for removal
-            removedReminders.push(reminder.reminderText);
-        } else if (reminder.isActive) {
-            // Keep active reminders
-            activeReminders.push(reminder);
-        }
+    if (user) {
+        ensureUserCollections(user);
+        return user.routines!;
     }
-    
-    if (removedReminders.length > 0) {
-        user.reminders = activeReminders;
+    return [];
+}
+
+export async function addUserRoutine(userId: number, routine: Routine): Promise<void> {
+    const user = await getUser(userId);
+    if (user) {
+        ensureUserCollections(user);
+        user.routines!.push(routine);
         await setUser(user);
     }
-    
-    return removedReminders;
+}
+
+export async function updateUserRoutine(userId: number, routineId: string, updateFn: (r: Routine) => void): Promise<void> {
+    const user = await getUser(userId);
+    if (user) {
+        ensureUserCollections(user);
+        const r = user.routines!.find(rt => rt.id === routineId);
+        if (r) {
+            updateFn(r);
+            await setUser(user);
+        }
+    }
+}
+
+export async function removeUserRoutine(userId: number, routineId: string): Promise<void> {
+    const user = await getUser(userId);
+    if (user) {
+        ensureUserCollections(user);
+        user.routines = user.routines!.filter(r => r.id !== routineId);
+        await setUser(user);
+    }
+}
+
+// NEW TASK HELPERS ----------------------------------------------------------
+export async function getUserTasks(userId: number): Promise<Task[]> {
+    const user = await getUser(userId);
+    if (user) {
+        ensureUserCollections(user);
+        return user.tasks!;
+    }
+    return [];
+}
+
+export async function addUserTask(userId: number, task: Task): Promise<void> {
+    const user = await getUser(userId);
+    if (user) {
+        ensureUserCollections(user);
+        user.tasks!.push(task);
+        await setUser(user);
+    }
+}
+
+export async function updateUserTask(userId: number, taskId: string, updateFn: (t: Task) => void): Promise<void> {
+    const user = await getUser(userId);
+    if (user) {
+        ensureUserCollections(user);
+        const t = user.tasks!.find(tt => tt.id === taskId);
+        if (t) {
+            updateFn(t);
+            await setUser(user);
+        }
+    }
+}
+
+export async function removeUserTask(userId: number, taskId: string): Promise<void> {
+    const user = await getUser(userId);
+    if (user) {
+        ensureUserCollections(user);
+        user.tasks = user.tasks!.filter(t => t.id !== taskId);
+        await setUser(user);
+    }
+}
+
+// MEMORY HELPERS ------------------------------------------------------------
+export async function updateUserMemory(userId: number, key: string, value: string): Promise<void> {
+    const user = await getUser(userId);
+    if (user) {
+        ensureUserCollections(user);
+        user.memory![key] = value;
+        await setUser(user);
+    }
 }

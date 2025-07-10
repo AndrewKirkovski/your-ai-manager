@@ -12,7 +12,8 @@
     "allowSyntheticDefaultImports": true,
     "noEmit": true
   },
-  "include": ["src/**/*"],
+  "include": ["*.ts"],
+  "exclude": ["node_modules", "dist", ".idea", ".vscode"],
   "ts-node": {
     "experimentalSpecifierResolution": "node"
   }

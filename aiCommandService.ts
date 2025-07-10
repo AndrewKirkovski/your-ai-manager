@@ -1,13 +1,41 @@
-import { ReminderService } from './reminderService';
-import { addUserReminder, removeUserReminder, getUser, setUser } from './userStore';
+import { 
+    getUser, setUser,
+    Routine, Task, AnnoyanceLevel,
+    addUserRoutine, updateUserRoutine, removeUserRoutine,
+    addUserTask, updateUserTask, removeUserTask,
+    updateUserMemory,
+    generateShortId
+} from './userStore';
 
 export interface AICommand {
-    type: 'set-reminder' | 'set-onetime-reminder' | 'update-reminder' | 'delete-reminder' | 'goal';
+    type:        
+        | 'goal'
+        | 'set-routine' | 'update-routine' | 'delete-routine'
+        | 'set-task' | 'update-task' | 'task-complete' | 'task-fail' | 'task-postpone' | 'task-update'
+        | 'update-memory';
+    // Existing fields
     id?: string;
     cron?: string;
-    timestamp?: string; // ISO timestamp for one-time reminders
+    timestamp?: string;
     text?: string;
     goal?: string;
+    // NEW fields for routines/tasks
+    annoyance?: 'low' | 'med' | 'high';
+    requiresAction?: boolean;
+    nextPingMinutes?: number; // for task-update
+    key?: string; // for memory update
+    value?: string; // for memory update
+}
+
+// Helper to parse attribute string like: key="value" key2="value2"
+function parseAttributes(attrString: string): Record<string, string> {
+    const attrs: Record<string, string> = {};
+    const regex = /(\w+)="([^"]*)"/g;
+    let m;
+    while ((m = regex.exec(attrString)) !== null) {
+        attrs[m[1]] = m[2];
+    }
+    return attrs;
 }
 
 export class AICommandService {
@@ -16,71 +44,7 @@ export class AICommandService {
      */
     static parseCommands(text: string): { commands: AICommand[], cleanText: string } {
         const commands: AICommand[] = [];
-        
-        // Set one-time reminder: <set-onetime-reminder timestamp="2025-07-09T14:25:00.000Z">текст</set-onetime-reminder>
-        const setOnetimeReminderRegex = /<set-onetime-reminder\s+timestamp="([^"]+)">([^<]+)<\/set-onetime-reminder>/g;
         let match;
-        while ((match = setOnetimeReminderRegex.exec(text)) !== null) {
-            const command = {
-                type: 'set-onetime-reminder' as const,
-                timestamp: match[1],
-                text: match[2].trim()
-            };
-            commands.push(command);
-            console.log('🤖 AI Command detected - SET ONE-TIME REMINDER:', {
-                timestampValue: command.timestamp,
-                text: command.text,
-                loggedAt: new Date().toISOString()
-            });
-        }
-        
-        // Set recurring reminder: <set-reminder cron="0 8 * * *">текст</set-reminder>
-        const setReminderRegex = /<set-reminder\s+cron="([^"]+)">([^<]+)<\/set-reminder>/g;
-        while ((match = setReminderRegex.exec(text)) !== null) {
-            const command = {
-                type: 'set-reminder' as const,
-                cron: match[1],
-                text: match[2].trim()
-            };
-            commands.push(command);
-            console.log('🤖 AI Command detected - SET RECURRING REMINDER:', {
-                cron: command.cron,
-                text: command.text,
-                timestamp: new Date().toISOString()
-            });
-        }
-
-        // Update reminder: <update-reminder id="uuid" cron="0 9 * * *">новый текст</update-reminder>
-        const updateReminderRegex = /<update-reminder\s+id="([^"]+)"\s+cron="([^"]+)">([^<]+)<\/update-reminder>/g;
-        while ((match = updateReminderRegex.exec(text)) !== null) {
-            const command = {
-                type: 'update-reminder' as const,
-                id: match[1],
-                cron: match[2],
-                text: match[3].trim()
-            };
-            commands.push(command);
-            console.log('🤖 AI Command detected - UPDATE REMINDER:', {
-                id: command.id,
-                cron: command.cron,
-                text: command.text,
-                timestamp: new Date().toISOString()
-            });
-        }
-
-        // Delete reminder: <delete-reminder id="uuid"></delete-reminder>
-        const deleteReminderRegex = /<delete-reminder\s+id="([^"]+)"><\/delete-reminder>/g;
-        while ((match = deleteReminderRegex.exec(text)) !== null) {
-            const command = {
-                type: 'delete-reminder' as const,
-                id: match[1]
-            };
-            commands.push(command);
-            console.log('🤖 AI Command detected - DELETE REMINDER:', {
-                id: command.id,
-                timestamp: new Date().toISOString()
-            });
-        }
 
         // Goal: <goal>новая цель</goal>
         const goalRegex = /<goal>([^<]+)<\/goal>/g;
@@ -96,15 +60,118 @@ export class AICommandService {
             });
         }
 
-        // Clean text by removing all command tags
-        const cleanText = text
-            .replace(setOnetimeReminderRegex, '')
-            .replace(setReminderRegex, '')
-            .replace(updateReminderRegex, '')
-            .replace(deleteReminderRegex, '')
-            .replace(goalRegex, '')
-            .replace(/\n\s*\n/g, '\n') // Remove empty lines
-            .trim();
+        // ---------------- NEW TAGS -------------------
+        // <set-routine cron="..." annoyance="med" requiresAction="true">Name</set-routine>
+        const setRoutineRegex = /<set-routine\s+([^>]*)>([^<]+)<\/set-routine>/g;
+        while ((match = setRoutineRegex.exec(text)) !== null) {
+            const attrs = parseAttributes(match[1]);
+            const command: AICommand = {
+                type: 'set-routine',
+                cron: attrs.cron,
+                annoyance: (attrs.annoyance as AnnoyanceLevel) || 'low',
+                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : true,
+                text: match[2].trim()
+            };
+            commands.push(command);
+            console.log('🤖 AI Command detected - SET ROUTINE:', { ...command, timestamp: new Date().toISOString() });
+        }
+
+        // <update-routine id="..." cron="..." annoyance="high" requiresAction="false">New Name</update-routine>
+        const updateRoutineRegex = /<update-routine\s+([^>]*)>([^<]*)<\/update-routine>/g;
+        while ((match = updateRoutineRegex.exec(text)) !== null) {
+            const attrs = parseAttributes(match[1]);
+            const command: AICommand = {
+                type: 'update-routine',
+                id: attrs.id,
+                cron: attrs.cron,
+                annoyance: attrs.annoyance as AnnoyanceLevel,
+                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : undefined,
+                text: match[2]?.trim()
+            };
+            commands.push(command);
+            console.log('🤖 AI Command detected - UPDATE ROUTINE:', { ...command, timestamp: new Date().toISOString() });
+        }
+
+        // <delete-routine id="uuid"/>
+        const deleteRoutineRegex = /<delete-routine\s+id="([^"]+)"\s*\/>/g;
+        while ((match = deleteRoutineRegex.exec(text)) !== null) {
+            const command: AICommand = {
+                type: 'delete-routine',
+                id: match[1]
+            };
+            commands.push(command);
+            console.log('🤖 AI Command detected - DELETE ROUTINE:', { id: command.id, timestamp: new Date().toISOString() });
+        }
+
+        // <set-task timestamp="..." annoyance="low" requiresAction="false">Name</set-task>
+        const setTaskRegex = /<set-task\s+([^>]*)>([^<]+)<\/set-task>/g;
+        while ((match = setTaskRegex.exec(text)) !== null) {
+            const attrs = parseAttributes(match[1]);
+            const command: AICommand = {
+                type: 'set-task',
+                timestamp: attrs.timestamp,
+                annoyance: attrs.annoyance as AnnoyanceLevel,
+                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : false,
+                text: match[2].trim()
+            };
+            commands.push(command);
+            console.log('🤖 AI Command detected - SET TASK:', { ...command, timestamp: new Date().toISOString() });
+        }
+
+        // <update-task id="uuid" annoyance="high" requiresAction="false"/>
+        const updateTaskRegex = /<update-task\s+([^>]*)>([^<]*)<\/update-task>/g;
+        while ((match = updateTaskRegex.exec(text)) !== null) {
+            const attrs = parseAttributes(match[1]);
+            const command: AICommand = {
+                type: 'update-task',
+                id: attrs.id,
+                annoyance: attrs.annoyance as AnnoyanceLevel,
+                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : undefined,
+                text: match[2]?.trim()
+            };
+            commands.push(command);
+            console.log('🤖 AI Command detected - UPDATE TASK:', { ...command, timestamp: new Date().toISOString() });
+        }
+
+        // <task-complete id="uuid"/>
+        const taskCompleteRegex = /<task-complete\s+id="([^"]+)"\s*\/>/g;
+        while ((match = taskCompleteRegex.exec(text)) !== null) {
+            commands.push({ type: 'task-complete', id: match[1] });
+        }
+
+        // <task-fail id="uuid"/>
+        const taskFailRegex = /<task-fail\s+id="([^"]+)"\s*\/>/g;
+        while ((match = taskFailRegex.exec(text)) !== null) {
+            commands.push({ type: 'task-fail', id: match[1] });
+        }
+
+        // <task-postpone id="uuid" timestamp="ISO"/>
+        const taskPostponeRegex = /<task-postpone\s+id="([^"]+)"\s+timestamp="([^"]+)"\s*\/>/g;
+        while ((match = taskPostponeRegex.exec(text)) !== null) {
+            commands.push({ type: 'task-postpone', id: match[1], timestamp: match[2] });
+        }
+
+        // <task-update id="uuid" nextPingMinutes="30" annoyance="high"/>
+        const taskUpdateRegex = /<task-update\s+([^>]*)\/>/g; // self-closing variant
+        while ((match = taskUpdateRegex.exec(text)) !== null) {
+            const attrs = parseAttributes(match[1]);
+            const command: AICommand = {
+                type: 'task-update',
+                id: attrs.id,
+                nextPingMinutes: attrs.nextPingMinutes ? parseInt(attrs.nextPingMinutes, 10) : undefined,
+                annoyance: attrs.annoyance as AnnoyanceLevel
+            };
+            commands.push(command);
+        }
+
+        // <update-memory key="sleepSchedule" value="23:00-07:00"/>
+        const updateMemoryRegex = /<update-memory\s+key="([^"]+)"\s+value="([^"]+)"\s*\/>/g;
+        while ((match = updateMemoryRegex.exec(text)) !== null) {
+            commands.push({ type: 'update-memory', key: match[1], value: match[2] });
+        }
+
+        // Extend cleanText removal for new tags (simple all-tags strip for safety)
+        const cleanText = text.replace(/<[^>]+>/g, '').replace(/\n\s*\n/g, '\n').trim();
 
         if (commands.length > 0) {
             console.log(`🤖 Total AI commands parsed: ${commands.length}`);
@@ -125,146 +192,7 @@ export class AICommandService {
 
         for (const command of commands) {
             try {
-                switch (command.type) {
-                    case 'set-reminder':
-                        if (command.cron && command.text) {
-                            const reminder = ReminderService.createReminderFromCron(command.cron, command.text);
-                            if (reminder) {
-                                await addUserReminder(userId, reminder);
-                                const successMsg = `✅ Создано напоминание: "${command.text}" (${command.cron})`;
-                                results.push(successMsg);
-                                console.log('✅ SET REMINDER executed:', {
-                                    userId,
-                                    reminderId: reminder.id,
-                                    cron: command.cron,
-                                    text: command.text,
-                                    nextFireTime: reminder.nextFireTime,
-                                    timestamp: new Date().toISOString()
-                                });
-                            } else {
-                                const errorMsg = `❌ Не удалось создать напоминание с cron: "${command.cron}"`;
-                                results.push(errorMsg);
-                                console.error('❌ SET REMINDER failed:', {
-                                    userId,
-                                    cron: command.cron,
-                                    text: command.text,
-                                    error: 'Invalid cron expression',
-                                    timestamp: new Date().toISOString()
-                                });
-                            }
-                        }
-                        break;
-
-                    case 'set-onetime-reminder':
-                        if (command.timestamp && command.text) {
-                            const reminder = ReminderService.createReminderFromTimestamp(command.timestamp, command.text);
-                            if (reminder) {
-                                await addUserReminder(userId, reminder);
-                                const successMsg = `✅ Создано одноразовое напоминание: "${command.text}" (${command.timestamp})`;
-                                results.push(successMsg);
-                                console.log('✅ SET ONE-TIME REMINDER executed:', {
-                                    userId,
-                                    reminderId: reminder.id,
-                                    timestampValue: command.timestamp,
-                                    text: command.text,
-                                    nextFireTime: reminder.nextFireTime,
-                                    loggedAt: new Date().toISOString()
-                                });
-                            } else {
-                                const errorMsg = `❌ Не удалось создать одноразовое напоминание с timestamp: "${command.timestamp}"`;
-                                results.push(errorMsg);
-                                console.error('❌ SET ONE-TIME REMINDER failed:', {
-                                    userId,
-                                    timestampValue: command.timestamp,
-                                    text: command.text,
-                                    error: 'Invalid timestamp',
-                                    loggedAt: new Date().toISOString()
-                                });
-                            }
-                        }
-                        break;
-
-                    case 'update-reminder':
-                        if (command.id && command.cron && command.text) {
-                            const user = await getUser(userId);
-                            if (user) {
-                                const existingReminder = user.reminders.find(r => r.id === command.id);
-                                if (existingReminder) {
-                                    const newReminder = ReminderService.createReminderFromCron(command.cron, command.text);
-                                    if (newReminder) {
-                                        // Keep the original ID and creation date
-                                        newReminder.id = command.id;
-                                        newReminder.createdAt = existingReminder.createdAt;
-                                        
-                                        // Remove old and add updated
-                                        user.reminders = user.reminders.filter(r => r.id !== command.id);
-                                        user.reminders.push(newReminder);
-                                        await setUser(user);
-                                        
-                                        const successMsg = `✅ Обновлено напоминание: "${command.text}" (${command.cron})`;
-                                        results.push(successMsg);
-                                        console.log('✅ UPDATE REMINDER executed:', {
-                                            userId,
-                                            reminderId: command.id,
-                                            oldText: existingReminder.reminderText,
-                                            newText: command.text,
-                                            oldCron: existingReminder.cronExpression,
-                                            newCron: command.cron,
-                                            timestamp: new Date().toISOString()
-                                        });
-                                    } else {
-                                        const errorMsg = `❌ Не удалось обновить напоминание с cron: "${command.cron}"`;
-                                        results.push(errorMsg);
-                                        console.error('❌ UPDATE REMINDER failed:', {
-                                            userId,
-                                            reminderId: command.id,
-                                            cron: command.cron,
-                                            error: 'Invalid cron expression',
-                                            timestamp: new Date().toISOString()
-                                        });
-                                    }
-                                } else {
-                                    const errorMsg = `❌ Напоминание с ID ${command.id} не найдено`;
-                                    results.push(errorMsg);
-                                    console.error('❌ UPDATE REMINDER failed:', {
-                                        userId,
-                                        reminderId: command.id,
-                                        error: 'Reminder not found',
-                                        timestamp: new Date().toISOString()
-                                    });
-                                }
-                            }
-                        }
-                        break;
-
-                    case 'delete-reminder':
-                        if (command.id) {
-                            const user = await getUser(userId);
-                            if (user) {
-                                const reminderToDelete = user.reminders.find(r => r.id === command.id);
-                                if (reminderToDelete) {
-                                    await removeUserReminder(userId, command.id);
-                                    const successMsg = `✅ Удалено напоминание: "${reminderToDelete.reminderText}"`;
-                                    results.push(successMsg);
-                                    console.log('✅ DELETE REMINDER executed:', {
-                                        userId,
-                                        reminderId: command.id,
-                                        deletedText: reminderToDelete.reminderText,
-                                        timestamp: new Date().toISOString()
-                                    });
-                                } else {
-                                    const errorMsg = `❌ Напоминание с ID ${command.id} не найдено`;
-                                    results.push(errorMsg);
-                                    console.error('❌ DELETE REMINDER failed:', {
-                                        userId,
-                                        reminderId: command.id,
-                                        error: 'Reminder not found',
-                                        timestamp: new Date().toISOString()
-                                    });
-                                }
-                            }
-                        }
-                        break;
+                switch (command.type) {                   
 
                     case 'goal':
                         if (command.goal) {
@@ -284,6 +212,124 @@ export class AICommandService {
                             }
                         }
                         break;
+                    case 'set-routine': {
+                        if (command.cron && command.text) {
+                            const routine: Routine = {
+                                id: generateShortId(),
+                                name: command.text,
+                                cron: command.cron,
+                                defaultAnnoyance: command.annoyance || 'low',
+                                requiresAction: command.requiresAction ?? true,
+                                isActive: true,
+                                stats: { completed: 0, failed: 0 },
+                                createdAt: new Date()
+                            };
+                            await addUserRoutine(userId, routine);
+                            results.push(`✅ Создана рутина: "${routine.name}" (${routine.cron})`);
+                        }
+                        break;
+                    }
+                    case 'update-routine': {
+                        if (command.id) {
+                            await updateUserRoutine(userId, command.id, (r) => {
+                                if (command.cron) r.cron = command.cron;
+                                if (command.annoyance) r.defaultAnnoyance = command.annoyance as AnnoyanceLevel;
+                                if (command.requiresAction !== undefined) r.requiresAction = command.requiresAction;
+                                if (command.text) r.name = command.text;
+                            });
+                            results.push(`✅ Обновлена рутина: ${command.text}`);
+                        }
+                        break;
+                    }
+                    case 'delete-routine': {
+                        if (command.id) {
+                            await removeUserRoutine(userId, command.id);
+                            results.push(`✅ Удалена рутина: ${command.text}`);
+                        }
+                        break;
+                    }
+                    case 'set-task': {
+                        if (command.timestamp && command.text) {
+                            const due = new Date(command.timestamp);
+                            const task: Task = {
+                                id: generateShortId(),
+                                name: command.text,
+                                routineId: undefined,
+                                firstTriggered: due,
+                                due,
+                                requiresAction: command.requiresAction ?? false,
+                                status: (command.requiresAction ?? false) ? 'pending' : 'completed',
+                                annoyance: command.annoyance || 'low',
+                                nextPing: due,
+                                postponeCount: 0,
+                                createdAt: new Date()
+                            };
+                            await addUserTask(userId, task);
+                            results.push(`✅ Создана задача: "${task.name}" (${due.toLocaleString('ru-RU')})`);
+                        }
+                        break;
+                    }
+                    case 'update-task': {
+                        if (command.id) {
+                            await updateUserTask(userId, command.id, (t) => {
+                                if (command.annoyance) t.annoyance = command.annoyance;
+                                if (command.requiresAction !== undefined) t.requiresAction = command.requiresAction;
+                                if (command.text) t.name = command.text;
+                            });
+                            results.push(`✅ Обновлена задача: ${command.text}`);
+                        }
+                        break;
+                    }
+                    case 'task-complete': {
+                        if (command.id) {
+                            await updateUserTask(userId, command.id, (t) => {
+                                t.status = 'completed';
+                            });
+                            results.push(`✅ Задача выполнена: ${command.text}`);
+                        }
+                        break;
+                    }
+                    case 'task-fail': {
+                        if (command.id) {
+                            await updateUserTask(userId, command.id, (t) => {
+                                t.status = 'failed';
+                            });
+                            results.push(`⚠️ Задача провалена: ${command.text}`);
+                        }
+                        break;
+                    }
+                    case 'task-postpone': {
+                        if (command.id && command.timestamp) {
+                            const newDate = new Date(command.timestamp);
+                            await updateUserTask(userId, command.id, (t) => {
+                                t.due = newDate;
+                                t.nextPing = newDate;
+                                t.postponeCount += 1;
+                            });
+                            results.push(`🔄 Задача перенесена: ${command.text} → ${newDate.toLocaleString('ru-RU')}`);
+                        }
+                        break;
+                    }
+                    case 'task-update': {
+                        if (command.id) {
+                            await updateUserTask(userId, command.id, (t) => {
+                                if (command.annoyance) t.annoyance = command.annoyance;
+                                if (command.nextPingMinutes !== undefined) {
+                                    const next = new Date(Date.now() + command.nextPingMinutes * 60000);
+                                    t.nextPing = next;
+                                }
+                            });
+                            results.push(`✅ Обновлены параметры задачи: ${command.text}`);
+                        }
+                        break;
+                    }
+                    case 'update-memory': {
+                        if (command.key && command.value) {
+                            await updateUserMemory(userId, command.key, command.value);
+                            results.push(`💾 Обновлена память: ${command.key}`);
+                        }
+                        break;
+                    }
                 }
             } catch (error) {
                 console.error(`❌ Error executing AI command:`, {
