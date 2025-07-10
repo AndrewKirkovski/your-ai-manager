@@ -145,7 +145,7 @@ async function generateAIResponse(userId: number, userMessage: string): Promise<
         
         // Add both user message and AI response to history
         await addMessageToHistory(userId, 'user', userMessage);
-        await addMessageToHistory(userId, 'assistant', message);
+        await addMessageToHistory(userId, 'assistant', aiResponse);
         
         console.log('📝 Messages added to history:', {
             userId,
@@ -274,7 +274,7 @@ cron.schedule('* * * * *', async () => {
                     console.log(aiResponse);
                     // Send message to user
                     await bot.sendMessage(user.chatId, cleanMessage);
-                    await addMessageToHistory(user.userId, 'assistant', cleanMessage);
+                    await addMessageToHistory(user.chatId, 'assistant', aiResponse);
 
 
                 }
@@ -335,6 +335,7 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
         const aiResponse = await generateMessage(GOAL_SET_PROMPT(newGoal));
         const { message: updateMessage } = await AICommandService.processAIResponse(userId, aiResponse);
         console.log(aiResponse);
+        await addMessageToHistory(userId, 'assistant', aiResponse);
         await bot.sendMessage(msg.chat.id, updateMessage);
 
     } catch (error) {
@@ -376,6 +377,7 @@ bot.onText(/\/cleargoal/, async (msg) => {
         const aiResponse = await generateMessage(GOAL_CLEAR_PROMPT());
         const { message: clearMessage } = await AICommandService.processAIResponse(userId, aiResponse);
         console.log(aiResponse);
+        await addMessageToHistory(userId, 'assistant', aiResponse);
         await bot.sendMessage(msg.chat.id, clearMessage);
 
     } catch (error) {
@@ -533,6 +535,7 @@ bot.on('message', async (msg) => {
             const aiResponse = await generateMessage(GREETING_PROMPT);
             const { message: greetingMessage } = await AICommandService.processAIResponse(userId, aiResponse);
             console.log(aiResponse);
+            await addMessageToHistory(userId, 'assistant', aiResponse);
             await bot.sendMessage(msg.chat.id, greetingMessage);
             return;
         }
@@ -559,7 +562,7 @@ bot.on('message', async (msg) => {
             const aiResponse = await generateMessage(GOAL_ACCEPTED_PROMPT(text));
             const { message: acceptedMessage } = await AICommandService.processAIResponse(userId, aiResponse);
             console.log(aiResponse);
-            await addMessageToHistory(userId, 'assistant', acceptedMessage);
+            await addMessageToHistory(userId, 'assistant', aiResponse);
             await bot.sendMessage(msg.chat.id, acceptedMessage);
             return;
         }

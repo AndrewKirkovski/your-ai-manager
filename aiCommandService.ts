@@ -113,7 +113,7 @@ export class AICommandService {
                 name: match[2]
             };
             commands.push(() => createRoutine(userId, routine));
-            console.log('🤖 SET ROUTINE:', routine, new Date().toISOString());
+            console.log('🤖 SET ROUTINE:', routine, attrs, new Date().toISOString());
         }
 
         // <update-routine id="..." cron="..." annoyance="high" requiresAction="false">New Name</update-routine>
@@ -126,7 +126,7 @@ export class AICommandService {
                 name: match[2]
             };
             commands.push(() => updateRoutine(userId, routine));
-            console.log('🤖 UPDATE ROUTINE:', routine, new Date().toISOString());
+            console.log('🤖 UPDATE ROUTINE:', routine, attrs, new Date().toISOString());
         }
 
         // <delete-routine id="uuid"/>
@@ -147,11 +147,10 @@ export class AICommandService {
             const task: Partial<Task> = {
                 ...attrs,
                 requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : false,
-                pingAt: attrs.timestamp ? new Date(attrs.timestamp) : undefined,
                 name: match[2]
             };
             commands.push(() => createTask(userId, task));
-            console.log('🤖 NEW TASK:', task, new Date().toISOString());
+            console.log('🤖 NEW TASK:', task, attrs, new Date().toISOString());
         }
 
         // <update-task id="uuid" annoyance="high" requiresAction="false"/>
@@ -164,7 +163,7 @@ export class AICommandService {
                 name: match[2]
             };
             commands.push(() => updateTask(userId, task));
-            console.log('🤖 UPDATE TASK:', task, new Date().toISOString());
+            console.log('🤖 UPDATE TASK:', task, attrs, new Date().toISOString());
         }
 
         // <task-complete id="uuid"/>
