@@ -1,31 +1,11 @@
-import { 
+import {
     getUser, setUser,
-    Routine, Task, AnnoyanceLevel,
+    Routine, Task,
     addUserRoutine, updateUserRoutine, removeUserRoutine,
     addUserTask, updateUserTask, removeUserTask,
     updateUserMemory,
-    generateShortId
+    generateShortId, getTask, getRoutine
 } from './userStore';
-
-export interface AICommand {
-    type:        
-        | 'goal'
-        | 'set-routine' | 'update-routine' | 'delete-routine'
-        | 'set-task' | 'update-task' | 'task-complete' | 'task-fail' | 'task-postpone' | 'task-update'
-        | 'update-memory';
-    // Existing fields
-    id?: string;
-    cron?: string;
-    timestamp?: string;
-    text?: string;
-    goal?: string;
-    // NEW fields for routines/tasks
-    annoyance?: 'low' | 'med' | 'high';
-    requiresAction?: boolean;
-    nextPingMinutes?: number; // for task-update
-    key?: string; // for memory update
-    value?: string; // for memory update
-}
 
 // Helper to parse attribute string like: key="value" key2="value2"
 function parseAttributes(attrString: string): Record<string, string> {
@@ -38,26 +18,88 @@ function parseAttributes(attrString: string): Record<string, string> {
     return attrs;
 }
 
+const createRoutine = async (userId: number, routine: Partial<Routine>): Promise<string> => {
+    if(!routine.cron) {
+        throw new Error('Cron schedule is required to create a routine');
+    }
+    if(!routine.name) {
+        throw new Error('Routine name is required');
+    }
+    const newRoutine: Routine = {
+        id: generateShortId(),
+        defaultAnnoyance: routine.defaultAnnoyance || 'low',
+        requiresAction: routine.requiresAction ?? true,
+        isActive: true,
+        stats: { completed: 0, failed: 0 },
+        createdAt: new Date(),
+        ...routine,
+    } as Routine;
+    await addUserRoutine(userId, newRoutine);
+    return `✅ Создана рутина: "${newRoutine.name}" (${newRoutine.cron})`;
+}
+
+const updateRoutine = async (userId: number, routine: Partial<Routine>): Promise<string> => {
+    if(!routine.id) {
+        throw new Error('Routine ID is required to update a routine');
+    }
+    await updateUserRoutine(userId, routine.id, (r) => {
+       Object.assign(r, routine); 
+    });
+    const updated = await getRoutine(userId, routine.id);
+    return `✅ Обновлена рутина: "${updated!.name}" (${updated!.cron})`;
+}
+
+const createTask = async (userId: number, task: Partial<Task>): Promise<string> => {
+    if(!task.pingAt) {
+        throw new Error('Next ping time is required to create a task');
+    }
+    if(!task.name) {
+        throw new Error('Task name is required');
+    }
+    const newTask: Task = {
+        id: generateShortId(),
+        ...task,
+    } as Task;
+    await addUserTask(userId, newTask);
+    return `✅ Запланировано: "${newTask.name}" (${newTask.pingAt})`;
+}
+
+const updateTask = async (userId: number, task: Partial<Task>): Promise<string> => {
+    if(!task.id) {
+        throw new Error('Task ID is required to update a task');
+    }
+    await updateUserTask(userId, task.id, (r) => {
+        Object.assign(r, task);
+    });
+    const updated = await getTask(userId, task.id);
+    return `✅ Обновлена рутина: "${updated!.name}" (${updated?.pingAt})`;
+}
+
+const updateGoal = async (userId: number, goal: string): Promise<string> => {
+    const user = await getUser(userId);
+    if (!user) {
+        throw new Error(`User with ID ${userId} not found`);
+    }
+    const oldGoal = user.preferences.goal;
+    user.preferences.goal = goal;
+    await setUser(user);
+    return `✅ Цель: "${goal}" (была: "${oldGoal}")`;
+}
+
 export class AICommandService {
     /**
      * Parse AI commands from generated text
      */
-    static parseCommands(text: string): { commands: AICommand[], cleanText: string } {
-        const commands: AICommand[] = [];
+    static generateCommands(userId: number, text: string): { commands: Array<()=>Promise<string>>, cleanText: string } {
+        const commands: Array<()=>Promise<string>> = [];
         let match;
 
         // Goal: <goal>новая цель</goal>
         const goalRegex = /<goal>([^<]+)<\/goal>/g;
         while ((match = goalRegex.exec(text)) !== null) {
-            const command = {
-                type: 'goal' as const,
-                goal: match[1].trim()
-            };
-            commands.push(command);
-            console.log('🤖 AI Command detected - SET GOAL:', {
-                goal: command.goal,
-                timestamp: new Date().toISOString()
-            });
+            const goal = match[1].trim();
+            commands.push(()=>updateGoal(userId, goal));
+            console.log('🤖 AI SET GOAL:', goal, new Date().toISOString());
         }
 
         // ---------------- NEW TAGS -------------------
@@ -65,109 +107,119 @@ export class AICommandService {
         const setRoutineRegex = /<set-routine\s+([^>]*)>([^<]+)<\/set-routine>/g;
         while ((match = setRoutineRegex.exec(text)) !== null) {
             const attrs = parseAttributes(match[1]);
-            const command: AICommand = {
-                type: 'set-routine',
-                cron: attrs.cron,
-                annoyance: (attrs.annoyance as AnnoyanceLevel) || 'low',
+            const routine: Partial<Routine> = {
+                ...attrs,
                 requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : true,
-                text: match[2].trim()
+                name: match[2]
             };
-            commands.push(command);
-            console.log('🤖 AI Command detected - SET ROUTINE:', { ...command, timestamp: new Date().toISOString() });
+            commands.push(() => createRoutine(userId, routine));
+            console.log('🤖 SET ROUTINE:', routine, new Date().toISOString());
         }
 
         // <update-routine id="..." cron="..." annoyance="high" requiresAction="false">New Name</update-routine>
         const updateRoutineRegex = /<update-routine\s+([^>]*)>([^<]*)<\/update-routine>/g;
         while ((match = updateRoutineRegex.exec(text)) !== null) {
             const attrs = parseAttributes(match[1]);
-            const command: AICommand = {
-                type: 'update-routine',
-                id: attrs.id,
-                cron: attrs.cron,
-                annoyance: attrs.annoyance as AnnoyanceLevel,
-                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : undefined,
-                text: match[2]?.trim()
+            const routine: Partial<Routine> = {
+                ...attrs,
+                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : true,
+                name: match[2]
             };
-            commands.push(command);
-            console.log('🤖 AI Command detected - UPDATE ROUTINE:', { ...command, timestamp: new Date().toISOString() });
+            commands.push(() => updateRoutine(userId, routine));
+            console.log('🤖 UPDATE ROUTINE:', routine, new Date().toISOString());
         }
 
         // <delete-routine id="uuid"/>
         const deleteRoutineRegex = /<delete-routine\s+id="([^"]+)"\s*\/>/g;
         while ((match = deleteRoutineRegex.exec(text)) !== null) {
-            const command: AICommand = {
-                type: 'delete-routine',
-                id: match[1]
-            };
-            commands.push(command);
-            console.log('🤖 AI Command detected - DELETE ROUTINE:', { id: command.id, timestamp: new Date().toISOString() });
+            const id = match[1];
+            commands.push(async ()=> {
+                await removeUserRoutine(userId, id)
+                return `✅ Удалена рутина: ${id}`;
+            });
+            console.log('🤖 AI DELETE ROUTINE:', id , new Date().toISOString());
         }
 
         // <set-task timestamp="..." annoyance="low" requiresAction="false">Name</set-task>
         const setTaskRegex = /<set-task\s+([^>]*)>([^<]+)<\/set-task>/g;
         while ((match = setTaskRegex.exec(text)) !== null) {
             const attrs = parseAttributes(match[1]);
-            const command: AICommand = {
-                type: 'set-task',
-                timestamp: attrs.timestamp,
-                annoyance: attrs.annoyance as AnnoyanceLevel,
+            const task: Partial<Task> = {
+                ...attrs,
                 requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : false,
-                text: match[2].trim()
+                pingAt: attrs.timestamp ? new Date(attrs.timestamp) : undefined,
+                name: match[2]
             };
-            commands.push(command);
-            console.log('🤖 AI Command detected - SET TASK:', { ...command, timestamp: new Date().toISOString() });
+            commands.push(() => createTask(userId, task));
+            console.log('🤖 NEW TASK:', task, new Date().toISOString());
         }
 
         // <update-task id="uuid" annoyance="high" requiresAction="false"/>
         const updateTaskRegex = /<update-task\s+([^>]*)>([^<]*)<\/update-task>/g;
         while ((match = updateTaskRegex.exec(text)) !== null) {
             const attrs = parseAttributes(match[1]);
-            const command: AICommand = {
-                type: 'update-task',
-                id: attrs.id,
-                annoyance: attrs.annoyance as AnnoyanceLevel,
-                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : undefined,
-                text: match[2]?.trim()
+            const task: Partial<Task> = {
+                ...attrs,
+                requiresAction: attrs.requiresAction ? attrs.requiresAction === 'true' : false,
+                name: match[2]
             };
-            commands.push(command);
-            console.log('🤖 AI Command detected - UPDATE TASK:', { ...command, timestamp: new Date().toISOString() });
+            commands.push(() => updateTask(userId, task));
+            console.log('🤖 UPDATE TASK:', task, new Date().toISOString());
         }
 
         // <task-complete id="uuid"/>
         const taskCompleteRegex = /<task-complete\s+id="([^"]+)"\s*\/>/g;
         while ((match = taskCompleteRegex.exec(text)) !== null) {
-            commands.push({ type: 'task-complete', id: match[1] });
+            const taskId = match[1];
+            commands.push(async () => {
+                const task = await getTask(userId, taskId);
+                if(!task) {
+                    return `❌ Задачи нету: ${taskId}`;
+                }
+                await updateUserTask(userId, taskId, (t) => {
+                    t.status = 'completed';
+                });
+                if(task.routineId) {
+                    await updateUserRoutine(userId, task.routineId, (r) => {
+                        r.stats.completed += 1;
+                    });
+                }
+                return `✅ Сделано: ${task.name}`;
+            });
+            console.log('🤖 TASK COMPLETE:', { id: match[1], timestamp: new Date().toISOString() });
         }
 
         // <task-fail id="uuid"/>
         const taskFailRegex = /<task-fail\s+id="([^"]+)"\s*\/>/g;
         while ((match = taskFailRegex.exec(text)) !== null) {
-            commands.push({ type: 'task-fail', id: match[1] });
-        }
-
-        // <task-postpone id="uuid" timestamp="ISO"/>
-        const taskPostponeRegex = /<task-postpone\s+id="([^"]+)"\s+timestamp="([^"]+)"\s*\/>/g;
-        while ((match = taskPostponeRegex.exec(text)) !== null) {
-            commands.push({ type: 'task-postpone', id: match[1], timestamp: match[2] });
-        }
-
-        // <task-update id="uuid" nextPingMinutes="30" annoyance="high"/>
-        const taskUpdateRegex = /<task-update\s+([^>]*)\/>/g; // self-closing variant
-        while ((match = taskUpdateRegex.exec(text)) !== null) {
-            const attrs = parseAttributes(match[1]);
-            const command: AICommand = {
-                type: 'task-update',
-                id: attrs.id,
-                nextPingMinutes: attrs.nextPingMinutes ? parseInt(attrs.nextPingMinutes, 10) : undefined,
-                annoyance: attrs.annoyance as AnnoyanceLevel
-            };
-            commands.push(command);
+            const taskId = match[1];
+            commands.push(async () => {
+                const task = await getTask(userId, taskId);
+                if(!task) {
+                    return `❌ Задачи нету: ${taskId}`;
+                }
+                await updateUserTask(userId, taskId, (t) => {
+                    t.status = 'failed';
+                });
+                if(task.routineId) {
+                    await updateUserRoutine(userId, task.routineId, (r) => {
+                        r.stats.failed += 1;
+                    });
+                }
+                return `⚠️ Не сделано: ${task.name}`;
+            });
+            console.log('🤖 TASK FAIL:', { id: match[1], timestamp: new Date().toISOString() });
         }
 
         // <update-memory key="sleepSchedule" value="23:00-07:00"/>
         const updateMemoryRegex = /<update-memory\s+key="([^"]+)"\s+value="([^"]+)"\s*\/>/g;
         while ((match = updateMemoryRegex.exec(text)) !== null) {
-            commands.push({ type: 'update-memory', key: match[1], value: match[2] });
+            const key = match[1];
+            const value = match[2];
+            commands.push(async () => {
+                await updateUserMemory(userId, key, value);
+                return `💾 Память: ${key} обновлена`;
+            });
         }
 
         // Extend cleanText removal for new tags (simple all-tags strip for safety)
@@ -183,173 +235,21 @@ export class AICommandService {
     /**
      * Execute AI commands for a user
      */
-    static async executeCommands(userId: number, commands: AICommand[]): Promise<string[]> {
+    static async executeCommands(userId: number, commands: Array<()=>Promise<string>>): Promise<string[]> {
         const results: string[] = [];
 
         if (commands.length > 0) {
             console.log(`🚀 Executing ${commands.length} AI commands for user ${userId}`);
         }
 
-        for (const command of commands) {
-            try {
-                switch (command.type) {                   
-
-                    case 'goal':
-                        if (command.goal) {
-                            const user = await getUser(userId);
-                            if (user) {
-                                const oldGoal = user.preferences.goal;
-                                user.preferences.goal = command.goal;
-                                await setUser(user);
-                                const successMsg = `✅ Цель обновлена: "${command.goal}"`;
-                                results.push(successMsg);
-                                console.log('✅ SET GOAL executed:', {
-                                    userId,
-                                    oldGoal,
-                                    newGoal: command.goal,
-                                    timestamp: new Date().toISOString()
-                                });
-                            }
-                        }
-                        break;
-                    case 'set-routine': {
-                        if (command.cron && command.text) {
-                            const routine: Routine = {
-                                id: generateShortId(),
-                                name: command.text,
-                                cron: command.cron,
-                                defaultAnnoyance: command.annoyance || 'low',
-                                requiresAction: command.requiresAction ?? true,
-                                isActive: true,
-                                stats: { completed: 0, failed: 0 },
-                                createdAt: new Date()
-                            };
-                            await addUserRoutine(userId, routine);
-                            results.push(`✅ Создана рутина: "${routine.name}" (${routine.cron})`);
-                        }
-                        break;
-                    }
-                    case 'update-routine': {
-                        if (command.id) {
-                            await updateUserRoutine(userId, command.id, (r) => {
-                                if (command.cron) r.cron = command.cron;
-                                if (command.annoyance) r.defaultAnnoyance = command.annoyance as AnnoyanceLevel;
-                                if (command.requiresAction !== undefined) r.requiresAction = command.requiresAction;
-                                if (command.text) r.name = command.text;
-                            });
-                            results.push(`✅ Обновлена рутина: ${command.text}`);
-                        }
-                        break;
-                    }
-                    case 'delete-routine': {
-                        if (command.id) {
-                            await removeUserRoutine(userId, command.id);
-                            results.push(`✅ Удалена рутина: ${command.text}`);
-                        }
-                        break;
-                    }
-                    case 'set-task': {
-                        if (command.timestamp && command.text) {
-                            const due = new Date(command.timestamp);
-                            const task: Task = {
-                                id: generateShortId(),
-                                name: command.text,
-                                routineId: undefined,
-                                firstTriggered: due,
-                                due,
-                                requiresAction: command.requiresAction ?? false,
-                                status: (command.requiresAction ?? false) ? 'pending' : 'completed',
-                                annoyance: command.annoyance || 'low',
-                                nextPing: due,
-                                postponeCount: 0,
-                                createdAt: new Date()
-                            };
-                            await addUserTask(userId, task);
-                            results.push(`✅ Создана задача: "${task.name}" (${due.toLocaleString('ru-RU')})`);
-                        }
-                        break;
-                    }
-                    case 'update-task': {
-                        if (command.id) {
-                            await updateUserTask(userId, command.id, (t) => {
-                                if (command.annoyance) t.annoyance = command.annoyance;
-                                if (command.requiresAction !== undefined) t.requiresAction = command.requiresAction;
-                                if (command.text) t.name = command.text;
-                            });
-                            results.push(`✅ Обновлена задача: ${command.text}`);
-                        }
-                        break;
-                    }
-                    case 'task-complete': {
-                        if (command.id) {
-                            await updateUserTask(userId, command.id, (t) => {
-                                t.status = 'completed';
-                            });
-                            results.push(`✅ Задача выполнена: ${command.text}`);
-                        }
-                        break;
-                    }
-                    case 'task-fail': {
-                        if (command.id) {
-                            await updateUserTask(userId, command.id, (t) => {
-                                t.status = 'failed';
-                            });
-                            results.push(`⚠️ Задача провалена: ${command.text}`);
-                        }
-                        break;
-                    }
-                    case 'task-postpone': {
-                        if (command.id && command.timestamp) {
-                            const newDate = new Date(command.timestamp);
-                            await updateUserTask(userId, command.id, (t) => {
-                                t.due = newDate;
-                                t.nextPing = newDate;
-                                t.postponeCount += 1;
-                            });
-                            results.push(`🔄 Задача перенесена: ${command.text} → ${newDate.toLocaleString('ru-RU')}`);
-                        }
-                        break;
-                    }
-                    case 'task-update': {
-                        if (command.id) {
-                            await updateUserTask(userId, command.id, (t) => {
-                                if (command.annoyance) t.annoyance = command.annoyance;
-                                if (command.nextPingMinutes !== undefined) {
-                                    const next = new Date(Date.now() + command.nextPingMinutes * 60000);
-                                    t.nextPing = next;
-                                }
-                            });
-                            results.push(`✅ Обновлены параметры задачи: ${command.text}`);
-                        }
-                        break;
-                    }
-                    case 'update-memory': {
-                        if (command.key && command.value) {
-                            await updateUserMemory(userId, command.key, command.value);
-                            results.push(`💾 Обновлена память: ${command.key}`);
-                        }
-                        break;
-                    }
-                }
-            } catch (error) {
-                console.error(`❌ Error executing AI command:`, {
-                    userId,
-                    command,
-                    error: error instanceof Error ? error.message : String(error),
-                    timestamp: new Date().toISOString()
-                });
-                results.push(`❌ Ошибка выполнения команды ${command.type}`);
-            }
-        }
-
-        return results;
+        return await Promise.all(commands.map(async (cmd) => cmd()))
     }
 
     /**
      * Process AI response: parse commands, execute them, and return clean text
      */
     static async processAIResponse(userId: number, aiResponse: string): Promise<{ message: string, commandResults: string[] }> {
-        const { commands, cleanText } = this.parseCommands(aiResponse);
+        const { commands, cleanText } = this.generateCommands(userId, aiResponse);
         const commandResults = await this.executeCommands(userId, commands);
         
         return {

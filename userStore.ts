@@ -1,5 +1,5 @@
-import { Low } from 'lowdb';
-import { JSONFile } from 'lowdb/node';
+import {Low} from 'lowdb';
+import {JSONFile} from 'lowdb/node';
 
 // Generate shorter IDs (8 characters)
 function generateShortId(): string {
@@ -11,7 +11,7 @@ function generateShortId(): string {
     return result;
 }
 
-export { generateShortId };
+export {generateShortId};
 
 export type MessageHistory = {
     role: 'user' | 'assistant';
@@ -36,13 +36,14 @@ export type TaskStatus = 'pending' | 'completed' | 'failed';
 export type Task = {
     id: string;
     name: string;
-    routineId?: string;             // undefined => ad-hoc/non-routine task
-    firstTriggered: Date;           // original due time, never changes
-    due: Date;                      // current due time (can be postponed)
+    // undefined => ad-hoc/non-routine task
+    routineId?: string;
+    // if not set, task can be postponed indefinitely
+    dueAt?: Date;
     requiresAction: boolean;
     status: TaskStatus;
     annoyance: AnnoyanceLevel;
-    nextPing: Date;                 // scheduler will ping when <= now
+    pingAt: Date;                 // scheduler will ping when <= now
     postponeCount: number;
     createdAt: Date;
 };
@@ -55,10 +56,10 @@ export type UserData = {
         timezone?: string; // user's timezone, default to UTC
     };
     // NEW collections
-    routines?: Routine[];
-    tasks?: Task[];
+    routines: Routine[];
+    tasks: Task[];
     // Arbitrary key/value memory for AI
-    memory?: Record<string, string>;
+    memory: Record<string, string>;
     messageHistory: MessageHistory[];
 };
 
@@ -67,7 +68,7 @@ export type DBData = {
 };
 
 const adapter = new JSONFile<DBData>('db.json');
-const db = new Low(adapter, { users: [] });
+const db = new Low(adapter, {users: []});
 
 // Initialize database
 async function initDB() {
@@ -113,7 +114,7 @@ function parseDatesInUser(user: UserData): void {
             }
         });
     }
-    
+
     // Parse routine dates
     if (user.routines) {
         user.routines.forEach(routine => {
@@ -122,18 +123,15 @@ function parseDatesInUser(user: UserData): void {
             }
         });
     }
-    
+
     // Parse task dates
     if (user.tasks) {
         user.tasks.forEach(task => {
-            if (typeof task.firstTriggered === 'string') {
-                task.firstTriggered = new Date(task.firstTriggered);
+            if (typeof task.dueAt === 'string') {
+                task.dueAt = new Date(task.dueAt);
             }
-            if (typeof task.due === 'string') {
-                task.due = new Date(task.due);
-            }
-            if (typeof task.nextPing === 'string') {
-                task.nextPing = new Date(task.nextPing);
+            if (typeof task.pingAt === 'string') {
+                task.pingAt = new Date(task.pingAt);
             }
             if (typeof task.createdAt === 'string') {
                 task.createdAt = new Date(task.createdAt);
@@ -148,18 +146,18 @@ export async function addMessageToHistory(userId: number, role: 'user' | 'assist
         if (!user.messageHistory) {
             user.messageHistory = [];
         }
-        
+
         user.messageHistory.push({
             role,
             content,
             timestamp: new Date()
         });
-        
+
         // Keep only the last 50 messages
         if (user.messageHistory.length > 50) {
             user.messageHistory = user.messageHistory.slice(-50);
         }
-        
+
         await setUser(user);
     }
 }
@@ -169,99 +167,76 @@ export async function getUserMessageHistory(userId: number): Promise<MessageHist
     return user?.messageHistory || [];
 }
 
-// HELPER: ensure user has arrays initialised (for legacy data)
-function ensureUserCollections(user: UserData): void {
-    if (!user.routines) user.routines = [];
-    if (!user.tasks) user.tasks = [];
-    if (!user.memory) user.memory = {};
-}
-
 // NEW ROUTINE HELPERS -------------------------------------------------------
-export async function getUserRoutines(userId: number): Promise<Routine[]> {
-    const user = await getUser(userId);
-    if (user) {
-        ensureUserCollections(user);
-        return user.routines!;
-    }
-    return [];
-}
+export const getAllRoutines = async (userId: number): Promise<Routine[]> => (await getUser(userId))?.routines ?? [];
+export const getAllTasks = async (userId: number): Promise<Task[]> => (await getUser(userId))?.tasks ?? [];
+
+export const getRoutine = async (userId: number, routineId: string): Promise<Routine | undefined> => (await getAllRoutines(userId)).find(r => r.id === routineId);
+
+export const getTask = async (userId: number, taskId: string): Promise<Task | undefined> => (await getAllTasks(userId)).find(t => t.id === taskId);
 
 export async function addUserRoutine(userId: number, routine: Routine): Promise<void> {
     const user = await getUser(userId);
     if (user) {
-        ensureUserCollections(user);
-        user.routines!.push(routine);
+        user.routines.push(routine);
         await setUser(user);
     }
 }
 
 export async function updateUserRoutine(userId: number, routineId: string, updateFn: (r: Routine) => void): Promise<void> {
     const user = await getUser(userId);
-    if (user) {
-        ensureUserCollections(user);
-        const r = user.routines!.find(rt => rt.id === routineId);
-        if (r) {
-            updateFn(r);
-            await setUser(user);
-        }
+    if (!user) return;
+
+    const r = user.routines.find(rt => rt.id === routineId);
+    if (r) {
+        updateFn(r);
+        await setUser(user);
     }
 }
 
 export async function removeUserRoutine(userId: number, routineId: string): Promise<void> {
-    const user = await getUser(userId);
-    if (user) {
-        ensureUserCollections(user);
-        user.routines = user.routines!.filter(r => r.id !== routineId);
-        await setUser(user);
-    }
-}
 
-// NEW TASK HELPERS ----------------------------------------------------------
-export async function getUserTasks(userId: number): Promise<Task[]> {
     const user = await getUser(userId);
-    if (user) {
-        ensureUserCollections(user);
-        return user.tasks!;
-    }
-    return [];
+    if (!user) return;
+
+    user.routines = user.routines.filter(r => r.id !== routineId);
+    await setUser(user);
+
 }
 
 export async function addUserTask(userId: number, task: Task): Promise<void> {
     const user = await getUser(userId);
-    if (user) {
-        ensureUserCollections(user);
-        user.tasks!.push(task);
-        await setUser(user);
-    }
+    if (!user) return;
+
+    user.tasks.push(task);
+    await setUser(user);
+
 }
 
 export async function updateUserTask(userId: number, taskId: string, updateFn: (t: Task) => void): Promise<void> {
     const user = await getUser(userId);
-    if (user) {
-        ensureUserCollections(user);
-        const t = user.tasks!.find(tt => tt.id === taskId);
-        if (t) {
-            updateFn(t);
-            await setUser(user);
-        }
+    if (!user) return;
+
+    const t = user.tasks.find(tt => tt.id === taskId);
+    if (t) {
+        updateFn(t);
+        await setUser(user);
     }
 }
 
 export async function removeUserTask(userId: number, taskId: string): Promise<void> {
     const user = await getUser(userId);
-    if (user) {
-        ensureUserCollections(user);
-        user.tasks = user.tasks!.filter(t => t.id !== taskId);
-        await setUser(user);
-    }
+    if(!user) return;
+
+    user.tasks = user.tasks.filter(t => t.id !== taskId);
+    await setUser(user);
 }
 
 // MEMORY HELPERS ------------------------------------------------------------
 export async function updateUserMemory(userId: number, key: string, value: string): Promise<void> {
     const user = await getUser(userId);
-    if (user) {
-        ensureUserCollections(user);
-        user.memory![key] = value;
-        await setUser(user);
-    }
+    if(!user) return;
+
+    user.memory[key] = value;
+    await setUser(user);
 }
