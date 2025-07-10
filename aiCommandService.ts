@@ -230,7 +230,7 @@ export class AICommandService {
         }
 
         // Extend cleanText removal for new tags (simple all-tags strip for safety)
-        const cleanText = sanitizeHtml(text, { allowedTags: [] });
+        const cleanText = sanitizeHtml(text, { allowedTags: [], disallowedTagsMode: 'completelyDiscard' });
 
         if (commands.length > 0) {
             console.log(`🤖 Total AI commands parsed: ${commands.length}`);
