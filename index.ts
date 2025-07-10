@@ -4,18 +4,14 @@ dotenv.config();
 import TelegramBot from 'node-telegram-bot-api';
 import OpenAI from 'openai';
 import cron from 'node-cron';
-import { 
+import {
     SYSTEM_PROMPT,
     GREETING_PROMPT,
     GOAL_ACCEPTED_PROMPT,
     GOAL_SET_PROMPT,
     GOAL_CLEAR_PROMPT,
-    GOAL_ANALYSIS_PROMPT,
-    MORNING_PROMPT,
-    LUNCH_CHECKIN_PROMPT,
-    EVENING_SUMMARY_PROMPT,
     ERROR_MESSAGE_PROMPT,
-    DEFAULT_HELP_PROMPT
+    DEFAULT_HELP_PROMPT, TASK_TRIGGERED_PROMPT
 } from './constants';
 import {getUser, setUser, getAllUsers, addMessageToHistory, getUserMessageHistory} from "./userStore";
 import { getUserRoutines, getUserTasks, addUserTask, updateUserTask, updateUserRoutine, addUserRoutine, generateShortId } from './userStore';
@@ -34,12 +30,26 @@ const openai = new OpenAI({
     ...(OPEN_AI_ENDPOINT && { baseURL: OPEN_AI_ENDPOINT }),
 });
 
-async function generateMessage(prompt: string): Promise<string> {
+async function recentMessages(userId: number, limit: number = 50): Promise<{ role: 'user' | 'assistant', content: string }[]> {
+    const messageHistory = await getUserMessageHistory(userId);
+    const recentMessages = messageHistory.slice(-limit);
+
+    return recentMessages.map(m => ({
+        role: m.role as 'user' | 'assistant',
+        content: m.content
+    }));
+}
+async function generateMessage(
+    prompt: string,
+    systemPrompt: string = SYSTEM_PROMPT,
+    messages: { role: 'user' | 'assistant', content: string }[] = []
+): Promise<string> {
     try {
         const response = await openai.chat.completions.create({
             model: 'gpt-4',
             messages: [
-                { role: 'system', content: SYSTEM_PROMPT },
+                { role: 'system', content: systemPrompt },
+                ...messages,
                 { role: 'user', content: prompt }
             ]
         });
@@ -48,90 +58,6 @@ async function generateMessage(prompt: string): Promise<string> {
     } catch (error) {
         console.error('Error generating message:', error);
         return 'Извини, проблемы с генерацией сообщения 🐺';
-    }
-}
-
-async function analyzeAndUpdateGoal(userId: number): Promise<void> {
-    try {
-        console.log('🎯 Starting goal analysis:', {
-            userId,
-            timestamp: new Date().toISOString()
-        });
-
-        const user = await getUser(userId);
-        if (!user || !user.preferences.goal) return;
-
-        const messageHistory = await getUserMessageHistory(userId);
-        if (messageHistory.length < 5) {
-            console.log('🎯 Skipping goal analysis - insufficient message history:', {
-                userId,
-                messageCount: messageHistory.length,
-                timestamp: new Date().toISOString()
-            });
-            return; // Need some conversation history
-        }
-
-        // Get recent messages (last 20)
-        const recentMessages = messageHistory.slice(-20).map(m => ({
-            role: m.role,
-            content: m.content
-        }));
-
-        console.log('🎯 Analyzing goal with message history:', {
-            userId,
-            currentGoal: user.preferences.goal,
-            recentMessageCount: recentMessages.length,
-            timestamp: new Date().toISOString()
-        });
-
-        const response = await openai.chat.completions.create({
-            model: 'gpt-4',
-            messages: [
-                { role: 'system', content: SYSTEM_PROMPT },
-                { role: 'user', content: GOAL_ANALYSIS_PROMPT(user.preferences.goal, recentMessages) }
-            ]
-        });
-
-        const analysisResult = response.choices[0].message?.content?.trim();
-        
-        console.log('🎯 Goal analysis result:', {
-            userId,
-            analysisResult,
-            timestamp: new Date().toISOString()
-        });
-
-        if (analysisResult?.startsWith('NEW_GOAL:')) {
-            const newGoal = analysisResult.replace('NEW_GOAL:', '').trim();
-            const oldGoal = user.preferences.goal;
-            user.preferences.goal = newGoal;
-            await setUser(user);
-            
-            console.log('🎯 Goal automatically updated:', {
-                userId,
-                oldGoal,
-                newGoal,
-                timestamp: new Date().toISOString()
-            });
-            
-            // Notify user about goal update
-            if (user.chatId) {
-                const aiResponse = await generateMessage(GOAL_SET_PROMPT(newGoal));
-                const { message: updateMessage } = await AICommandService.processAIResponse(userId, aiResponse);
-                await bot.sendMessage(user.chatId, `🎯 Обновил твою цель: ${updateMessage}`);
-            }
-        } else {
-            console.log('🎯 Goal analysis completed - no update needed:', {
-                userId,
-                currentGoal: user.preferences.goal,
-                timestamp: new Date().toISOString()
-            });
-        }
-    } catch (error) {
-        console.error('❌ Error analyzing goal:', {
-            userId,
-            error: error instanceof Error ? error.message : String(error),
-            timestamp: new Date().toISOString()
-        });
     }
 }
 
@@ -156,9 +82,6 @@ async function getCurrentInfo(userId: number): Promise<string> {
             annoyance: t.annoyance,
             postponeCount: t.postponeCount
         }));
-
-        const messageHistory = await getUserMessageHistory(userId);
-        const recentMessages = messageHistory.slice(-50); // Last 50 messages for context
 
         const currentTime = new Date();
         const Memory = `
@@ -186,8 +109,6 @@ async function generateAIResponse(userId: number, userMessage: string): Promise<
         const user = await getUser(userId);
         if (!user) return 'Ошибка: пользователь не найден';
 
-        const messageHistory = await getUserMessageHistory(userId);
-        const recentMessages = messageHistory.slice(-50); // Last 50 messages for context
         const memory = await getCurrentInfo(userId);
         const fullPrompt = ` 
             ${SYSTEM_PROMPT}       
@@ -200,10 +121,7 @@ async function generateAIResponse(userId: number, userMessage: string): Promise<
               content: fullPrompt 
             },
             // Add recent message history for context
-            ...recentMessages.map(m => ({
-                role: m.role as 'user' | 'assistant',
-                content: m.content
-            })),
+            ...(await recentMessages(userId, 50)),
             { role: 'user' as const, content: userMessage }
         ];
 
@@ -369,48 +287,23 @@ cron.schedule('* * * * *', async () => {
                         timestamp: now.toISOString()
                     });
 
+                    const memory = await getCurrentInfo(user.userId);
+
                     // Generate AI response asking about the task
-                    const taskPrompt = `Время для задачи: "${task.name}". 
-                    ${task.postponeCount > 0 ? `Уже перенесена ${task.postponeCount} раз. ` : ''}
-                    Спроси пользователя, сделал ли он это, и предложи отметить как выполнено, провалено или перенести.
-                    Используй соответствующие команды для управления задачей (ID: ${task.id}).`;
+                    const taskPrompt = TASK_TRIGGERED_PROMPT(memory, task);
                     
-                    const aiResponse = await generateMessage(taskPrompt);
+                    const aiResponse = await generateMessage(
+                        taskPrompt,
+                        SYSTEM_PROMPT,
+                        await recentMessages(user.userId, 50),
+                    );
                     const { message: cleanMessage } = await AICommandService.processAIResponse(user.userId, aiResponse);
-                    
+
                     // Send message to user
                     await bot.sendMessage(user.chatId, cleanMessage);
                     await addMessageToHistory(user.userId, 'assistant', cleanMessage);
-                    
-                    // Calculate next ping time based on annoyance level
-                    let nextPingMinutes: number;
-                    switch (task.annoyance) {
-                        case 'high':
-                            nextPingMinutes = Math.random() * 4 + 1; // 1-5 minutes
-                            break;
-                        case 'med':
-                            nextPingMinutes = Math.random() * 30 + 30; // 30-60 minutes
-                            break;
-                        case 'low':
-                        default:
-                            nextPingMinutes = Math.random() * 60 + 120; // 120-180 minutes (2-3 hours)
-                            break;
-                    }
-                    
-                    // Update next ping time
-                    const nextPing = new Date(now.getTime() + nextPingMinutes * 60000);
-                    await updateUserTask(user.userId, task.id, (t) => {
-                        t.nextPing = nextPing;
-                    });
-                    
-                    console.log('⏰ Updated task next ping time:', {
-                        userId: user.userId,
-                        taskId: task.id,
-                        nextPing: nextPing.toISOString(),
-                        annoyanceLevel: task.annoyance,
-                        minutesUntilNext: nextPingMinutes,
-                        timestamp: now.toISOString()
-                    });
+
+                    console.log(aiResponse);
                 }
             } catch (error) {
                 console.error('❌ Error pinging task:', {
@@ -420,74 +313,6 @@ cron.schedule('* * * * *', async () => {
                     timestamp: now.toISOString()
                 });
             }
-        }
-    }
-});
-
-// Analyze goals every 6 hours
-cron.schedule('0 */6 * * *', async () => {
-    console.log('🎯 Starting periodic goal analysis for all users:', {
-        timestamp: new Date().toISOString()
-    });
-
-    const users = await getAllUsers();
-    let analyzedCount = 0;
-    
-    for (const user of users) {
-        if (user.preferences.goal) {
-            await analyzeAndUpdateGoal(user.userId);
-            analyzedCount++;
-            // Add small delay between users to avoid rate limits
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-    }
-
-    console.log('🎯 Periodic goal analysis completed:', {
-        totalUsers: users.length,
-        analyzedUsers: analyzedCount,
-        timestamp: new Date().toISOString()
-    });
-});
-
-// Legacy cron jobs (keeping for users with CHAT_ID set)
-cron.schedule('0 10 * * *', async () => {
-    if (CHAT_ID) {
-        const aiResponse = await generateMessage(MORNING_PROMPT);
-        const { message: cleanMessage } = await AICommandService.processAIResponse(parseInt(CHAT_ID), aiResponse);
-        await bot.sendMessage(CHAT_ID, cleanMessage);
-        
-        // Add to message history if CHAT_ID is a valid user ID
-        const chatIdAsNumber = parseInt(CHAT_ID);
-        if (!isNaN(chatIdAsNumber)) {
-            await addMessageToHistory(chatIdAsNumber, 'assistant', cleanMessage);
-        }
-    }
-});
-
-cron.schedule('0 13 * * *', async () => {
-    if (CHAT_ID) {
-        const aiResponse = await generateMessage(LUNCH_CHECKIN_PROMPT);
-        const { message: cleanMessage } = await AICommandService.processAIResponse(parseInt(CHAT_ID), aiResponse);
-        await bot.sendMessage(CHAT_ID, cleanMessage);
-        
-        // Add to message history if CHAT_ID is a valid user ID
-        const chatIdAsNumber = parseInt(CHAT_ID);
-        if (!isNaN(chatIdAsNumber)) {
-            await addMessageToHistory(chatIdAsNumber, 'assistant', cleanMessage);
-        }
-    }
-});
-
-cron.schedule('0 17 * * *', async () => {
-    if (CHAT_ID) {
-        const aiResponse = await generateMessage(EVENING_SUMMARY_PROMPT);
-        const { message: cleanMessage } = await AICommandService.processAIResponse(parseInt(CHAT_ID), aiResponse);
-        await bot.sendMessage(CHAT_ID, cleanMessage);
-        
-        // Add to message history if CHAT_ID is a valid user ID
-        const chatIdAsNumber = parseInt(CHAT_ID);
-        if (!isNaN(chatIdAsNumber)) {
-            await addMessageToHistory(chatIdAsNumber, 'assistant', cleanMessage);
         }
     }
 });
