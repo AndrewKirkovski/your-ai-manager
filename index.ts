@@ -246,13 +246,13 @@ cron.schedule('* * * * *', async () => {
 
                     console.log('✅ Created task from routine:', newTask);
                 } else {
-                    console.log('⏳ Routine not ready to fire yet:', {
+                    /* console.log('⏳ Routine not ready to fire yet:', {
                         userId: user.userId,
                         routineId: routine.id,
                         nextFireTime: nextFireTime.toISOString(),
                         lastFireTime: lastFireTime.toISOString(),
                         now: now.toISOString()
-                    });
+                    }); */
                 }
             } catch (error) {
                 console.error('❌ Error checking routine:', {
@@ -295,12 +295,12 @@ cron.schedule('* * * * *', async () => {
                         })
                     }
                 } else {
-                    console.log('⏳ Task not ready for ping yet:', {
+                    /* console.log('⏳ Task not ready for ping yet:', {
                         userId: user.userId,
                         taskId: task.id,
                         pingAt: task.pingAt.toISOString(),
                         now: now.toISOString()
-                    });
+                    }); */
                 }
             } catch (error) {
                 console.error('❌ Error pinging task:', {

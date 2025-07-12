@@ -6,7 +6,18 @@ import {
     updateUserMemory,
     generateShortId, getTask, getRoutine
 } from './userStore';
-import sanitizeHtml from 'sanitize-html';
+function cleanAIResponse(text: string): string {
+    // First remove AI command tags
+    let cleaned = text.replace(/<(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal)[^>]*>.*?<\/(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal)>/gs, '');
+
+    // Remove self-closing tags
+    cleaned = cleaned.replace(/<(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory)[^>]*\/>/g, '');
+
+    // Clean up extra whitespace
+    cleaned = cleaned.replace(/\s+/g, ' ').trim();
+
+    return cleaned;
+}
 
 // Helper to parse attribute string like: key="value" key2="value2"
 function parseAttributes(attrString: string): Record<string, string> {
@@ -230,7 +241,7 @@ export class AICommandService {
         }
 
         // Extend cleanText removal for new tags (simple all-tags strip for safety)
-        const cleanText = sanitizeHtml(text, { allowedTags: [], disallowedTagsMode: 'completelyDiscard' });
+        const cleanText = cleanAIResponse(text);
 
         if (commands.length > 0) {
             console.log(`🤖 Total AI commands parsed: ${commands.length}`);
