@@ -13,3 +13,6 @@ OPENAI_API_KEY=
 ```
 
 
+To run: `yarn` + `yarn start`
+
+
