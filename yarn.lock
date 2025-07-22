@@ -319,6 +319,11 @@
   resolved "https://registry.yarnpkg.com/@types/estree/-/estree-1.0.8.tgz#958b91c991b1867ced318bedea0e215ee050726e"
   integrity sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w==
 
+"@types/luxon@^3.6.2":
+  version "3.6.2"
+  resolved "https://registry.yarnpkg.com/@types/luxon/-/luxon-3.6.2.tgz#be6536931801f437eafcb9c0f6d6781f72308041"
+  integrity sha512-R/BdP7OxEMc44l2Ex5lSXHoIXTB2JLNa3y2QISIbr58U/YcsffyQrYW//hZSdrfxrjRZj3GcUoxMPGdO8gSYuw==
+
 "@types/node-telegram-bot-api@^0.64.9":
   version "0.64.9"
   resolved "https://registry.yarnpkg.com/@types/node-telegram-bot-api/-/node-telegram-bot-api-0.64.9.tgz#c03ec8a876d00ce0a93023755becd13924d92116"
@@ -604,6 +609,11 @@ cron-parser@^5.3.0:
   integrity sha512-IS4mnFu6n3CFgEmXjr+B2zzGHsjJmHEdN+BViKvYSiEn3KWss9ICRDETDX/VZldiW82B94OyAZm4LIT4vcKK0g==
   dependencies:
     luxon "^3.6.1"
+
+cronstrue@^3.1.0:
+  version "3.1.0"
+  resolved "https://registry.yarnpkg.com/cronstrue/-/cronstrue-3.1.0.tgz#d4ea116eb884ebca89c401e317fb045a89bf9347"
+  integrity sha512-Utuwaml2Zwr5mQ74xZkIZPQvJ/lQ3IwKqP5pg7cXOaShqaLyrnzeNtJEi4Eyw/X5wvvS6hGdaio9M/CrEisPoA==
 
 cross-spawn@^7.0.6:
   version "7.0.6"
@@ -1438,6 +1448,11 @@ luxon@^3.6.1:
   version "3.6.1"
   resolved "https://registry.yarnpkg.com/luxon/-/luxon-3.6.1.tgz#d283ffc4c0076cb0db7885ec6da1c49ba97e47b0"
   integrity sha512-tJLxrKJhO2ukZ5z0gyjY1zPh3Rh88Ej9P7jNrZiHMUXHae1yvI2imgOZtL1TO8TW6biMMKfTtAOoEJANgtWBMQ==
+
+luxon@^3.7.1:
+  version "3.7.1"
+  resolved "https://registry.yarnpkg.com/luxon/-/luxon-3.7.1.tgz#9bd09aa84a56afb00c57ea78a8ec5bd16eb24ec0"
+  integrity sha512-RkRWjA926cTvz5rAb1BqyWkKbbjzCGchDUIKMCUvNi17j6f6j8uHGDV82Aqcqtzd+icoYpELmG3ksgGiFNNcNg==
 
 magic-string@^0.30.17:
   version "0.30.17"

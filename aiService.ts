@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 import TelegramBot from 'node-telegram-bot-api';
 import { AICommandService } from './aiCommandService';
 import { addMessageToHistory, getUser, getUserMessageHistory } from './userStore';
+import { getCurrentTime } from './dateUtils';
 
 export interface AIStreamOptions {
     userId: number;
@@ -142,7 +143,7 @@ export class AIService {
                     userMessageLength: userMessage.length,
                     aiMessageLength: message.length,
                     totalHistoryAfter: (await getUserMessageHistory(userId)).length,
-                    timestamp: new Date().toISOString()
+                    timestamp: getCurrentTime().toISO()
                 });
             }
 
@@ -157,12 +158,12 @@ export class AIService {
             };
 
         } catch (error) {
-            console.error('❌ Error generating AI response:', {
-                userId,
-                userMessage: userMessage.substring(0, 50) + '...',
-                error: error instanceof Error ? error.message : String(error),
-                timestamp: new Date().toISOString()
-            });
+                    console.error('❌ Error generating AI response:', {
+            userId,
+            userMessage: userMessage.substring(0, 50) + '...',
+            error: error instanceof Error ? error.message : String(error),
+            timestamp: getCurrentTime().toISO()
+        });
             
             const errorMessage = `
 Ой 🐺

@@ -2,10 +2,11 @@ import {
     getUser, setUser,
     Routine, Task,
     addUserRoutine, updateUserRoutine, removeUserRoutine,
-    addUserTask, updateUserTask, removeUserTask,
+    addUserTask, updateUserTask,
     updateUserMemory,
     generateShortId, getTask, getRoutine
 } from './userStore';
+import { formatDateHuman, formatCronHuman } from './dateUtils';
 
 function cleanAIResponse(text: string): string {
     // First remove AI command tags
@@ -45,7 +46,7 @@ const createRoutine = async (userId: number, routine: Partial<Routine>): Promise
         ...routine,
     } as Routine;
     await addUserRoutine(userId, newRoutine);
-    return `✅ Создана рутина: "${newRoutine.name}" (${newRoutine.cron})`;
+    return `✅ Создана рутина: "${newRoutine.name}" (${formatCronHuman(newRoutine.cron)})`;
 }
 
 const updateRoutine = async (userId: number, routine: Partial<Routine>): Promise<string> => {
@@ -59,7 +60,7 @@ const updateRoutine = async (userId: number, routine: Partial<Routine>): Promise
         });
     });
     const updated = await getRoutine(userId, routine.id);
-    return `✅ Обновлена рутина: "${updated!.name}" (${updated!.cron})`;
+    return `✅ Обновлена рутина: "${updated!.name}" (${formatCronHuman(updated!.cron)})`;
 }
 
 const createTask = async (userId: number, task: Partial<Task>): Promise<string> => {
@@ -75,7 +76,7 @@ const createTask = async (userId: number, task: Partial<Task>): Promise<string> 
         ...task,
     } as Task;
     await addUserTask(userId, newTask);
-    return `✅ Запланировано: "${newTask.name}" (${newTask.pingAt})`;
+    return `✅ Запланировано: "${newTask.name}" (${formatDateHuman(newTask.pingAt)})`;
 }
 
 const updateTask = async (userId: number, task: Partial<Task>): Promise<string> => {
@@ -89,7 +90,7 @@ const updateTask = async (userId: number, task: Partial<Task>): Promise<string> 
         });
     });
     const updated = await getTask(userId, task.id);
-    return `✅ Обновлена рутина: "${updated!.name}" (${updated?.pingAt})`;
+    return `✅ Обновлена тасочка: "${updated!.name}" (${formatDateHuman(updated!.pingAt)})`;
 }
 
 const updateGoal = async (userId: number, goal: string): Promise<string> => {
