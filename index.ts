@@ -408,7 +408,7 @@ bot.onText(/\/routines/, async (msg) => {
             return;
         }
 
-        const routineText = activeRoutines.map(r => `* ${r.name} (${formatCronHuman(r.cron)}, Annoyance: ${r.annoyance})`).join('\n');
+        const routineText = activeRoutines.map(r => `- ${r.name} (${formatCronHuman(r.cron)}, Annoyance: ${r.annoyance})`).join('\n');
         await bot.sendMessage(msg.chat.id, `🔗 Активные рутины:\n\n${routineText}`, {
             parse_mode: 'Markdown'
         });
@@ -449,7 +449,7 @@ bot.onText(/\/tasks/, async (msg) => {
             return;
         }
 
-        const taskText = pendingTasks.map(t => `* ${t.name} (Next: ${formatDateHuman(t.pingAt)}, Annoyance: ${t.annoyance})`).join('\n');
+        const taskText = pendingTasks.map(t => `- ${t.name} (Next: ${formatDateHuman(t.pingAt)}, Annoyance: ${t.annoyance})`).join('\n');
         await bot.sendMessage(msg.chat.id, `📋 Активные задачи:\n\n${taskText}`, {
             parse_mode: 'Markdown'
         });
