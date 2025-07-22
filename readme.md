@@ -136,70 +136,11 @@ The bot uses a hybrid system where:
 - More natural conversation flow
 - No more waiting for complete responses
 
-## 🛠️ Technical Details
-
-### Built With
-- **TypeScript** - For type safety and better development experience
-- **Node.js** - Runtime environment
-- **Telegram Bot API** - For messaging
-- **OpenAI/Anthropic API** - For AI responses
-- **Cron Jobs** - For scheduled task management
-- **Streaming Responses** - For real-time interaction
-
-### Architecture
-- **Modular Design** - Easy to extend and modify
-- **Unified AI Service** - All AI interactions go through one system
-- **Persistent Storage** - User data and preferences are saved
-- **Error Handling** - Graceful fallbacks when things go wrong
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**"Bot not responding"**
-- Check your `TELEGRAM_TOKEN` is correct
-- Make sure the bot is running (`yarn start`)
-- Verify your API keys are valid
-
-**"AI not working"**
-- Confirm your `OPENAI_API_KEY` is set correctly
-- Check if you have sufficient API credits
-- Try switching between Claude and ChatGPT
-
-**"Tasks not being created"**
-- Make sure you have a goal set (`/goal`)
-- Check the bot's logs for error messages
-- Verify your message format is clear
 
 ### Getting Help
 - Check the logs in your terminal for error messages
-- Make sure all environment variables are set correctly
-- Try restarting the bot with `yarn start`
-
-## 🎉 Features That Make This Special
-
-- **🐺 Wolf Personality**: Not just another boring bot - this one has character!
-- **🧠 ADHD-Friendly**: Designed specifically for ADHD brains and patterns
-- **⚡ Real-time Streaming**: Watch the AI think in real-time
-- **🎯 Goal-Oriented**: Everything ties back to your main life goals
-- **🔄 Adaptive**: Learns and improves over time
-- **💪 Supportive**: Uses psychology principles to motivate and encourage
-
-## 🤝 Contributing
-
-Found a bug? Want to add a feature? Have an idea for making the wolf even more helpful?
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-*Remember: The wolf appreciates all help! 🐺*
-
-## 📄 License
-
-This project is open source and available under the MIT License.
+- Cry
+- Ask AI or bot author for help :)
 
 ---
 
