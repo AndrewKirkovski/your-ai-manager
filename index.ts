@@ -25,6 +25,7 @@ import {
 } from "./userStore";
 import {addUserTask, generateShortId} from './userStore';
 import {AICommandService} from './aiCommandService';
+import {AIService} from './aiService';
 import {CronExpressionParser} from 'cron-parser';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN!;
@@ -39,40 +40,13 @@ const openai = new OpenAI({
     ...(OPEN_AI_ENDPOINT && {baseURL: OPEN_AI_ENDPOINT}),
 });
 
-async function recentMessages(userId: number, limit: number = 30): Promise<{
-    role: 'user' | 'assistant',
-    content: string
-}[]> {
-    const messageHistory = await getUserMessageHistory(userId);
-    const recentMessages = messageHistory.slice(-limit);
-
-    return recentMessages.map(m => ({
-        role: m.role as 'user' | 'assistant',
-        content: m.content
-    }));
-}
-
+// Legacy function for backward compatibility - now uses AIService
 async function generateMessage(
     prompt: string,
     systemPrompt: string = SYSTEM_PROMPT,
     messages: { role: 'user' | 'assistant', content: string }[] = []
 ): Promise<string> {
-    try {
-        const response = await openai.chat.completions.create({
-            max_tokens: 250,
-            model: OPEN_AI_MODEL,
-            messages: [
-                {role: 'system', content: systemPrompt},
-                ...messages,
-                {role: 'user', content: prompt}
-            ]
-        });
-
-        return response.choices[0].message?.content?.trim() || 'Ошибка генерации сообщения';
-    } catch (error) {
-        console.error('Error generating message:', error);
-        return 'Извини, проблемы с генерацией сообщения 🐺';
-    }
+    return AIService.generateMessage(prompt, systemPrompt, messages, openai, OPEN_AI_MODEL);
 }
 
 async function getCurrentInfo(userId: number): Promise<string> {
@@ -106,14 +80,8 @@ Memory: ${JSON.stringify(user.memory || {}, null, 2)}
     return Memory;
 }
 
-async function generateAIResponse(userId: number, userMessage: string): Promise<string> {
+async function replyToUser(userId: number, userMessage: string): Promise<string> {
     try {
-        console.log('💬 Generating AI response:', {
-            userId,
-            userMessage: userMessage.substring(0, 100) + (userMessage.length > 100 ? '...' : ''),
-            timestamp: new Date().toISOString()
-        });
-
         const user = await getUser(userId);
         if (!user) return 'Ошибка: пользователь не найден';
 
@@ -123,43 +91,15 @@ async function generateAIResponse(userId: number, userMessage: string): Promise<
             
             ${memory}`;
 
-        const messages = [
-            {
-                role: 'system' as const,
-                content: fullPrompt
-            },
-            // Add recent message history for context
-            ...(await recentMessages(userId, 50)),
-            {role: 'user' as const, content: userMessage}
-        ];
-
-        const response = await openai.chat.completions.create({
-            max_tokens: 250,
+        const result = await AIService.streamAIResponse({
+            userId,
+            userMessage,
+            systemPrompt: fullPrompt,
+            bot,
+            openai,
             model: OPEN_AI_MODEL,
-            messages
-        });
-
-        const aiResponse = response.choices[0].message?.content?.trim() || 'Ошибка генерации ответа';
-
-        console.log('🤖 AI RAW:', {
-            userId,
-            aiResponse,
-            timestamp: new Date().toISOString()
-        });
-
-        // Process AI commands and return clean response
-        const {message, commandResults} = await AICommandService.processAIResponse(userId, aiResponse);
-
-        // Add both user message and AI response to history
-        await addMessageToHistory(userId, 'user', userMessage);
-        await addMessageToHistory(userId, 'assistant', aiResponse);
-
-        console.log('📝 Messages added to history:', {
-            userId,
-            userMessageLength: userMessage.length,
-            aiMessageLength: message.length,
-            totalHistoryAfter: (await getUserMessageHistory(userId)).length,
-            timestamp: new Date().toISOString()
+            shouldUpdateTelegram: true,
+            shouldAddToHistory: true
         });
 
         // Cleanup old completed/failed tasks after processing (keep last 50 per user)
@@ -183,11 +123,11 @@ async function generateAIResponse(userId: number, userMessage: string): Promise<
         }
 
         // Combine the clean message with command results if any
-        if (commandResults.length > 0) {
-            return `${message}\n\n${commandResults.join('\n')}`;
+        if (result.commandResults.length > 0) {
+            return `${result.message}\n\n${result.commandResults.join('\n')}`;
         }
 
-        return message;
+        return result.message;
     } catch (error) {
         console.error('❌ Error generating AI response:', {
             userId,
@@ -279,17 +219,17 @@ cron.schedule('* * * * *', async () => {
                     // Generate AI response asking about the task
                     const taskPrompt = task.requiresAction ? TASK_TRIGGERED_PROMPT(memory, task) : TASK_TRIGGERED_PROMPT_NO_ACTION(memory, task);
 
-                    const aiResponse = await generateMessage(
-                        taskPrompt,
-                        SYSTEM_PROMPT,
-                        await recentMessages(user.userId, 50),
-                    );
+                    const result = await AIService.streamAIResponse({
+                        userId: user.userId,
+                        userMessage: taskPrompt,
+                        systemPrompt: SYSTEM_PROMPT,
+                        bot,
+                        openai,
+                        model: OPEN_AI_MODEL,
+                        shouldAddToHistory: true
+                    });
 
-                    const {message: cleanMessage} = await AICommandService.processAIResponse(user.userId, aiResponse);
-                    console.log(aiResponse);
-                    // Send message to user
-                    await bot.sendMessage(user.chatId, cleanMessage);
-                    await addMessageToHistory(user.chatId, 'assistant', aiResponse);
+                    console.log(result);
 
                     if (!task.requiresAction) {
                         await updateUserTask(user.userId, task.id, (t) => {
@@ -358,18 +298,31 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
         }
         await setUser(user);
 
-        const aiResponse = await generateMessage(GOAL_SET_PROMPT(newGoal));
-        const {message: updateMessage} = await AICommandService.processAIResponse(userId, aiResponse);
-        console.log(aiResponse);
-        await addMessageToHistory(userId, 'assistant', aiResponse);
-        await bot.sendMessage(msg.chat.id, updateMessage);
+        const result = await AIService.streamAIResponse({
+            userId,
+            userMessage: GOAL_SET_PROMPT(newGoal),
+            systemPrompt: SYSTEM_PROMPT,
+            bot,
+            openai,
+            model: OPEN_AI_MODEL,
+            shouldAddToHistory: true
+        });
+
+        console.log(result);
 
     } catch (error) {
         console.error('Error updating goal:', error);
-        const aiResponse = await generateMessage(ERROR_MESSAGE_PROMPT);
-        const {message: errorMessage} = await AICommandService.processAIResponse(msg.from?.id || 0, aiResponse);
-        console.log(aiResponse);
-        await bot.sendMessage(msg.chat.id, errorMessage);
+        const result = await AIService.streamAIResponse({
+            userId: msg.from?.id || 0,
+            userMessage: ERROR_MESSAGE_PROMPT,
+            systemPrompt: SYSTEM_PROMPT,
+            bot,
+            openai,
+            model: OPEN_AI_MODEL,
+            shouldAddToHistory: true
+        });
+
+        console.log(result);
     }
 });
 
@@ -400,18 +353,33 @@ bot.onText(/\/cleargoal/, async (msg) => {
         }
         await setUser(user);
 
-        const aiResponse = await generateMessage(GOAL_CLEAR_PROMPT());
-        const {message: clearMessage} = await AICommandService.processAIResponse(userId, aiResponse);
-        console.log(aiResponse);
-        await addMessageToHistory(userId, 'assistant', aiResponse);
-        await bot.sendMessage(msg.chat.id, clearMessage);
+        const result = await AIService.streamAIResponse({
+            userId,
+            userMessage: GOAL_CLEAR_PROMPT(),
+            systemPrompt: SYSTEM_PROMPT,
+            bot,
+            openai,
+            model: OPEN_AI_MODEL,
+            shouldUpdateTelegram: false,
+            shouldAddToHistory: true
+        });
+
+        console.log(result);
 
     } catch (error) {
         console.error('Error clearing goal:', error);
-        const aiResponse = await generateMessage(ERROR_MESSAGE_PROMPT);
-        const {message: errorMessage} = await AICommandService.processAIResponse(msg.from?.id || 0, aiResponse);
-        console.log(aiResponse);
-        await bot.sendMessage(msg.chat.id, errorMessage);
+        const result = await AIService.streamAIResponse({
+            userId: msg.from?.id || 0,
+            userMessage: ERROR_MESSAGE_PROMPT,
+            systemPrompt: SYSTEM_PROMPT,
+            bot,
+            openai,
+            model: OPEN_AI_MODEL,
+            shouldUpdateTelegram: false,
+            shouldAddToHistory: true
+        });
+
+        console.log(result);
     }
 });
 
@@ -444,10 +412,18 @@ bot.onText(/\/routines/, async (msg) => {
 
     } catch (error) {
         console.error('Error showing routines:', error);
-        const aiResponse = await generateMessage(ERROR_MESSAGE_PROMPT);
-        const {message: errorMessage} = await AICommandService.processAIResponse(msg.from?.id || 0, aiResponse);
-        console.log(aiResponse);
-        await bot.sendMessage(msg.chat.id, errorMessage);
+        const result = await AIService.streamAIResponse({
+            userId: msg.from?.id || 0,
+            userMessage: ERROR_MESSAGE_PROMPT,
+            systemPrompt: SYSTEM_PROMPT,
+            bot,
+            openai,
+            model: OPEN_AI_MODEL,
+            shouldUpdateTelegram: false,
+            shouldAddToHistory: true
+        });
+
+        console.log(result);
     }
 });
 
@@ -475,10 +451,18 @@ bot.onText(/\/tasks/, async (msg) => {
 
     } catch (error) {
         console.error('Error showing tasks:', error);
-        const aiResponse = await generateMessage(ERROR_MESSAGE_PROMPT);
-        const {message: errorMessage} = await AICommandService.processAIResponse(msg.from?.id || 0, aiResponse);
-        console.log(aiResponse);
-        await bot.sendMessage(msg.chat.id, errorMessage);
+        const result = await AIService.streamAIResponse({
+            userId: msg.from?.id || 0,
+            userMessage: ERROR_MESSAGE_PROMPT,
+            systemPrompt: SYSTEM_PROMPT,
+            bot,
+            openai,
+            model: OPEN_AI_MODEL,
+            shouldUpdateTelegram: false,
+            shouldAddToHistory: true
+        });
+
+        console.log(result);
     }
 });
 
@@ -498,19 +482,35 @@ bot.onText(/\/memory/, async (msg) => {
 
     } catch (error) {
         console.error('Error showing memory:', error);
-        const aiResponse = await generateMessage(ERROR_MESSAGE_PROMPT);
-        const {message: errorMessage} = await AICommandService.processAIResponse(msg.from?.id || 0, aiResponse);
-        console.log(aiResponse);
-        await bot.sendMessage(msg.chat.id, errorMessage);
+        const result = await AIService.streamAIResponse({
+            userId: msg.from?.id || 0,
+            userMessage: ERROR_MESSAGE_PROMPT,
+            systemPrompt: SYSTEM_PROMPT,
+            bot,
+            openai,
+            model: OPEN_AI_MODEL,
+            shouldUpdateTelegram: false,
+            shouldAddToHistory: true
+        });
+
+        console.log(result);
     }
 });
 
 bot.onText(/\/help/, async (msg) => {
     try {
-        const aiResponse = await generateMessage(DEFAULT_HELP_PROMPT());
-        const {message: helpMessage} = await AICommandService.processAIResponse(msg.from?.id || 0, aiResponse);
-        console.log(aiResponse);
-        await bot.sendMessage(msg.chat.id, helpMessage);
+        const result = await AIService.streamAIResponse({
+            userId: msg.from?.id || 0,
+            userMessage: DEFAULT_HELP_PROMPT(),
+            systemPrompt: SYSTEM_PROMPT,
+            bot,
+            openai,
+            model: OPEN_AI_MODEL,
+            shouldUpdateTelegram: false,
+            shouldAddToHistory: true
+        });
+
+        console.log(result);
     } catch (error) {
         console.error('Error showing help:', error);
         await bot.sendMessage(msg.chat.id, `Доступные команды:
@@ -558,11 +558,18 @@ bot.on('message', async (msg) => {
                 messageHistory: []
             };
             await setUser(newUser);
-            const aiResponse = await generateMessage(GREETING_PROMPT);
-            const {message: greetingMessage} = await AICommandService.processAIResponse(userId, aiResponse);
-            console.log(aiResponse);
-            await addMessageToHistory(userId, 'assistant', aiResponse);
-            await bot.sendMessage(msg.chat.id, greetingMessage);
+            const result = await AIService.streamAIResponse({
+                userId,
+                userMessage: GREETING_PROMPT,
+                systemPrompt: SYSTEM_PROMPT,
+                bot,
+                openai,
+                model: OPEN_AI_MODEL,
+                shouldUpdateTelegram: false,
+                shouldAddToHistory: true
+            });
+
+            console.log(result);
             return;
         }
 
@@ -585,17 +592,24 @@ bot.on('message', async (msg) => {
             existing.preferences.goal = text;
             await setUser(existing);
             await addMessageToHistory(userId, 'user', text);
-            const aiResponse = await generateMessage(GOAL_ACCEPTED_PROMPT(text));
-            const {message: acceptedMessage} = await AICommandService.processAIResponse(userId, aiResponse);
-            console.log(aiResponse);
-            await addMessageToHistory(userId, 'assistant', aiResponse);
-            await bot.sendMessage(msg.chat.id, acceptedMessage);
+            const result = await AIService.streamAIResponse({
+                userId,
+                userMessage: GOAL_ACCEPTED_PROMPT(text),
+                systemPrompt: SYSTEM_PROMPT,
+                bot,
+                openai,
+                model: OPEN_AI_MODEL,
+                shouldUpdateTelegram: false,
+                shouldAddToHistory: true
+            });
+
+            console.log(result);
             return;
         }
 
         // Use AI to respond with command processing
-        const aiResponse = await generateAIResponse(userId, text);
-        await bot.sendMessage(msg.chat.id, aiResponse);
+        await replyToUser(userId, text);
+
 
     } catch (error) {
         console.error('❌ Error handling message:', {
@@ -603,10 +617,18 @@ bot.on('message', async (msg) => {
             error: error instanceof Error ? error.message : String(error),
             timestamp: new Date().toISOString()
         });
-        const aiResponse = await generateMessage(ERROR_MESSAGE_PROMPT);
-        const {message: errorMessage} = await AICommandService.processAIResponse(msg.from?.id || 0, aiResponse);
-        console.log(aiResponse);
-        await bot.sendMessage(msg.chat.id, errorMessage);
+        const result = await AIService.streamAIResponse({
+            userId: msg.from?.id || 0,
+            userMessage: ERROR_MESSAGE_PROMPT,
+            systemPrompt: SYSTEM_PROMPT,
+            bot,
+            openai,
+            model: OPEN_AI_MODEL,
+            shouldUpdateTelegram: false,
+            shouldAddToHistory: true
+        });
+
+        console.log(result);
     }
 });
 
