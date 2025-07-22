@@ -407,8 +407,10 @@ bot.onText(/\/routines/, async (msg) => {
             return;
         }
 
-        const routineText = activeRoutines.map(r => `• ${r.name} (CRON: ${r.cron}, Annoyance: ${r.annoyance})`).join('\n');
-        await bot.sendMessage(msg.chat.id, `🔗 Активные рутины:\n${routineText}`);
+        const routineText = activeRoutines.map(r => `* ${r.name} (CRON: ${r.cron}, Annoyance: ${r.annoyance})`).join('\n');
+        await bot.sendMessage(msg.chat.id, `🔗 Активные рутины:\n\n${routineText}`, {
+            parse_mode: 'Markdown'
+        });
 
     } catch (error) {
         console.error('Error showing routines:', error);
@@ -446,8 +448,10 @@ bot.onText(/\/tasks/, async (msg) => {
             return;
         }
 
-        const taskText = pendingTasks.map(t => `• ${t.name} (Next: ${t.pingAt}, Annoyance: ${t.annoyance})`).join('\n');
-        await bot.sendMessage(msg.chat.id, `📋 Активные задачи:\n${taskText}`);
+        const taskText = pendingTasks.map(t => `* ${t.name} (Next: ${t.pingAt}, Annoyance: ${t.annoyance})`).join('\n');
+        await bot.sendMessage(msg.chat.id, `📋 Активные задачи:\n\n${taskText}`, {
+            parse_mode: 'Markdown'
+        });
 
     } catch (error) {
         console.error('Error showing tasks:', error);
@@ -478,7 +482,9 @@ bot.onText(/\/memory/, async (msg) => {
         }
 
         const memoryText = JSON.stringify(user.memory, null, 2);
-        await bot.sendMessage(msg.chat.id, `🧠 Сохраненная информация:\n\`\`\`${memoryText}\`\`\``);
+        await bot.sendMessage(msg.chat.id, `🧠 Сохраненная информация:\n\`\`\`${memoryText}\`\`\``, {
+            parse_mode: 'Markdown'
+        });
 
     } catch (error) {
         console.error('Error showing memory:', error);
