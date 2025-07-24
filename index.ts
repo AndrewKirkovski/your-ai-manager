@@ -93,7 +93,8 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
             openai,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: true,
-            shouldAddToHistory: true
+            shouldAddToHistory: true,
+            enableToolCalls: true,
         });
 
         // Cleanup old completed/failed tasks after processing (keep last 50 per user)
@@ -220,7 +221,8 @@ cron.schedule('* * * * *', async () => {
                         bot,
                         openai,
                         model: OPEN_AI_MODEL,
-                        shouldAddToHistory: true
+                        shouldAddToHistory: true,
+                        enableToolCalls: true
                     });
 
                     console.log(result);
@@ -567,7 +569,8 @@ bot.on('message', async (msg) => {
                 openai,
                 model: OPEN_AI_MODEL,
                 shouldUpdateTelegram: false,
-                shouldAddToHistory: true
+                shouldAddToHistory: true,
+                enableToolCalls: true
             });
 
             console.log(result);

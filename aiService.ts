@@ -1,8 +1,16 @@
 import OpenAI from 'openai';
 import TelegramBot from 'node-telegram-bot-api';
-import { AICommandService } from './aiCommandService';
-import { addMessageToHistory, getUser, getUserMessageHistory } from './userStore';
-import { getCurrentTime } from './dateUtils';
+import {AICommandService} from './aiCommandService';
+import {addMessageToHistory, getUser, getUserMessageHistory} from './userStore';
+import {getAllToolDefinitions, executeTool, ToolResult, ToolCall, tools} from './tools';
+import {ChatCompletionCreateParamsStreaming} from "openai/src/resources/chat/completions/completions";
+
+// Proper types for OpenAI messages with tool support
+type OpenAIMessage =
+    | { role: 'system'; content: string }
+    | { role: 'user'; content: string }
+    | { role: 'assistant'; content: string; tool_calls?: ToolCall[] }
+    | { role: 'tool'; content: string; tool_call_id: string };
 
 export interface AIStreamOptions {
     userId: number;
@@ -14,19 +22,34 @@ export interface AIStreamOptions {
     maxTokens?: number;
     shouldUpdateTelegram?: boolean;
     shouldAddToHistory?: boolean;
+    currentRecursionDepth?: number;
+    enableToolCalls?: boolean;
+    appendMessagesAfterUser?: OpenAIMessage[];
 }
 
 export interface AIStreamResult {
     message: string;
     commandResults: string[];
     rawResponse: string;
+    toolCalls?: ToolCall[];
+    toolResults?: ToolResult[];
 }
 
 export class AIService {
     /**
-     * Unified function to handle AI streaming responses
+     * Unified function to handle AI streaming responses with tool calling support
      */
     static async streamAIResponse(options: AIStreamOptions): Promise<AIStreamResult> {
+        return this.streamAIResponseInternal({
+            ...options,
+            enableToolCalls: (options.currentRecursionDepth ?? 0) >= 5 ? false : (options.enableToolCalls || false),
+        });
+    }
+
+    /**
+     * Internal method to handle AI streaming responses
+     */
+    private static async streamAIResponseInternal(options: AIStreamOptions): Promise<AIStreamResult> {
         const {
             userId,
             userMessage,
@@ -35,7 +58,10 @@ export class AIService {
             openai,
             model,
             maxTokens = 250,
-            shouldAddToHistory = true
+            shouldAddToHistory = true,
+            enableToolCalls = false,
+            currentRecursionDepth = 0,
+            appendMessagesAfterUser,
         } = options;
 
         try {
@@ -46,6 +72,11 @@ export class AIService {
             async function updateTelegramMessage(isFinal = false) {
                 try {
                     const contentToSend = isFinal ? aiResponseAccumulated : aiResponseAccumulated + ' ...';
+
+                    if(!aiResponseAccumulated.length) {
+                        console.warn('AI response is empty, not updating Telegram message');
+                        return;
+                    }
 
                     if (!messageId) {
                         // Send initial message
@@ -75,27 +106,40 @@ export class AIService {
             });
 
             // Get recent message history for context
-            const recentMessages = await this.getRecentMessages(userId, 50);
+            const recentMessages = await this.getRecentMessages(userId, 30);
 
-            const messages = [
+            console.log(recentMessages);
+
+            const messages: OpenAIMessage[] = [
                 {
-                    role: 'system' as const,
+                    role: 'system',
                     content: systemPrompt
                 },
                 ...recentMessages,
-                { role: 'user' as const, content: userMessage }
+                {role: 'user', content: userMessage},
+                ...(appendMessagesAfterUser || []),
             ];
 
             // Create streaming request
-            const stream = await openai.chat.completions.create({
+            const requestOptions: ChatCompletionCreateParamsStreaming = {
                 max_tokens: maxTokens,
                 model: model,
                 stream: true,
                 messages
-            });
+            };
+
+            // Add tools if tool calling is enabled
+            if (enableToolCalls) {
+                requestOptions.tools = getAllToolDefinitions()
+                requestOptions.tool_choice = 'auto';
+            }
+
+            const stream = await openai.chat.completions.create(requestOptions);
 
             let aiResponseAccumulated = '';
-            
+            let historyResponseAccumulated = '';
+            let toolCalls: ToolCall[] = [];
+            let currentToolCall: Partial<ToolCall> | null = null;
 
             await bot.sendChatAction(userId, 'typing');
 
@@ -112,14 +156,52 @@ export class AIService {
 
             // Process streaming response
             for await (const chunk of stream) {
-                const content = chunk.choices[0]?.delta?.content;
-                if (content) {
-                    aiResponseAccumulated += content;
+                const delta = chunk.choices[0]?.delta;
+
+                // Handle content
+                if (delta?.content) {
+                    aiResponseAccumulated += delta.content;
+                }
+
+                // Handle tool calls
+                if (delta?.tool_calls) {
+                    for (const toolCallDelta of delta.tool_calls) {
+                        if (toolCallDelta.index !== undefined) {
+                            // Start of a new tool call
+                            if (!currentToolCall || currentToolCall.id !== toolCallDelta.id) {
+                                if (currentToolCall && currentToolCall.id) {
+                                    toolCalls.push(currentToolCall as ToolCall);
+                                }
+                                currentToolCall = {
+                                    id: toolCallDelta.id || '',
+                                    type: 'function',
+                                    function: {
+                                        name: '',
+                                        arguments: ''
+                                    }
+                                };
+                            }
+                        }
+
+                        if (currentToolCall) {
+                            if (toolCallDelta.function?.name) {
+                                currentToolCall.function!.name += toolCallDelta.function.name;
+                            }
+                            if (toolCallDelta.function?.arguments) {
+                                currentToolCall.function!.arguments += toolCallDelta.function.arguments;
+                            }
+                        }
+                    }
                 }
 
                 // Check if stream is done
                 if (chunk.choices[0]?.finish_reason) {
                     clearInterval(updateInterval_id);
+
+                    // Add the last tool call if exists
+                    if (currentToolCall && currentToolCall.id) {
+                        toolCalls.push(currentToolCall as ToolCall);
+                    }
                     break;
                 }
             }
@@ -127,21 +209,105 @@ export class AIService {
             console.log('🤖 AI RAW:', {
                 userId,
                 accumulatedContent: aiResponseAccumulated,
+                toolCalls: toolCalls.length,
                 timestamp: new Date().toISOString()
             });
 
+            historyResponseAccumulated = aiResponseAccumulated;
+
+            if (toolCalls.length > 0 && enableToolCalls) {
+
+                console.log('🔧 Executing tool calls:', {
+                    userId,
+                    toolCalls: toolCalls.map(tc => tc.function.name),
+                    timestamp: new Date().toISOString()
+                });
+
+                const newAppendedMessages = [...appendMessagesAfterUser || []];
+               newAppendedMessages.push({
+                    role: 'assistant',
+                    content: aiResponseAccumulated,
+                    tool_calls: toolCalls.map(tc => ({
+                        ...tc,
+                        function: {
+                            name: tc.function.name,
+                            arguments: tc.function.arguments || '{}'
+                        }
+                    }))
+                });
+
+                for (const toolCall of toolCalls) {
+                    try {
+                        const result = await executeTool(
+                            toolCall.function.name as keyof typeof tools,
+                            toolCall.function.arguments,
+                            userId,
+                        );
+
+                        newAppendedMessages.push({
+                            role: 'tool',
+                            content: JSON.stringify(result),
+                            tool_call_id: toolCall.id,
+                        })
+
+                        console.log('✅ Tool executed:', {
+                            userId,
+                            toolName: toolCall.function.name,
+                            result: result,
+                            timestamp: new Date().toISOString()
+                        });
+
+                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Success call a tool: ${toolCall.function.name}]\n\n`;
+                    } catch (error) {
+                        console.error('❌ Tool execution failed:', {
+                            userId,
+                            toolName: toolCall.function.name,
+                            error: error instanceof Error ? error.message : String(error),
+                            timestamp: new Date().toISOString()
+                        });
+
+                        newAppendedMessages.push({
+                            tool_call_id: toolCall.id,
+                            role: 'tool',
+                            content: JSON.stringify({error: error instanceof Error ? error.message : String(error)})
+                        })
+
+                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Failed call a tool: ${toolCall.function.name}]\n\n`;
+                    }
+                }
+
+                console.log('🔄 Making recursive call with tool results:', {
+                    userId,
+                    newAppendedMessages,
+                    recursionDepth: currentRecursionDepth + 1,
+                    timestamp: new Date().toISOString()
+                });
+
+                const recursiveResult = await this.streamAIResponse({
+                    ...options,
+                    currentRecursionDepth: currentRecursionDepth + 1,
+                    appendMessagesAfterUser: newAppendedMessages,
+                    shouldAddToHistory: false // Don't add recursive calls to history
+                });
+
+                historyResponseAccumulated = historyResponseAccumulated + recursiveResult.rawResponse;
+
+            }
+
             // Process AI commands and return clean response
-            const { message, commandResults } = await AICommandService.processAIResponse(userId, aiResponseAccumulated);
+            const {message, commandResults} = await AICommandService.processAIResponse(userId, aiResponseAccumulated);
 
             // Add messages to history if requested
             if (shouldAddToHistory) {
                 await addMessageToHistory(userId, 'user', userMessage);
-                await addMessageToHistory(userId, 'assistant', aiResponseAccumulated);
+
+                await addMessageToHistory(userId, 'assistant', historyResponseAccumulated);
 
                 console.log('📝 Messages added to history:', {
                     userId,
                     userMessageLength: userMessage.length,
-                    aiMessageLength: message.length,
+                    aiMessageLength: historyResponseAccumulated.length,
+                    toolCalls: toolCalls.length,
                     totalHistoryAfter: (await getUserMessageHistory(userId)).length,
                     timestamp: new Date().toISOString()
                 });
@@ -154,7 +320,8 @@ export class AIService {
             return {
                 message,
                 commandResults,
-                rawResponse: aiResponseAccumulated
+                rawResponse: aiResponseAccumulated,
+                toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             };
 
         } catch (error) {
@@ -164,17 +331,17 @@ export class AIService {
                 error: error instanceof Error ? error.message : String(error),
                 timestamp: new Date().toISOString()
             });
-            
+
             const errorMessage = `
 Ой 🐺
 \`\`\`
 ${error instanceof Error ? error.message : String(error)}
 \`\`\`            
             `;
-            await bot.sendMessage(userId, errorMessage,{
-                    parse_mode: 'Markdown',
+            await bot.sendMessage(userId, errorMessage, {
+                parse_mode: 'Markdown',
             });
-            
+
             return {
                 message: errorMessage,
                 commandResults: [],
@@ -186,10 +353,7 @@ ${error instanceof Error ? error.message : String(error)}
     /**
      * Get recent messages for context
      */
-    private static async getRecentMessages(userId: number, limit: number = 30): Promise<{
-        role: 'user' | 'assistant',
-        content: string
-    }[]> {
+    private static async getRecentMessages(userId: number, limit: number = 30): Promise<OpenAIMessage[]> {
         const messageHistory = await getUserMessageHistory(userId);
         const recentMessages = messageHistory.slice(-limit);
 
@@ -205,7 +369,7 @@ ${error instanceof Error ? error.message : String(error)}
     static async generateMessage(
         prompt: string,
         systemPrompt: string,
-        messages: { role: 'user' | 'assistant', content: string }[] = [],
+        messages: OpenAIMessage[] = [],
         openai: OpenAI,
         model: string,
         maxTokens: number = 250
@@ -215,9 +379,9 @@ ${error instanceof Error ? error.message : String(error)}
                 max_tokens: maxTokens,
                 model: model,
                 messages: [
-                    { role: 'system', content: systemPrompt },
+                    {role: 'system', content: systemPrompt},
                     ...messages,
-                    { role: 'user', content: prompt }
+                    {role: 'user', content: prompt}
                 ]
             });
 

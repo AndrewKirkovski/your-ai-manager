@@ -1,6 +1,6 @@
 import { DateTime } from 'luxon';
 import cronstrue from 'cronstrue';
-import `cronstrue/locales/ru`;
+import 'cronstrue/locales/ru';
 
 // Set default timezone to Warsaw (Europe/Warsaw)
 const DEFAULT_TIMEZONE = 'Europe/Warsaw';
