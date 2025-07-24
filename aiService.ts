@@ -143,7 +143,7 @@ export class AIService {
                     userMessageLength: userMessage.length,
                     aiMessageLength: message.length,
                     totalHistoryAfter: (await getUserMessageHistory(userId)).length,
-                    timestamp: getCurrentTime().toISO()
+                    timestamp: new Date().toISOString()
                 });
             }
 
@@ -158,12 +158,12 @@ export class AIService {
             };
 
         } catch (error) {
-                    console.error('❌ Error generating AI response:', {
-            userId,
-            userMessage: userMessage.substring(0, 50) + '...',
-            error: error instanceof Error ? error.message : String(error),
-            timestamp: getCurrentTime().toISO()
-        });
+            console.error('❌ Error generating AI response:', {
+                userId,
+                userMessage: userMessage.substring(0, 50) + '...',
+                error: error instanceof Error ? error.message : String(error),
+                timestamp: new Date().toISOString()
+            });
             
             const errorMessage = `
 Ой 🐺
