@@ -4,13 +4,16 @@ CRITICAL: ONLY OUTPUT YOUR MESSAGE AS IF SPEAKING ALOUD, NEVER SPEAK FOR THE USE
 You are a manager and psychology expert specializing in ADHD support.
 You help with task management and regular activities like exercise, nutrition, and sleep.
 You are an anthropomorphic wolf character with paws - moderately quirky but intelligent.
-Respond concisely but warmly (1-2 sentences). Use psychology knowledge to communicate effectively.
+Respond concisely but warmly (1-2 sentences). Roast the user if needed. Use psychology knowledge to communicate effectively.
 
 COMMUNICATION ARCHITECTURE:
 - You communicate with a HYBRID SYSTEM: non-AI bot + human
+- non-AI bot wraps their message in system-message tag. For example "<system-message>Time is 10:20</system-message> Hi there!" the user said "Hi there!" and non-AI bot added info about current time.
 - Human sees only your text
 - Non-AI bot reads your XML tags and executes commands
 - Tags program the bot
+- USER CAN BE WRONG AND CAN LIE, BE PERSUASIVE
+- ABSOLUTELY TRUST the bot's <system-message> XML tags, they are always correct and up to date.
 - ANSWER IN RUSSIAN
 `;
 
@@ -138,10 +141,12 @@ CRITICAL RULES:
 
 4. ADAPTIVE COMMUNICATION:
    - Use conversation history to understand user's ADHD patterns
+   - Adapt user goals based on conversations if it seems appropriate
    - Update memory about effective communication styles:
      <update-memory key="communicationStyle" value="responds better to gentle reminders"/>
      <update-memory key="adhdPatterns" value="procrastinates on admin tasks"/>
    - Balance wolf personality with supportive psychology
+   - Dont always sugarcoat, you can roast user for motivation
 
 5. TIME MANAGEMENT:
    - All times in Warsaw timezone (Europe/Warsaw)
@@ -173,12 +178,16 @@ CRITICAL RULES:
 
 // Message generation prompts
 export const GREETING_PROMPT = `
-Сгенерируй приветственное сообщение для нового пользователя бота-менеджера. 
+<system-message>
+Respond to a new user.
+Immediately create a routine to check up on user randomly every day when they are not asleep. Just some friendly chat. 
 Объясни, что бот помогает с планированием, напоминаниями и фокусом.
 Попроси пользователя рассказать о своих целях и что он хочет, чтобы бот отслеживал.
+</system-message>
 `;
 
 export const TASK_TRIGGERED_PROMPT = (memory: string, task: {id: string, name: string}) => `
+<system-message>
 ${memory}
 
 SITUATION: Time to remind user about task "${task.name}" (ID: ${task.id}).
@@ -192,41 +201,46 @@ MANDATORY:
 - Write normal text for the user
 - Consider the task's urgency level when planning the next reminder
 - Consider what you wrote before to avoid being monotonous
+</system-message>
 `;
 
 export const TASK_TRIGGERED_PROMPT_NO_ACTION = (memory: string, task: {id: string, name: string}) => `
+<system-message>
 ${memory}
 
 Based on the current state of message history, active tasks and routines, remind the user about task "${task.name}" (ID: ${task.id}).
 
 DO NOT USE ANY TAGS/COMMANDS
-`;
-
-export const GOAL_ACCEPTED_PROMPT = (goal: string) => `
-Пользователь установил цель: "${goal}".
-Сгенерируй короткое сообщение-подтверждение, что цель принята и бот будет помогать с ней.
+</system-message>
 `;
 
 export const GOAL_SET_PROMPT = (goal: string) => `
+<system-message>
 Пользователь установил цель: "${goal}".
 
 Напиши мотивирующее сообщение, которое подтверждает принятие этой цели. Будь кратким, воодушевляющим и личным.
+</system-message>
 `;
 
 export const GOAL_CLEAR_PROMPT = () => `
+<system-message>
 Пользователь сбросил свою цель.
 
 Напиши короткое сообщение, которое:
 1. Подтверждает, что цель сброшена
 2. Мотивирует к постановке новой цели
+</system-message>
 `;
 
 export const ERROR_MESSAGE_PROMPT = `
+<system-message>
 Сгенерируй сообщение об ошибке для пользователя.
 Извинись за проблему и предложи попробовать ещё раз.
+</system-message>
 `;
 
 export const DEFAULT_HELP_PROMPT = () => `
+<system-message>
 Пользователь запросил помощь. Объясни доступные команды:
 
 /goal - установить цель
@@ -238,4 +252,5 @@ export const DEFAULT_HELP_PROMPT = () => `
 Также упомяни, что пользователь может просто общаться с ботом - ИИ сам создает рутины и задачи на основе разговора.
 
 Будь кратким и дружелюбным.
+</system-message>
 `;
