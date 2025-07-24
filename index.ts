@@ -63,10 +63,10 @@ Time: ${currentTime.toISO()}
 Goal: ${user.preferences.goal || 'not set'}
 
 Routines/Schedule:
-${activeRoutines.map(r => `id: ${r.id} cron: ${r.cron} (${formatCronHuman(r.cron)}) defaultAnnoyance: ${r.defaultAnnoyance} name: ${r.name} timesCompleted: ${r.stats.completed} timesFailed: ${r.stats.failed}`).join('\n') || 'no active routines'}
+${activeRoutines.map(r => `id: ${r.id} cron: ${r.cron} defaultAnnoyance: ${r.defaultAnnoyance} name: ${r.name} timesCompleted: ${r.stats.completed} timesFailed: ${r.stats.failed}`).join('\n') || 'no active routines'}
 
 Active Tasks: 
-${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt ? formatDateHuman(t.dueAt) : 'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'no active tasks'}
+${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'no active tasks'}
 
 Memory: ${JSON.stringify(user.memory || {}, null, 2)}
         `
@@ -93,7 +93,8 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
             openai,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: true,
-            shouldAddToHistory: true,
+            addUserToHistory: true,
+            addAssistantToHistory: true,
             enableToolCalls: true,
         });
 
@@ -221,7 +222,8 @@ cron.schedule('* * * * *', async () => {
                         bot,
                         openai,
                         model: OPEN_AI_MODEL,
-                        shouldAddToHistory: true,
+                        addUserToHistory: false,
+                        addAssistantToHistory: true,
                         enableToolCalls: true
                     });
 
@@ -301,7 +303,8 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
             bot,
             openai,
             model: OPEN_AI_MODEL,
-            shouldAddToHistory: true
+            addUserToHistory: true,
+            addAssistantToHistory: true,
         });
 
         console.log(result);
@@ -315,7 +318,8 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
             bot,
             openai,
             model: OPEN_AI_MODEL,
-            shouldAddToHistory: true
+            addUserToHistory: false,
+            addAssistantToHistory: false,
         });
 
         console.log(result);
@@ -357,7 +361,8 @@ bot.onText(/\/cleargoal/, async (msg) => {
             openai,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
-            shouldAddToHistory: true
+            addUserToHistory: false,
+            addAssistantToHistory: true,
         });
 
         console.log(result);
@@ -372,7 +377,8 @@ bot.onText(/\/cleargoal/, async (msg) => {
             openai,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
-            shouldAddToHistory: true
+            addUserToHistory: false,
+            addAssistantToHistory: false,
         });
 
         console.log(result);
@@ -418,7 +424,8 @@ bot.onText(/\/routines/, async (msg) => {
             openai,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
-            shouldAddToHistory: true
+            addUserToHistory: false,
+            addAssistantToHistory: false,
         });
 
         console.log(result);
@@ -459,7 +466,8 @@ bot.onText(/\/tasks/, async (msg) => {
             openai,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
-            shouldAddToHistory: true
+            addUserToHistory: false,
+            addAssistantToHistory: false,
         });
 
         console.log(result);
@@ -492,7 +500,8 @@ bot.onText(/\/memory/, async (msg) => {
             openai,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
-            shouldAddToHistory: true
+            addUserToHistory: false,
+            addAssistantToHistory: false,
         });
 
         console.log(result);
@@ -509,7 +518,8 @@ bot.onText(/\/help/, async (msg) => {
             openai,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
-            shouldAddToHistory: true
+            addUserToHistory: false,
+            addAssistantToHistory: true,
         });
 
         console.log(result);
@@ -569,7 +579,8 @@ bot.on('message', async (msg) => {
                 openai,
                 model: OPEN_AI_MODEL,
                 shouldUpdateTelegram: false,
-                shouldAddToHistory: true,
+                addUserToHistory: true,
+                addAssistantToHistory: true,
                 enableToolCalls: true
             });
 
@@ -605,7 +616,8 @@ bot.on('message', async (msg) => {
             openai,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
-            shouldAddToHistory: true
+            addUserToHistory: false,
+            addAssistantToHistory: false,
         });
 
         console.log(result);

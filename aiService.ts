@@ -21,7 +21,8 @@ export interface AIStreamOptions {
     model: string;
     maxTokens?: number;
     shouldUpdateTelegram?: boolean;
-    shouldAddToHistory?: boolean;
+    addUserToHistory?: boolean;
+    addAssistantToHistory?: boolean;
     currentRecursionDepth?: number;
     enableToolCalls?: boolean;
     appendMessagesAfterUser?: OpenAIMessage[];
@@ -58,7 +59,8 @@ export class AIService {
             openai,
             model,
             maxTokens = 250,
-            shouldAddToHistory = true,
+            addUserToHistory = true,
+            addAssistantToHistory = true,
             enableToolCalls = false,
             currentRecursionDepth = 0,
             appendMessagesAfterUser,
@@ -139,7 +141,6 @@ export class AIService {
             let aiResponseAccumulated = '';
             let historyResponseAccumulated = '';
             let toolCalls: ToolCall[] = [];
-            let currentToolCall: Partial<ToolCall> | null = null;
 
             await bot.sendChatAction(userId, 'typing');
 
@@ -167,12 +168,10 @@ export class AIService {
                 if (delta?.tool_calls) {
                     for (const toolCallDelta of delta.tool_calls) {
                         if (toolCallDelta.index !== undefined) {
+                            let currentToolCall = toolCalls[toolCallDelta.index];
                             // Start of a new tool call
-                            if (!currentToolCall || currentToolCall.id !== toolCallDelta.id) {
-                                if (currentToolCall && currentToolCall.id) {
-                                    toolCalls.push(currentToolCall as ToolCall);
-                                }
-                                currentToolCall = {
+                            if (!currentToolCall) {
+                                currentToolCall = toolCalls[toolCallDelta.index] = {
                                     id: toolCallDelta.id || '',
                                     type: 'function',
                                     function: {
@@ -181,9 +180,6 @@ export class AIService {
                                     }
                                 };
                             }
-                        }
-
-                        if (currentToolCall) {
                             if (toolCallDelta.function?.name) {
                                 currentToolCall.function!.name += toolCallDelta.function.name;
                             }
@@ -197,11 +193,6 @@ export class AIService {
                 // Check if stream is done
                 if (chunk.choices[0]?.finish_reason) {
                     clearInterval(updateInterval_id);
-
-                    // Add the last tool call if exists
-                    if (currentToolCall && currentToolCall.id) {
-                        toolCalls.push(currentToolCall as ToolCall);
-                    }
                     break;
                 }
             }
@@ -214,6 +205,13 @@ export class AIService {
             });
 
             historyResponseAccumulated = aiResponseAccumulated;
+
+            // Process AI commands and return clean response
+            const {message, commandResults} = await AICommandService.processAIResponse(userId, aiResponseAccumulated);
+
+            const finalContent = message + (commandResults.length > 0 ? '\n\n' + commandResults.join('\n') : '');
+            aiResponseAccumulated = finalContent;
+            await updateTelegramMessage(true);
 
             if (toolCalls.length > 0 && enableToolCalls) {
 
@@ -287,35 +285,30 @@ export class AIService {
                     ...options,
                     currentRecursionDepth: currentRecursionDepth + 1,
                     appendMessagesAfterUser: newAppendedMessages,
-                    shouldAddToHistory: false // Don't add recursive calls to history
+                    addUserToHistory: false // Don't add recursive calls to history
                 });
 
                 historyResponseAccumulated = historyResponseAccumulated + recursiveResult.rawResponse;
 
             }
 
-            // Process AI commands and return clean response
-            const {message, commandResults} = await AICommandService.processAIResponse(userId, aiResponseAccumulated);
+
 
             // Add messages to history if requested
-            if (shouldAddToHistory) {
+            if (addUserToHistory) {
                 await addMessageToHistory(userId, 'user', userMessage);
-
-                await addMessageToHistory(userId, 'assistant', historyResponseAccumulated);
-
-                console.log('📝 Messages added to history:', {
+                console.log('📝 Added user message to history:', userMessage, {
                     userId,
-                    userMessageLength: userMessage.length,
-                    aiMessageLength: historyResponseAccumulated.length,
-                    toolCalls: toolCalls.length,
-                    totalHistoryAfter: (await getUserMessageHistory(userId)).length,
                     timestamp: new Date().toISOString()
                 });
             }
-
-            const finalContent = message + (commandResults.length > 0 ? '\n\n' + commandResults.join('\n') : '');
-            aiResponseAccumulated = finalContent;
-            await updateTelegramMessage(true);
+            if(addAssistantToHistory) {
+                await addMessageToHistory(userId, 'assistant', historyResponseAccumulated);
+                console.log('📝 Added ass message to history:', historyResponseAccumulated, {
+                    userId,
+                    timestamp: new Date().toISOString()
+                });
+            }
 
             return {
                 message,
