@@ -86,7 +86,7 @@ const updateTask = async (userId: number, task: Partial<Task>): Promise<string> 
     }
     await updateUserTask(userId, task.id, (r) => {
         Object.assign(r, {
-            postponeCount: task.dueAt ? ((r.postponeCount ?? 0) + 1) : r.postponeCount, // Reset postpone count if no dueAt
+            postponeCount: task.pingAt ? ((r.postponeCount ?? 0) + 1) : r.postponeCount, // Reset postpone count if no dueAt
             status: 'pending', // Reset status to pending on update
             ...task,
             requiresAction: task.requiresAction ?? r.requiresAction,

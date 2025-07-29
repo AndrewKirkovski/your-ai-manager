@@ -37,15 +37,6 @@ const openai = new OpenAI({
     ...(OPEN_AI_ENDPOINT && {baseURL: OPEN_AI_ENDPOINT}),
 });
 
-// Legacy function for backward compatibility - now uses AIService
-async function generateMessage(
-    prompt: string,
-    systemPrompt: string = SYSTEM_PROMPT,
-    messages: { role: 'user' | 'assistant', content: string }[] = []
-): Promise<string> {
-    return AIService.generateMessage(prompt, systemPrompt, messages, openai, OPEN_AI_MODEL);
-}
-
 async function getCurrentInfo(userId: number): Promise<string> {
     const user = await getUser(userId);
     if (!user) throw new Error('Ошибка: пользователь не найден');
@@ -55,17 +46,17 @@ async function getCurrentInfo(userId: number): Promise<string> {
 
     const tasks = await getAllTasks(userId);
     const pendingTasks = tasks.filter(t => t.status === 'pending');
-
-    const currentTime = getCurrentTime();
+    const replanningTasks = tasks.filter(t => t.status === 'needs_replanning');
     const Memory = `
-Time: ${currentTime.toISO()}
-
 Goal: ${user.preferences.goal || 'not set'}
 
 Routines/Schedule:
 ${activeRoutines.map(r => `id: ${r.id} cron: ${r.cron} defaultAnnoyance: ${r.defaultAnnoyance} name: ${r.name} timesCompleted: ${r.stats.completed} timesFailed: ${r.stats.failed}`).join('\n') || 'no active routines'}
 
-Active Tasks: 
+Pending Tasks: 
+${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'no active tasks'}
+
+Tasks that need AI agent to update them: 
 ${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'no active tasks'}
 
 Memory: ${JSON.stringify(user.memory || {}, null, 2)}
@@ -210,6 +201,16 @@ cron.schedule('* * * * *', async () => {
                 if (task.pingAt <= now.toJSDate()) {
                     console.log('📱 Pinging user about pending task:', task);
 
+                    if (!task.requiresAction) {
+                        await updateUserTask(user.userId, task.id, (t) => {
+                            t.status = 'completed';
+                        })
+                    } else {
+                        await updateUserTask(user.userId, task.id, (t) => {
+                            t.status = 'needs_replanning'
+                        });
+                    }
+
                     const memory = await getCurrentInfo(user.userId);
 
                     // Generate AI response asking about the task
@@ -229,11 +230,7 @@ cron.schedule('* * * * *', async () => {
 
                     console.log(result);
 
-                    if (!task.requiresAction) {
-                        await updateUserTask(user.userId, task.id, (t) => {
-                            t.status = 'completed';
-                        })
-                    }
+
                 } else {
                     /* console.log('⏳ Task not ready for ping yet:', {
                         userId: user.userId,

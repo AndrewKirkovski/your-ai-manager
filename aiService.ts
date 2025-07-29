@@ -2,8 +2,10 @@ import OpenAI from 'openai';
 import TelegramBot from 'node-telegram-bot-api';
 import {AICommandService} from './aiCommandService';
 import {addMessageToHistory, getUser, getUserMessageHistory} from './userStore';
-import {getAllToolDefinitions, executeTool, ToolResult, ToolCall, tools} from './tools';
+import {getAllToolDefinitions, executeTool, tools} from './tools';
 import {ChatCompletionCreateParamsStreaming} from "openai/src/resources/chat/completions/completions";
+import {ToolCall, ToolResult} from "./tool.types";
+import {formatDateHuman} from "./dateUtils";
 
 // Proper types for OpenAI messages with tool support
 type OpenAIMessage =
@@ -58,7 +60,7 @@ export class AIService {
             bot,
             openai,
             model,
-            maxTokens = 250,
+            maxTokens = 300,
             addUserToHistory = true,
             addAssistantToHistory = true,
             enableToolCalls = false,
@@ -69,6 +71,15 @@ export class AIService {
         try {
             let messageId: number | undefined;
             let lastSentContent: string = '';
+
+            // Add messages to history if requested
+            if (addUserToHistory) {
+                await addMessageToHistory(userId, 'user', userMessage);
+                console.log('📝 Added user message to history:', userMessage, {
+                    userId,
+                    timestamp: new Date().toISOString()
+                });
+            }
 
             // Function to update Telegram message during streaming
             async function updateTelegramMessage(isFinal = false) {
@@ -103,14 +114,12 @@ export class AIService {
 
             console.log('💬 Generating AI response:', {
                 userId,
-                userMessage: userMessage.substring(0, 100) + (userMessage.length > 100 ? '...' : ''),
+                userMessage,
                 timestamp: new Date().toISOString()
             });
 
             // Get recent message history for context
             const recentMessages = await this.getRecentMessages(userId, 30);
-
-            console.log(recentMessages);
 
             const messages: OpenAIMessage[] = [
                 {
@@ -118,7 +127,7 @@ export class AIService {
                     content: systemPrompt
                 },
                 ...recentMessages,
-                {role: 'user', content: userMessage},
+                {role: 'user', content: userMessage + `<system>At ${new Date().toISOString()}</system>`},
                 ...(appendMessagesAfterUser || []),
             ];
 
@@ -135,6 +144,8 @@ export class AIService {
                 requestOptions.tools = getAllToolDefinitions()
                 requestOptions.tool_choice = 'auto';
             }
+
+            console.debug('💬 FULL AI PROMPT:', requestOptions);
 
             const stream = await openai.chat.completions.create(requestOptions);
 
@@ -199,8 +210,8 @@ export class AIService {
 
             console.log('🤖 AI RAW:', {
                 userId,
-                accumulatedContent: aiResponseAccumulated,
-                toolCalls: toolCalls.length,
+                aiResponseAccumulated,
+                toolCalls,
                 timestamp: new Date().toISOString()
             });
 
@@ -217,7 +228,7 @@ export class AIService {
 
                 console.log('🔧 Executing tool calls:', {
                     userId,
-                    toolCalls: toolCalls.map(tc => tc.function.name),
+                    toolCalls,
                     timestamp: new Date().toISOString()
                 });
 
@@ -294,14 +305,7 @@ export class AIService {
 
 
 
-            // Add messages to history if requested
-            if (addUserToHistory) {
-                await addMessageToHistory(userId, 'user', userMessage);
-                console.log('📝 Added user message to history:', userMessage, {
-                    userId,
-                    timestamp: new Date().toISOString()
-                });
-            }
+
             if(addAssistantToHistory) {
                 await addMessageToHistory(userId, 'assistant', historyResponseAccumulated);
                 console.log('📝 Added ass message to history:', historyResponseAccumulated, {
@@ -352,36 +356,7 @@ ${error instanceof Error ? error.message : String(error)}
 
         return recentMessages.map(m => ({
             role: m.role as 'user' | 'assistant',
-            content: m.content
+            content: m.content + `<system>At ${formatDateHuman(m.timestamp)}</system>`
         }));
-    }
-
-    /**
-     * Legacy function for backward compatibility (non-streaming)
-     */
-    static async generateMessage(
-        prompt: string,
-        systemPrompt: string,
-        messages: OpenAIMessage[] = [],
-        openai: OpenAI,
-        model: string,
-        maxTokens: number = 250
-    ): Promise<string> {
-        try {
-            const response = await openai.chat.completions.create({
-                max_tokens: maxTokens,
-                model: model,
-                messages: [
-                    {role: 'system', content: systemPrompt},
-                    ...messages,
-                    {role: 'user', content: prompt}
-                ]
-            });
-
-            return response.choices[0].message?.content?.trim() || 'Ошибка генерации сообщения';
-        } catch (error) {
-            console.error('Error generating message:', error);
-            return 'Извини, проблемы с генерацией сообщения 🐺';
-        }
     }
 } 

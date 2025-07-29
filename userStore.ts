@@ -32,7 +32,7 @@ export type Routine = {
     createdAt: Date;
 };
 
-export type TaskStatus = 'pending' | 'completed' | 'failed';
+export type TaskStatus = 'pending' | 'completed' | 'failed' | 'needs_replanning';
 export type Task = {
     id: string;
     name: string;
