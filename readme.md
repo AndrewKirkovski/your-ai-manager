@@ -4,7 +4,7 @@
 
 Click below to roll out your own instance on [Railway](https://railway.app):
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://git.spiralscout.com/ryotsuke/ai-managers)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/AndrewKirkovski/your-ai-manager)
 
 
 > *"Because sometimes you need a furry friend to remind you that yes, you should probably eat lunch"* 🐺
