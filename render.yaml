@@ -13,7 +13,3 @@ services:
         sync: false
       - key: OPEN_AI_ENDPOINT
         sync: false
-    disk:
-      name: bot-data
-      mountPath: /data
-      sizeGB: 1
