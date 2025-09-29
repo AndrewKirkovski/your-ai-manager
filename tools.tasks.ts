@@ -9,7 +9,8 @@ import {
     Task,
     TaskStatus,
     updateUserRoutine,
-    updateUserTask
+    updateUserTask,
+    removeUserTask
 } from "./userStore";
 
 export const GetTaskById: Tool = {
@@ -376,6 +377,41 @@ export const MarkTaskFailed: Tool = {
         };
     }
 };
+
+export const DeleteTask: Tool = {
+    name: 'DeleteTask',
+    description: 'Delete a task by its ID',
+    parameters: {
+        type: 'object',
+        properties: {
+            task_id: {
+                type: 'string',
+                description: 'The ID of the task to delete'
+            }
+        },
+        required: ['task_id']
+    },
+    execute: async (args: { userId: string; task_id: string }) => {
+        const userId = parseInt(args.userId);
+        const taskId = args.task_id;
+
+        // Check if task exists
+        const existingTask = await getTask(userId, taskId);
+        if (!existingTask) {
+            throw new Error(`Task with ID ${taskId} not found`);
+        }
+
+        // Delete the task
+        await removeUserTask(userId, taskId);
+
+        return {
+            success: true,
+            deleted_task: existingTask,
+            message: `Task "${existingTask.name}" deleted successfully`
+        };
+    }
+};
+
 export const GetTasksByRoutine: Tool = {
     name: 'GetTasksByRoutine',
     description: 'Fetch all tasks for a specific routine',

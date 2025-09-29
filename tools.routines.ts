@@ -5,11 +5,12 @@ import {
     getAllRoutines,
     getRoutine,
     Routine,
-    updateUserRoutine
+    updateUserRoutine,
+    removeUserRoutine
 } from "./userStore";
 
-export const add_routine: Tool = {
-    name: 'add_routine',
+export const AddRoutine: Tool = {
+    name: 'AddRoutine',
     description: 'Create a new routine',
     parameters: {
         type: 'object',
@@ -74,8 +75,8 @@ export const add_routine: Tool = {
     }
 };
 
-export const update_routine: Tool = {
-    name: 'update_routine',
+export const UpdateRoutine: Tool = {
+    name: 'UpdateRoutine',
     description: 'Update an existing routine',
     parameters: {
         type: 'object',
@@ -151,8 +152,8 @@ export const update_routine: Tool = {
     }
 };
 
-export const list_routines: Tool = {
-    name: 'list_routines',
+export const ListRoutines: Tool = {
+    name: 'ListRoutines',
     description: 'Get all routines for a user',
     parameters: {
         type: 'object',
@@ -180,8 +181,8 @@ export const list_routines: Tool = {
     }
 };
 
-export const get_routine_by_id: Tool = {
-    name: 'get_routine_by_id',
+export const GetRoutineById: Tool = {
+    name: 'GetRoutineById',
     description: 'Get a single routine by its ID',
     parameters: {
         type: 'object',
@@ -204,6 +205,40 @@ export const get_routine_by_id: Tool = {
 
         return {
             routine: routine
+        };
+    }
+};
+
+export const DeleteRoutine: Tool = {
+    name: 'DeleteRoutine',
+    description: 'Delete a routine by its ID',
+    parameters: {
+        type: 'object',
+        properties: {
+            routine_id: {
+                type: 'string',
+                description: 'The ID of the routine to delete'
+            }
+        },
+        required: ['routine_id']
+    },
+    execute: async (args: { userId: string; routine_id: string }) => {
+        const userId = parseInt(args.userId);
+        const routineId = args.routine_id;
+
+        // Check if routine exists
+        const existingRoutine = await getRoutine(userId, routineId);
+        if (!existingRoutine) {
+            throw new Error(`Routine with ID ${routineId} not found`);
+        }
+
+        // Delete the routine
+        await removeUserRoutine(userId, routineId);
+
+        return {
+            success: true,
+            deleted_routine: existingRoutine,
+            message: `Routine "${existingRoutine.name}" deleted successfully`
         };
     }
 }; 

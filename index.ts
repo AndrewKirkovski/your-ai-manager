@@ -121,7 +121,7 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
             userMessage: userMessage.substring(0, 50) + '...',
             error: error instanceof Error ? error.message : String(error),
             timestamp: new Date().toISOString()
-        });
+        }, error);
         return 'Извини, проблемы с генерацией ответа 🐺';
     }
 }

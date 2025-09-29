@@ -1,0 +1,35 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "name": "telegram-openai-bot",
+  "description": "A Telegram bot powered by OpenAI/Anthropic. Deploy your own instance in one click via Railway.",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "yarn start"
+  },
+  "envs": {
+    "TELEGRAM_TOKEN": {
+      "description": "Telegram bot token (get it from @BotFather)",
+      "required": true
+    },
+    "OPENAI_API_KEY": {
+      "description": "API key for OpenAI or Anthropic",
+      "required": true
+    },
+    "OPENAI_MODEL": {
+      "description": "Custom model, e.g. 'claude-sonnet-4-20250514'. Leave empty to use default.",
+      "required": false
+    },
+    "OPEN_AI_ENDPOINT": {
+      "description": "Optional API endpoint override, e.g. https://api.anthropic.com/v1/",
+      "required": false
+    }
+  },
+  "volumes": [
+    {
+      "name": "bot-data",
+      "mountPath": "/app"
+    }
+  ]
+}

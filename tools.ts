@@ -8,31 +8,35 @@ import {
     GetTasksByStatus,
     MarkTaskComplete,
     MarkTaskFailed,
-    UpdateTask
+    UpdateTask,
+    DeleteTask
 } from "./tools.tasks";
 import {
-    add_routine,
-    get_routine_by_id,
-    list_routines,
-    update_routine
+    AddRoutine,
+    GetRoutineById,
+    ListRoutines,
+    UpdateRoutine,
+    DeleteRoutine
 } from "./tools.routines";
 
 export const tools = {
     get_current_time,
     // Task tools
-    GetTasksByIdList,
-    GetTasksByRoutine,
-    GetTasksByStatus,
     GetTaskById,
+    GetTasksByIdList,
+    GetTasksByStatus,
+    GetTasksByRoutine,
     AddTask,
     UpdateTask,
     MarkTaskComplete,
     MarkTaskFailed,
+    DeleteTask,
     // Routine tools
-    add_routine,
-    get_routine_by_id,
-    list_routines,
-    update_routine,
+    AddRoutine,
+    GetRoutineById,
+    ListRoutines,
+    UpdateRoutine,
+    DeleteRoutine,
 } as const;
 
 

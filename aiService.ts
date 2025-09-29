@@ -60,7 +60,7 @@ export class AIService {
             bot,
             openai,
             model,
-            maxTokens = 300,
+            maxTokens = 500,
             addUserToHistory = true,
             addAssistantToHistory = true,
             enableToolCalls = false,
@@ -327,7 +327,7 @@ export class AIService {
                 userMessage: userMessage.substring(0, 50) + '...',
                 error: error instanceof Error ? error.message : String(error),
                 timestamp: new Date().toISOString()
-            });
+            }, error);
 
             const errorMessage = `
 Ой 🐺

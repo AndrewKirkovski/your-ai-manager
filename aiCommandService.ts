@@ -10,7 +10,7 @@ import { formatDateHuman, formatCronHuman } from './dateUtils';
 
 function cleanAIResponse(text: string): string {
     // First remove AI command tags
-    let cleaned = text.replace(/<(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal)[^>]*>.*?<\/(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal)>/gs, '');
+    let cleaned = text.replace(/<(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal|thinking)[^>]*>.*?<\/(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal|thinking)>/gs, '');
 
     // Remove self-closing tags
     cleaned = cleaned.replace(/<(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory)[^>]*\/>/g, '');
