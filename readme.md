@@ -6,6 +6,8 @@ Click below to roll out your own instance on [Railway](https://railway.app):
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/lLIPRJ?referralCode=boKVbN&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AndrewKirkovski/your-ai-manager)
+
 > *"Because sometimes you need a furry friend to remind you that yes, you should probably eat lunch"* 🐺
 
 Meet your new AI manager - a Telegram bot with the personality of a supportive wolf who specializes in helping people with ADHD manage tasks, routines, and life in general. Think of it as having a very persistent, slightly quirky friend who never forgets your appointments (even when you do).
