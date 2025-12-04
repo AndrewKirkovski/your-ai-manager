@@ -24,17 +24,38 @@ import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
 import {CronExpressionParser} from 'cron-parser';
 import {formatDateHuman, formatCronHuman, getCurrentTime} from './dateUtils';
+import {initializeMediaParser, getMediaParser} from './mediaParser';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN!;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
 const OPEN_AI_ENDPOINT = process.env.OPEN_AI_ENDPOINT;
 const OPEN_AI_MODEL = process.env.OPENAI_MODEL || 'gpt-4-1106-preview';
 
+// Media parsing configuration
+const OPENAI_WHISPER_API_KEY = process.env.OPENAI_WHISPER_API_KEY;
+const WHISPER_MODEL = process.env.WHISPER_MODEL || 'whisper-1';
+const VISION_MODEL = process.env.VISION_MODEL || 'claude-sonnet-4-20250514';
+
 const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: true});
 
 const openai = new OpenAI({
     apiKey: OPENAI_API_KEY,
     ...(OPEN_AI_ENDPOINT && {baseURL: OPEN_AI_ENDPOINT}),
+});
+
+// Separate OpenAI client for Whisper (voice transcription)
+const openaiWhisper = OPENAI_WHISPER_API_KEY
+    ? new OpenAI({ apiKey: OPENAI_WHISPER_API_KEY })
+    : null;
+
+// Initialize MediaParser with both clients
+initializeMediaParser({
+    bot,
+    openaiWhisper,              // OpenAI for Whisper (null if not configured)
+    anthropic: openai,          // Anthropic client (via OpenAI-compatible SDK) for vision
+    visionModel: VISION_MODEL,
+    whisperModel: WHISPER_MODEL,
+    language: 'ru'
 });
 
 async function getCurrentInfo(userId: number): Promise<string> {
@@ -532,17 +553,58 @@ bot.onText(/\/help/, async (msg) => {
     }
 });
 
-// Handle regular messages (now with AI command processing)
+// Handle regular messages (now with AI command processing AND media support)
 bot.on('message', async (msg) => {
     try {
-        const text = msg.text;
         const userId = msg.from?.id;
-        if (!text || !userId || text.startsWith('/')) return;
+        if (!userId) return;
+
+        // Skip commands - they have their own handlers
+        if (msg.text?.startsWith('/')) return;
+
+        // Detect message type and parse content
+        const mediaParser = getMediaParser();
+        const hasMedia = mediaParser.hasParseableMedia(msg);
+
+        let processedContent: string;
+        let logIndicator: string;
+
+        if (hasMedia) {
+            // Show typing indicator while processing media
+            await bot.sendChatAction(msg.chat.id, 'typing');
+
+            // Parse the media
+            const parsed = await mediaParser.parseMedia(msg);
+
+            if (parsed.error && !parsed.content) {
+                // Complete failure - notify user
+                await bot.sendMessage(
+                    msg.chat.id,
+                    'Could not process this media. Please try sending text instead.'
+                );
+                return;
+            }
+
+            // Format for AI conversation
+            processedContent = mediaParser.formatForAI(parsed);
+            logIndicator = mediaParser.getMediaIndicator(parsed);
+
+            // Include any caption with photos/stickers
+            if (msg.caption) {
+                processedContent = `${msg.caption}\n\n${processedContent}`;
+            }
+        } else if (msg.text) {
+            processedContent = msg.text;
+            logIndicator = '[Text]';
+        } else {
+            // Unsupported message type (documents, animations, etc.)
+            return;
+        }
 
         console.log('📨 Received user message:', {
             userId,
-            messageLength: text.length,
-            isCommand: text.startsWith('/'),
+            type: logIndicator,
+            contentPreview: processedContent.substring(0, 100) + (processedContent.length > 100 ? '...' : ''),
             timestamp: new Date().toISOString()
         });
 
@@ -586,7 +648,6 @@ bot.on('message', async (msg) => {
             return;
         }
 
-
         // Ensure chatId and messageHistory are set
         if (!existing.chatId) {
             existing.chatId = msg.chat.id;
@@ -595,9 +656,9 @@ bot.on('message', async (msg) => {
             existing.messageHistory = [];
         }
         await setUser(existing);
-        // Use AI to respond with command processing
-        await replyToUser(userId, text);
 
+        // Use AI to respond with command processing
+        await replyToUser(userId, processedContent);
 
     } catch (error) {
         console.error('❌ Error handling message:', {

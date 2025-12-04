@@ -60,7 +60,7 @@ export class AIService {
             bot,
             openai,
             model,
-            maxTokens = 500,
+            maxTokens = 1500,
             addUserToHistory = true,
             addAssistantToHistory = true,
             enableToolCalls = false,
