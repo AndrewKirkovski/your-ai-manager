@@ -67,7 +67,9 @@ export type DBData = {
     users: UserData[];
 };
 
-const adapter = new JSONFile<DBData>('db.json');
+// Use DB_PATH env var for Docker volume persistence, fallback to local db.json
+const dbPath = process.env.DB_PATH || 'db.json';
+const adapter = new JSONFile<DBData>(dbPath);
 const db = new Low(adapter, {users: []});
 
 // Initialize database
