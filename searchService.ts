@@ -1,8 +1,8 @@
 /**
- * DuckDuckGo Search Service
+ * Google Custom Search Service
  *
- * Uses DuckDuckGo's Instant Answer API for quick facts and
- * HTML search for web results.
+ * Uses Google Custom Search JSON API.
+ * Requires API key and Search Engine ID from Google Cloud Console.
  */
 
 export interface SearchResult {
@@ -11,187 +11,132 @@ export interface SearchResult {
     snippet: string;
 }
 
-export interface InstantAnswer {
-    abstract: string;
-    abstractSource: string;
-    abstractURL: string;
-    answer: string;
-    answerType: string;
-    relatedTopics: Array<{
-        text: string;
-        url: string;
-    }>;
+export interface SearchResponse {
+    results: SearchResult[];
+    images: string[];
+    totalResults?: string;
+    searchTime?: number;
 }
 
-interface DDGInstantAnswerResponse {
-    Abstract: string;
-    AbstractSource: string;
-    AbstractURL: string;
-    Answer: string;
-    AnswerType: string;
-    RelatedTopics: Array<{
-        Text?: string;
-        FirstURL?: string;
-        Topics?: Array<{
-            Text: string;
-            FirstURL: string;
-        }>;
-    }>;
+interface GoogleSearchItem {
+    title: string;
+    link: string;
+    snippet: string;
+    pagemap?: {
+        cse_image?: Array<{ src: string }>;
+        cse_thumbnail?: Array<{ src: string; width: string; height: string }>;
+    };
 }
 
-// Rate limiting: 1 request per second
-let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 1000; // 1 second
-
-async function rateLimitedFetch(url: string, options?: RequestInit): Promise<Response> {
-    const now = Date.now();
-    const timeSinceLastRequest = now - lastRequestTime;
-
-    if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
-        await new Promise(resolve => setTimeout(resolve, MIN_REQUEST_INTERVAL - timeSinceLastRequest));
-    }
-
-    lastRequestTime = Date.now();
-    return fetch(url, options);
+interface GoogleSearchResponse {
+    items?: GoogleSearchItem[];
+    searchInformation?: {
+        totalResults: string;
+        searchTime: number;
+    };
+    error?: {
+        code: number;
+        message: string;
+    };
 }
+
+const API_KEY = process.env.GOOGLE_SEARCH_API_KEY;
+const SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID;
 
 /**
- * Get instant answer from DuckDuckGo
- * Good for quick facts, definitions, calculations
+ * Search using Google Custom Search API
+ * Returns both text results and images
  */
-export async function getInstantAnswer(query: string): Promise<InstantAnswer | null> {
+export async function search(query: string, numResults: number = 5): Promise<SearchResponse> {
+    if (!API_KEY || !SEARCH_ENGINE_ID) {
+        console.error('❌ Google Search API credentials not configured');
+        return {
+            results: [],
+            images: [],
+        };
+    }
+
+    const num = Math.min(Math.max(numResults, 1), 10); // Google allows 1-10
+    const url = `https://www.googleapis.com/customsearch/v1?key=${API_KEY}&cx=${SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=${num}`;
+
+    console.log(`🔍 Google Search: "${query}" (${num} results)`);
+
     try {
-        const encodedQuery = encodeURIComponent(query);
-        const url = `https://api.duckduckgo.com/?q=${encodedQuery}&format=json&no_html=1&skip_disambig=1`;
+        const response = await fetch(url);
+        const data: GoogleSearchResponse = await response.json();
 
-        const response = await rateLimitedFetch(url, {
-            headers: {
-                'User-Agent': 'AIManagerBot/1.0 (Telegram Bot; https://github.com/)'
+        if (data.error) {
+            console.error('❌ Google Search API error:', data.error.message);
+            return {
+                results: [],
+                images: [],
+            };
+        }
+
+        const results: SearchResult[] = [];
+        const images: string[] = [];
+
+        for (const item of data.items || []) {
+            results.push({
+                title: item.title,
+                url: item.link,
+                snippet: item.snippet || '',
+            });
+
+            // Extract images from pagemap
+            const imageUrl = item.pagemap?.cse_image?.[0]?.src ||
+                            item.pagemap?.cse_thumbnail?.[0]?.src;
+            if (imageUrl && !images.includes(imageUrl)) {
+                images.push(imageUrl);
             }
-        });
-
-        if (!response.ok) {
-            console.error('DuckDuckGo API error:', response.status);
-            return null;
         }
 
-        const data = await response.json() as DDGInstantAnswerResponse;
-
-        // Check if we got a useful answer
-        if (!data.Abstract && !data.Answer && (!data.RelatedTopics || data.RelatedTopics.length === 0)) {
-            return null;
-        }
-
-        const relatedTopics = data.RelatedTopics
-            .filter(topic => topic.Text && topic.FirstURL)
-            .slice(0, 5)
-            .map(topic => ({
-                text: topic.Text!,
-                url: topic.FirstURL!
-            }));
+        console.log(`🔍 Found ${results.length} results, ${images.length} images`);
 
         return {
-            abstract: data.Abstract || '',
-            abstractSource: data.AbstractSource || '',
-            abstractURL: data.AbstractURL || '',
-            answer: data.Answer || '',
-            answerType: data.AnswerType || '',
-            relatedTopics
+            results,
+            images,
+            totalResults: data.searchInformation?.totalResults,
+            searchTime: data.searchInformation?.searchTime,
         };
     } catch (error) {
-        console.error('Error fetching instant answer:', error);
-        return null;
+        console.error('❌ Google Search error:', error);
+        return {
+            results: [],
+            images: [],
+        };
     }
 }
 
 /**
- * Search DuckDuckGo HTML and parse results
- * Returns web search results
+ * Image-focused search using Google Custom Search API
  */
-export async function searchWeb(query: string, numResults: number = 5): Promise<SearchResult[]> {
+export async function searchImages(query: string, numResults: number = 5): Promise<string[]> {
+    if (!API_KEY || !SEARCH_ENGINE_ID) {
+        console.error('❌ Google Search API credentials not configured');
+        return [];
+    }
+
+    const num = Math.min(Math.max(numResults, 1), 10);
+    const url = `https://www.googleapis.com/customsearch/v1?key=${API_KEY}&cx=${SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=${num}&searchType=image`;
+
+    console.log(`🖼️ Google Image Search: "${query}" (${num} results)`);
+
     try {
-        const encodedQuery = encodeURIComponent(query);
-        // Use DuckDuckGo HTML search
-        const url = `https://html.duckduckgo.com/html/?q=${encodedQuery}`;
+        const response = await fetch(url);
+        const data: GoogleSearchResponse = await response.json();
 
-        const response = await rateLimitedFetch(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5'
-            }
-        });
-
-        if (!response.ok) {
-            console.error('DuckDuckGo search error:', response.status);
+        if (data.error) {
+            console.error('❌ Google Image Search API error:', data.error.message);
             return [];
         }
 
-        const html = await response.text();
+        const images = (data.items || []).map(item => item.link);
 
-        // Parse results from HTML
-        const results: SearchResult[] = [];
-
-        // Match result blocks - DuckDuckGo HTML format
-        const resultRegex = /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([^<]*)<\/a>/g;
-        let match;
-
-        while ((match = resultRegex.exec(html)) !== null && results.length < numResults) {
-            const url = decodeURIComponent(match[1].replace(/^\/\/duckduckgo.com\/l\/\?uddg=/, '').split('&')[0]);
-            const title = match[2].trim();
-            const snippet = match[3].trim();
-
-            if (url && title && !url.includes('duckduckgo.com')) {
-                results.push({
-                    title,
-                    url,
-                    snippet
-                });
-            }
-        }
-
-        // Fallback: try alternative parsing if first method fails
-        if (results.length === 0) {
-            const altRegex = /<div class="result[^"]*"[^>]*>[\s\S]*?<a[^>]*href="([^"]*)"[^>]*>[\s\S]*?<h2[^>]*>([^<]*)<\/h2>[\s\S]*?<span[^>]*class="[^"]*snippet[^"]*"[^>]*>([^<]*)<\/span>/g;
-
-            while ((match = altRegex.exec(html)) !== null && results.length < numResults) {
-                const url = match[1];
-                const title = match[2].trim();
-                const snippet = match[3].trim();
-
-                if (url && title && !url.includes('duckduckgo.com')) {
-                    results.push({
-                        title,
-                        url,
-                        snippet
-                    });
-                }
-            }
-        }
-
-        console.log(`🔍 DuckDuckGo search for "${query}" returned ${results.length} results`);
-        return results;
+        console.log(`🖼️ Found ${images.length} images`);
+        return images;
     } catch (error) {
-        console.error('Error searching web:', error);
+        console.error('❌ Google Image Search error:', error);
         return [];
     }
-}
-
-/**
- * Combined search: tries instant answer first, then web search
- */
-export async function search(query: string, numResults: number = 5): Promise<{
-    instantAnswer: InstantAnswer | null;
-    webResults: SearchResult[];
-}> {
-    // Try instant answer first (for facts, definitions, etc.)
-    const instantAnswer = await getInstantAnswer(query);
-
-    // If no instant answer or user needs web results, do web search
-    const webResults = await searchWeb(query, numResults);
-
-    return {
-        instantAnswer,
-        webResults
-    };
 }

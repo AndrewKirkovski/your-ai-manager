@@ -28,6 +28,8 @@ export interface AIStreamOptions {
     currentRecursionDepth?: number;
     enableToolCalls?: boolean;
     appendMessagesAfterUser?: OpenAIMessage[];
+    /** Callback to handle images from search results (sent separately, not in history) */
+    onImageResults?: (images: string[]) => Promise<void>;
 }
 
 export interface AIStreamResult {
@@ -264,6 +266,18 @@ export class AIService {
                             toolArgs,
                             userId,
                         );
+
+                        // Handle images from search results (send separately, not in history)
+                        if ((toolName === 'WebSearch' || toolName === 'SearchImages') &&
+                            result && typeof result === 'object' && 'images' in result) {
+                            const images = (result as { images?: string[] }).images;
+                            if (images && images.length > 0 && options.onImageResults) {
+                                console.log(`   🖼️ Sending ${images.length} images separately`);
+                                await options.onImageResults(images);
+                            }
+                            // Remove images from result before adding to history/context
+                            delete (result as { images?: string[] }).images;
+                        }
 
                         // Log result summary
                         const resultStr = JSON.stringify(result);

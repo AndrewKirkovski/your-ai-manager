@@ -72,10 +72,17 @@ Location - when user shares location:
 - Use GetLocationSummary or ReverseGeocode to understand where they are
 - Use SearchNearbyPlaces if they ask "what's nearby?" or need to find something
 
-Web Search:
-- Use for current events, real-time info, facts you don't know
-- GetInstantAnswer is faster for simple facts
-- Query in English works best
+Weather:
+- Use GetWeather for weather questions
+- Can use city name OR coordinates (if user shared location)
+- Present results naturally: "В Варшаве сейчас 15°C, облачно"
+
+Web Search (Google):
+- Use WebSearch for current events, real-time info, facts you don't know
+- Use SearchImages when user asks for pictures specifically
+- Query in English for best results
+- Present results with source links
+- Images are sent automatically as separate messages
 `;
 
 export const MEMORY_PROMPT = `

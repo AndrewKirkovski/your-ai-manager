@@ -108,6 +108,31 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
             addUserToHistory: true,
             addAssistantToHistory: true,
             enableToolCalls: true,
+            // Send images from search results as a gallery (not in history)
+            onImageResults: async (images: string[]) => {
+                const imagesToSend = images.slice(0, 5); // Max 5 images in gallery
+                if (imagesToSend.length === 0) return;
+
+                try {
+                    if (imagesToSend.length === 1) {
+                        // Single image - use sendPhoto
+                        await bot.sendPhoto(userId, imagesToSend[0], {
+                            disable_notification: true
+                        });
+                    } else {
+                        // Multiple images - use sendMediaGroup for gallery
+                        const mediaGroup = imagesToSend.map(url => ({
+                            type: 'photo' as const,
+                            media: url
+                        }));
+                        await bot.sendMediaGroup(userId, mediaGroup, {
+                            disable_notification: true
+                        });
+                    }
+                } catch (e) {
+                    console.log(`Failed to send images:`, e);
+                }
+            }
         });
 
         // Cleanup old completed/failed tasks after processing (keep last 50 per user)

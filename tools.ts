@@ -31,13 +31,14 @@ import {
 } from "./tools.user";
 import {
     WebSearch,
-    GetInstantAnswer
+    SearchImages
 } from "./tools.search";
 import {
     ReverseGeocode,
     SearchNearbyPlaces,
     GetLocationSummary
 } from "./tools.location";
+import { GetWeather } from "./tools.weather";
 
 export const tools = {
     get_current_time,
@@ -68,7 +69,9 @@ export const tools = {
     ClearGoal,
     // Search tools
     WebSearch,
-    GetInstantAnswer,
+    SearchImages,
+    // Weather tools
+    GetWeather,
     // Location tools
     ReverseGeocode,
     SearchNearbyPlaces,
