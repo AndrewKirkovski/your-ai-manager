@@ -18,6 +18,26 @@ import {
     UpdateRoutine,
     DeleteRoutine
 } from "./tools.routines";
+import {
+    UpdateMemory,
+    GetMemory,
+    ListMemory,
+    DeleteMemory
+} from "./tools.memory";
+import {
+    SetGoal,
+    GetGoal,
+    ClearGoal
+} from "./tools.user";
+import {
+    WebSearch,
+    GetInstantAnswer
+} from "./tools.search";
+import {
+    ReverseGeocode,
+    SearchNearbyPlaces,
+    GetLocationSummary
+} from "./tools.location";
 
 export const tools = {
     get_current_time,
@@ -37,6 +57,22 @@ export const tools = {
     ListRoutines,
     UpdateRoutine,
     DeleteRoutine,
+    // Memory tools
+    UpdateMemory,
+    GetMemory,
+    ListMemory,
+    DeleteMemory,
+    // User/Goal tools
+    SetGoal,
+    GetGoal,
+    ClearGoal,
+    // Search tools
+    WebSearch,
+    GetInstantAnswer,
+    // Location tools
+    ReverseGeocode,
+    SearchNearbyPlaces,
+    GetLocationSummary,
 } as const;
 
 

@@ -242,3 +242,44 @@ export async function updateUserMemory(userId: number, key: string, value: strin
     user.memory[key] = value;
     await setUser(user);
 }
+
+export async function getUserMemory(userId: number, key: string): Promise<string | undefined> {
+    const user = await getUser(userId);
+    return user?.memory[key];
+}
+
+export async function getAllUserMemory(userId: number): Promise<Record<string, string>> {
+    const user = await getUser(userId);
+    return user?.memory ?? {};
+}
+
+export async function deleteUserMemory(userId: number, key: string): Promise<boolean> {
+    const user = await getUser(userId);
+    if (!user || !(key in user.memory)) return false;
+
+    delete user.memory[key];
+    await setUser(user);
+    return true;
+}
+
+// GOAL HELPERS --------------------------------------------------------------
+export async function setUserGoal(userId: number, goal: string): Promise<void> {
+    const user = await getUser(userId);
+    if (!user) return;
+
+    user.preferences.goal = goal;
+    await setUser(user);
+}
+
+export async function getUserGoal(userId: number): Promise<string> {
+    const user = await getUser(userId);
+    return user?.preferences.goal ?? '';
+}
+
+export async function clearUserGoal(userId: number): Promise<void> {
+    const user = await getUser(userId);
+    if (!user) return;
+
+    user.preferences.goal = '';
+    await setUser(user);
+}

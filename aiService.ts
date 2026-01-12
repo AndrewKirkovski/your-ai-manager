@@ -45,7 +45,8 @@ export class AIService {
     static async streamAIResponse(options: AIStreamOptions): Promise<AIStreamResult> {
         return this.streamAIResponseInternal({
             ...options,
-            enableToolCalls: (options.currentRecursionDepth ?? 0) >= 5 ? false : (options.enableToolCalls || false),
+            // Tools are always enabled by default (unless recursion limit reached)
+            enableToolCalls: (options.currentRecursionDepth ?? 0) >= 5 ? false : (options.enableToolCalls ?? true),
         });
     }
 
@@ -127,7 +128,7 @@ export class AIService {
                     content: systemPrompt
                 },
                 ...recentMessages,
-                {role: 'user', content: userMessage + `<system>At ${new Date().toISOString()}</system>`},
+                {role: 'user', content: `<system>At ${new Date().toISOString()}</system>\n${userMessage}`},
                 ...(appendMessagesAfterUser || []),
             ];
 
@@ -356,7 +357,7 @@ ${error instanceof Error ? error.message : String(error)}
 
         return recentMessages.map(m => ({
             role: m.role as 'user' | 'assistant',
-            content: m.content + `<system>At ${formatDateHuman(m.timestamp)}</system>`
+            content: `<system>At ${formatDateHuman(m.timestamp)}</system>\n${m.content}`
         }));
     }
 } 

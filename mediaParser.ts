@@ -7,7 +7,7 @@ import { createReadStream } from 'fs';
 
 // ============== TYPE DEFINITIONS ==============
 
-export type MediaType = 'voice' | 'photo' | 'sticker' | 'text' | 'unsupported';
+export type MediaType = 'voice' | 'photo' | 'sticker' | 'location' | 'text' | 'unsupported';
 
 export interface ParsedMedia {
     type: MediaType;
@@ -19,6 +19,12 @@ export interface ParsedMedia {
         setName?: string;      // For stickers
         fileSize?: number;
         mimeType?: string;
+        // Location metadata
+        latitude?: number;
+        longitude?: number;
+        horizontalAccuracy?: number;
+        livePeriod?: number;   // For live location sharing
+        heading?: number;      // Direction of travel
     };
     error?: string;            // If parsing failed
 }
@@ -66,6 +72,7 @@ export class MediaParser {
         if (msg.voice) return 'voice';
         if (msg.photo && msg.photo.length > 0) return 'photo';
         if (msg.sticker && !msg.sticker.is_animated && !msg.sticker.is_video) return 'sticker';
+        if (msg.location) return 'location';
         if (msg.text) return 'text';
         return 'unsupported';
     }
@@ -95,6 +102,8 @@ export class MediaParser {
                     return await this.parsePhoto(msg.photo!);
                 case 'sticker':
                     return await this.parseSticker(msg.sticker!);
+                case 'location':
+                    return this.parseLocation(msg.location!);
                 case 'text':
                     return {
                         type: 'text',
@@ -373,6 +382,52 @@ export class MediaParser {
         }
     }
 
+    // ============== LOCATION MESSAGE PARSING ==============
+
+    /**
+     * Parse location message from Telegram
+     * Location messages include coordinates and optionally accuracy/live period
+     */
+    parseLocation(location: { latitude: number; longitude: number; horizontal_accuracy?: number; live_period?: number; heading?: number; proximity_alert_radius?: number }): ParsedMedia {
+        const { latitude, longitude, horizontal_accuracy, live_period, heading } = location;
+
+        // Format coordinates for display
+        const coords = `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
+
+        // Build description
+        let description = `Location: ${coords}`;
+
+        if (horizontal_accuracy) {
+            description += ` (accuracy: ~${Math.round(horizontal_accuracy)}m)`;
+        }
+
+        if (live_period) {
+            description += ` [LIVE - updating for ${Math.round(live_period / 60)} min]`;
+        }
+
+        if (heading !== undefined) {
+            description += ` heading: ${heading}°`;
+        }
+
+        console.log(`📍 Location received: ${coords}`, {
+            accuracy: horizontal_accuracy,
+            live: !!live_period
+        });
+
+        return {
+            type: 'location',
+            content: description,
+            originalType: live_period ? 'live_location' : 'location',
+            metadata: {
+                latitude,
+                longitude,
+                horizontalAccuracy: horizontal_accuracy,
+                livePeriod: live_period,
+                heading
+            }
+        };
+    }
+
     // ============== AI INTEGRATION HELPERS ==============
 
     /**
@@ -396,6 +451,12 @@ export class MediaParser {
                 const emojiHint = parsed.metadata?.emoji ? ` (${parsed.metadata.emoji})` : '';
                 return `[User sent a sticker${emojiHint}]\nSticker analysis: ${parsed.content}\n[End of sticker analysis]`;
 
+            case 'location':
+                const liveHint = parsed.metadata?.livePeriod ? ' (LIVE)' : '';
+                const lat = parsed.metadata?.latitude?.toFixed(6) || '?';
+                const lng = parsed.metadata?.longitude?.toFixed(6) || '?';
+                return `[User shared their location${liveHint}]\nCoordinates: ${lat}, ${lng}\n[End of location]`;
+
             case 'text':
                 return parsed.content;
 
@@ -415,6 +476,8 @@ export class MediaParser {
                 return '[Photo]';
             case 'sticker':
                 return `[Sticker ${parsed.metadata?.emoji || ''}]`;
+            case 'location':
+                return parsed.metadata?.livePeriod ? '[Live Location]' : '[Location]';
             default:
                 return '[Media]';
         }
