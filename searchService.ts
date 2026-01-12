@@ -40,15 +40,15 @@ interface GoogleSearchResponse {
     };
 }
 
-const API_KEY = process.env.GOOGLE_SEARCH_API_KEY;
-const SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID;
-
 /**
  * Search using Google Custom Search API
  * Returns both text results and images
  */
 export async function search(query: string, numResults: number = 5): Promise<SearchResponse> {
-    if (!API_KEY || !SEARCH_ENGINE_ID) {
+    const apiKey = process.env.GOOGLE_SEARCH_API_KEY;
+    const searchEngineId = process.env.GOOGLE_SEARCH_ENGINE_ID;
+
+    if (!apiKey || !searchEngineId) {
         console.error('❌ Google Search API credentials not configured');
         return {
             results: [],
@@ -57,7 +57,7 @@ export async function search(query: string, numResults: number = 5): Promise<Sea
     }
 
     const num = Math.min(Math.max(numResults, 1), 10); // Google allows 1-10
-    const url = `https://www.googleapis.com/customsearch/v1?key=${API_KEY}&cx=${SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=${num}`;
+    const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${searchEngineId}&q=${encodeURIComponent(query)}&num=${num}`;
 
     console.log(`🔍 Google Search: "${query}" (${num} results)`);
 
@@ -112,13 +112,16 @@ export async function search(query: string, numResults: number = 5): Promise<Sea
  * Image-focused search using Google Custom Search API
  */
 export async function searchImages(query: string, numResults: number = 5): Promise<string[]> {
-    if (!API_KEY || !SEARCH_ENGINE_ID) {
+    const apiKey = process.env.GOOGLE_SEARCH_API_KEY;
+    const searchEngineId = process.env.GOOGLE_SEARCH_ENGINE_ID;
+
+    if (!apiKey || !searchEngineId) {
         console.error('❌ Google Search API credentials not configured');
         return [];
     }
 
     const num = Math.min(Math.max(numResults, 1), 10);
-    const url = `https://www.googleapis.com/customsearch/v1?key=${API_KEY}&cx=${SEARCH_ENGINE_ID}&q=${encodeURIComponent(query)}&num=${num}&searchType=image`;
+    const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${searchEngineId}&q=${encodeURIComponent(query)}&num=${num}&searchType=image`;
 
     console.log(`🖼️ Google Image Search: "${query}" (${num} results)`);
 
