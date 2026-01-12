@@ -94,6 +94,9 @@
                 ${renderMemory()}
                 ${renderMessages()}
             `;
+
+            // Auto-resize textareas after render
+            setTimeout(initTextareas, 0);
         }
 
         // Goal section
@@ -273,8 +276,8 @@
                         </span>
                         <div class="flex-1 min-w-0">
                             <textarea
-                                class="bg-transparent border border-transparent hover:border-dark-border focus:border-blue-500 outline-none w-full resize-none rounded p-1"
-                                rows="${Math.min(Math.max(m.content.split('\n').length, 2), 10)}"
+                                class="bg-transparent border border-transparent hover:border-dark-border focus:border-blue-500 outline-none w-full resize-none rounded p-1 overflow-hidden"
+                                rows="1"
                                 onchange="updateMessage(${i}, this.value)"
                             >${escapeHtml(m.content)}</textarea>
                             <div class="text-xs text-dark-muted mt-1">
@@ -355,6 +358,19 @@
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;')
                 .replace(/"/g, '&quot;');
+        }
+
+        function autoResize(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = textarea.scrollHeight + 'px';
+        }
+
+        // Auto-resize all textareas after render
+        function initTextareas() {
+            document.querySelectorAll('textarea').forEach(ta => {
+                autoResize(ta);
+                ta.addEventListener('input', () => autoResize(ta));
+            });
         }
 
         // Initialize
