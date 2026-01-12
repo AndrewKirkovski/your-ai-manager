@@ -581,6 +581,8 @@ bot.onText(/\/help/, async (msg) => {
     }
 });
 
+
+
 // Handle regular messages (now with AI command processing AND media support)
 bot.on('message', async (msg) => {
     try {
