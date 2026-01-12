@@ -76,10 +76,10 @@ export class AIService {
             // Add messages to history if requested
             if (addUserToHistory) {
                 await addMessageToHistory(userId, 'user', userMessage);
-                console.log('📝 Added user message to history:', userMessage, {
-                    userId,
-                    timestamp: new Date().toISOString()
-                });
+                const preview = userMessage.length > 100
+                    ? userMessage.substring(0, 100) + '...'
+                    : userMessage;
+                console.log(`📝 Added user message to history: "${preview.replace(/\n/g, ' ')}"`);
             }
 
             // Function to update Telegram message during streaming
@@ -247,12 +247,34 @@ export class AIService {
                 });
 
                 for (const toolCall of toolCalls) {
+                    const toolName = toolCall.function.name;
+                    const toolArgs = toolCall.function.arguments;
+                    let parsedArgs: Record<string, unknown> = {};
+                    try {
+                        parsedArgs = JSON.parse(toolArgs || '{}');
+                    } catch { /* ignore parse errors */ }
+
+                    // Log tool call with arguments
+                    console.log(`\n🔧 Tool Call: ${toolName}`);
+                    console.log(`   📥 Args: ${JSON.stringify(parsedArgs, null, 2).split('\n').join('\n   ')}`);
+
                     try {
                         const result = await executeTool(
-                            toolCall.function.name as keyof typeof tools,
-                            toolCall.function.arguments,
+                            toolName as keyof typeof tools,
+                            toolArgs,
                             userId,
                         );
+
+                        // Log result summary
+                        const resultStr = JSON.stringify(result);
+                        const logSummary = resultStr.length > 500
+                            ? resultStr.substring(0, 500) + '...'
+                            : resultStr;
+                        const historySummary = resultStr.length > 300
+                            ? resultStr.substring(0, 300) + '...'
+                            : resultStr;
+                        console.log(`   📤 Result: ${logSummary}`);
+                        console.log(`   ✅ Success\n`);
 
                         newAppendedMessages.push({
                             role: 'tool',
@@ -260,38 +282,22 @@ export class AIService {
                             tool_call_id: toolCall.id,
                         })
 
-                        console.log('✅ Tool executed:', {
-                            userId,
-                            toolName: toolCall.function.name,
-                            result: result,
-                            timestamp: new Date().toISOString()
-                        });
-
-                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Success call a tool: ${toolCall.function.name}]\n\n`;
+                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nOutput: ${historySummary}\n`;
                     } catch (error) {
-                        console.error('❌ Tool execution failed:', {
-                            userId,
-                            toolName: toolCall.function.name,
-                            error: error instanceof Error ? error.message : String(error),
-                            timestamp: new Date().toISOString()
-                        });
+                        const errorMsg = error instanceof Error ? error.message : String(error);
+                        console.log(`   ❌ Error: ${errorMsg}\n`);
 
                         newAppendedMessages.push({
                             tool_call_id: toolCall.id,
                             role: 'tool',
-                            content: JSON.stringify({error: error instanceof Error ? error.message : String(error)})
+                            content: JSON.stringify({error: errorMsg})
                         })
 
-                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Failed call a tool: ${toolCall.function.name}]\n\n`;
+                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nError: ${errorMsg}\n`;
                     }
                 }
 
-                console.log('🔄 Making recursive call with tool results:', {
-                    userId,
-                    newAppendedMessages,
-                    recursionDepth: currentRecursionDepth + 1,
-                    timestamp: new Date().toISOString()
-                });
+                console.log(`🔄 Continuing with ${newAppendedMessages.length} tool result(s), depth: ${currentRecursionDepth + 1}`);
 
                 const recursiveResult = await this.streamAIResponse({
                     ...options,
@@ -309,10 +315,10 @@ export class AIService {
 
             if(addAssistantToHistory) {
                 await addMessageToHistory(userId, 'assistant', historyResponseAccumulated);
-                console.log('📝 Added ass message to history:', historyResponseAccumulated, {
-                    userId,
-                    timestamp: new Date().toISOString()
-                });
+                const preview = historyResponseAccumulated.length > 100
+                    ? historyResponseAccumulated.substring(0, 100) + '...'
+                    : historyResponseAccumulated;
+                console.log(`📝 Added assistant message to history: "${preview.replace(/\n/g, ' ')}"`);
             }
 
             return {
