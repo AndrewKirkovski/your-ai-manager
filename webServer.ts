@@ -111,6 +111,6 @@ app.patch('/api/users/:id/messages/:index', async (req: Request, res: Response) 
 });
 
 const PORT = process.env.WEB_PORT || 3000;
-app.listen(PORT, () => {
+app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`🌐 Web UI available at http://localhost:${PORT}`);
 });

@@ -155,9 +155,9 @@ export async function addMessageToHistory(userId: number, role: 'user' | 'assist
             timestamp: new Date()
         });
 
-        // Keep only the last 50 messages
-        if (user.messageHistory.length > 50) {
-            user.messageHistory = user.messageHistory.slice(-50);
+        // Keep only the last 5000 messages
+        if (user.messageHistory.length > 5000) {
+            user.messageHistory = user.messageHistory.slice(-5000);
         }
 
         await setUser(user);

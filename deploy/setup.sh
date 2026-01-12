@@ -60,6 +60,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      - "3000:3000"
     volumes:
       - bot-data:/app/data
     labels:
@@ -73,6 +75,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ~/.docker/config.json:/config.json:ro
     environment:
+      - DOCKER_CONFIG=/
       - WATCHTOWER_CLEANUP=true
       - WATCHTOWER_POLL_INTERVAL=300
       - WATCHTOWER_LABEL_ENABLE=true
