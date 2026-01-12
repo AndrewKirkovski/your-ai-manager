@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Manager - Admin</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        dark: {
+                            bg: '#0f172a',
+                            card: '#1e293b',
+                            border: '#334155',
+                            text: '#e2e8f0',
+                            muted: '#94a3b8'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        .editing { background-color: #1e40af !important; }
+    </style>
+</head>
+<body class="bg-dark-bg text-dark-text min-h-screen">
+    <div class="container mx-auto px-4 py-6 max-w-4xl">
+        <!-- Header -->
+        <div class="flex items-center justify-between mb-6">
+            <h1 class="text-2xl font-bold">AI Manager Admin</h1>
+            <div class="flex items-center gap-4">
+                <select id="userSelect" class="bg-dark-card border border-dark-border rounded px-3 py-2 text-sm">
+                    <option value="">Select user...</option>
+                </select>
+                <button onclick="loadUserData()" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-sm">
+                    Refresh
+                </button>
+            </div>
+        </div>
+
+        <!-- Content -->
+        <div id="content" class="space-y-6">
+            <p class="text-dark-muted">Select a user to view data</p>
+        </div>
+    </div>
+
+    <script>
+        let currentUser = null;
+
+        // Load users on page load
+        async function loadUsers() {
+            try {
+                const res = await fetch('/api/users');
+                const users = await res.json();
+                const select = document.getElementById('userSelect');
+                select.innerHTML = '<option value="">Select user...</option>';
+                users.forEach(u => {
+                    const opt = document.createElement('option');
+                    opt.value = u.userId;
+                    opt.textContent = `${u.userId} (${u.taskCount} tasks, ${u.routineCount} routines)`;
+                    select.appendChild(opt);
+                });
+            } catch (e) {
+                console.error('Failed to load users:', e);
+            }
+        }
+
+        // Load user data
+        async function loadUserData() {
+            const userId = document.getElementById('userSelect').value;
+            if (!userId) return;
+
+            try {
+                const res = await fetch(`/api/users/${userId}`);
+                currentUser = await res.json();
+                renderContent();
+            } catch (e) {
+                console.error('Failed to load user:', e);
+            }
+        }
+
+        // Render all sections
+        function renderContent() {
+            if (!currentUser) return;
+
+            document.getElementById('content').innerHTML = `
+                ${renderGoal()}
+                ${renderTasks()}
+                ${renderRoutines()}
+                ${renderMemory()}
+                ${renderMessages()}
+            `;
+        }
+
+        // Goal section
+        function renderGoal() {
+            return `
+                <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                    <h2 class="text-lg font-semibold mb-2">Goal</h2>
+                    <p class="text-dark-muted">${currentUser.goal || 'No goal set'}</p>
+                </div>
+            `;
+        }
+
+        // Tasks section
+        function renderTasks() {
+            if (!currentUser.tasks.length) {
+                return `
+                    <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                        <h2 class="text-lg font-semibold mb-2">Tasks</h2>
+                        <p class="text-dark-muted">No tasks</p>
+                    </div>
+                `;
+            }
+
+            const statusColors = {
+                pending: 'bg-yellow-600',
+                completed: 'bg-green-600',
+                failed: 'bg-red-600',
+                needs_replanning: 'bg-purple-600'
+            };
+
+            const rows = currentUser.tasks.map((t, i) => `
+                <tr class="border-b border-dark-border" id="task-${t.id}">
+                    <td class="py-2 px-2">
+                        <span class="px-2 py-1 rounded text-xs ${statusColors[t.status] || 'bg-gray-600'}">${t.status}</span>
+                    </td>
+                    <td class="py-2 px-2">
+                        <input type="text" value="${escapeHtml(t.name)}"
+                            class="bg-transparent border-b border-transparent hover:border-dark-border focus:border-blue-500 outline-none w-full"
+                            data-task-id="${t.id}" data-field="name" onchange="updateTask('${t.id}', 'name', this.value)">
+                    </td>
+                    <td class="py-2 px-2 text-sm text-dark-muted">
+                        ${t.pingAt ? new Date(t.pingAt).toLocaleString() : '-'}
+                    </td>
+                    <td class="py-2 px-2">
+                        <select class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs"
+                            onchange="updateTask('${t.id}', 'status', this.value)">
+                            ${['pending', 'completed', 'failed', 'needs_replanning'].map(s =>
+                                `<option value="${s}" ${t.status === s ? 'selected' : ''}>${s}</option>`
+                            ).join('')}
+                        </select>
+                    </td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                    <h2 class="text-lg font-semibold mb-3">Tasks (${currentUser.tasks.length})</h2>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="text-left text-dark-muted border-b border-dark-border">
+                                    <th class="py-2 px-2 w-24">Status</th>
+                                    <th class="py-2 px-2">Name</th>
+                                    <th class="py-2 px-2 w-40">Ping At</th>
+                                    <th class="py-2 px-2 w-32">Change</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Routines section (read-only)
+        function renderRoutines() {
+            if (!currentUser.routines.length) {
+                return `
+                    <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                        <h2 class="text-lg font-semibold mb-2">Routines</h2>
+                        <p class="text-dark-muted">No routines</p>
+                    </div>
+                `;
+            }
+
+            const rows = currentUser.routines.map(r => `
+                <tr class="border-b border-dark-border">
+                    <td class="py-2 px-2">
+                        <span class="px-2 py-1 rounded text-xs ${r.isActive ? 'bg-green-600' : 'bg-gray-600'}">
+                            ${r.isActive ? 'active' : 'inactive'}
+                        </span>
+                    </td>
+                    <td class="py-2 px-2">${escapeHtml(r.name)}</td>
+                    <td class="py-2 px-2 text-dark-muted font-mono text-xs">${r.cron}</td>
+                    <td class="py-2 px-2 text-sm">
+                        <span class="text-green-400">${r.stats?.completed || 0}</span> /
+                        <span class="text-red-400">${r.stats?.failed || 0}</span>
+                    </td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                    <h2 class="text-lg font-semibold mb-3">Routines (${currentUser.routines.length}) <span class="text-dark-muted text-sm font-normal">read-only</span></h2>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="text-left text-dark-muted border-b border-dark-border">
+                                    <th class="py-2 px-2 w-20">Status</th>
+                                    <th class="py-2 px-2">Name</th>
+                                    <th class="py-2 px-2 w-32">Cron</th>
+                                    <th class="py-2 px-2 w-20">Stats</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Memory section
+        function renderMemory() {
+            const entries = Object.entries(currentUser.memory || {});
+            if (!entries.length) {
+                return `
+                    <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                        <h2 class="text-lg font-semibold mb-2">Memory</h2>
+                        <p class="text-dark-muted">No memory entries</p>
+                    </div>
+                `;
+            }
+
+            const rows = entries.map(([key, value]) => `
+                <tr class="border-b border-dark-border">
+                    <td class="py-2 px-2 font-mono text-sm text-blue-400">${escapeHtml(key)}</td>
+                    <td class="py-2 px-2">
+                        <input type="text" value="${escapeHtml(value)}"
+                            class="bg-transparent border-b border-transparent hover:border-dark-border focus:border-blue-500 outline-none w-full"
+                            onchange="updateMemory('${escapeHtml(key)}', this.value)">
+                    </td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                    <h2 class="text-lg font-semibold mb-3">Memory (${entries.length})</h2>
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-left text-dark-muted border-b border-dark-border">
+                                <th class="py-2 px-2 w-40">Key</th>
+                                <th class="py-2 px-2">Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        // Messages section
+        function renderMessages() {
+            if (!currentUser.messages.length) {
+                return `
+                    <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                        <h2 class="text-lg font-semibold mb-2">Messages</h2>
+                        <p class="text-dark-muted">No messages</p>
+                    </div>
+                `;
+            }
+
+            const rows = currentUser.messages.map((m, i) => `
+                <div class="border-b border-dark-border py-3" id="msg-${i}">
+                    <div class="flex items-start gap-3">
+                        <span class="px-2 py-1 rounded text-xs ${m.role === 'user' ? 'bg-blue-600' : 'bg-green-600'} shrink-0">
+                            ${m.role}
+                        </span>
+                        <div class="flex-1 min-w-0">
+                            <textarea
+                                class="bg-transparent border border-transparent hover:border-dark-border focus:border-blue-500 outline-none w-full resize-none rounded p-1"
+                                rows="${Math.min(Math.max(m.content.split('\n').length, 2), 10)}"
+                                onchange="updateMessage(${i}, this.value)"
+                            >${escapeHtml(m.content)}</textarea>
+                            <div class="text-xs text-dark-muted mt-1">
+                                ${m.timestamp ? new Date(m.timestamp).toLocaleString() : ''}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+
+            return `
+                <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                    <h2 class="text-lg font-semibold mb-3">Messages (${currentUser.messages.length})</h2>
+                    <div class="max-h-96 overflow-y-auto">${rows}</div>
+                </div>
+            `;
+        }
+
+        // Update functions
+        async function updateTask(taskId, field, value) {
+            const userId = document.getElementById('userSelect').value;
+            try {
+                await fetch(`/api/users/${userId}/tasks/${taskId}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ [field]: value })
+                });
+                // Update local state
+                const task = currentUser.tasks.find(t => t.id === taskId);
+                if (task) task[field] = value;
+                showSaved(`task-${taskId}`);
+            } catch (e) {
+                console.error('Failed to update task:', e);
+            }
+        }
+
+        async function updateMemory(key, value) {
+            const userId = document.getElementById('userSelect').value;
+            try {
+                await fetch(`/api/users/${userId}/memory/${encodeURIComponent(key)}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ value })
+                });
+                currentUser.memory[key] = value;
+            } catch (e) {
+                console.error('Failed to update memory:', e);
+            }
+        }
+
+        async function updateMessage(index, content) {
+            const userId = document.getElementById('userSelect').value;
+            try {
+                await fetch(`/api/users/${userId}/messages/${index}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content })
+                });
+                currentUser.messages[index].content = content;
+                showSaved(`msg-${index}`);
+            } catch (e) {
+                console.error('Failed to update message:', e);
+            }
+        }
+
+        function showSaved(elementId) {
+            const el = document.getElementById(elementId);
+            if (el) {
+                el.classList.add('editing');
+                setTimeout(() => el.classList.remove('editing'), 500);
+            }
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        // Initialize
+        document.getElementById('userSelect').addEventListener('change', loadUserData);
+        loadUsers();
+    </script>
+</body>
+</html>

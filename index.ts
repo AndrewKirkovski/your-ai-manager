@@ -2,6 +2,9 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// Start web server
+import './webServer';
+
 import TelegramBot from 'node-telegram-bot-api';
 import OpenAI from 'openai';
 import cron from 'node-cron';
