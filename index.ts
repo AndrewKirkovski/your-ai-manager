@@ -25,6 +25,7 @@ import {
 } from "./userStore";
 import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
+import {runHistoryCompaction} from './historyCompaction';
 import {CronExpressionParser} from 'cron-parser';
 import {formatDateHuman, formatCronHuman, getCurrentTime} from './dateUtils';
 import {initializeMediaParser, getMediaParser} from './mediaParser';
@@ -297,6 +298,15 @@ cron.schedule('* * * * *', async () => {
                 });
             }
         }
+    }
+});
+
+// Compact history once per hour
+cron.schedule('0 * * * *', async () => {
+    try {
+        await runHistoryCompaction(openai, OPEN_AI_MODEL);
+    } catch (error) {
+        console.error('🗜️ History compaction cron error:', error instanceof Error ? error.message : error);
     }
 });
 

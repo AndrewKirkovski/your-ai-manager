@@ -232,6 +232,24 @@ export const ERROR_MESSAGE_PROMPT = `
 </system>
 `;
 
+export const HISTORY_COMPACTION_PROMPT = (dateRange: string, messages: string) => `
+You are summarizing a block of consecutive bot messages from a conversation history.
+These messages were sent by the bot without user replies in between (e.g. task reminders, routine pings, status updates).
+
+Date range of these messages: ${dateRange}
+
+Messages to summarize:
+${messages}
+
+INSTRUCTIONS:
+- Produce a single concise summary in the SAME LANGUAGE as the original messages
+- Preserve key facts: task names, decisions made, tool actions taken, important information shared
+- Omit repetitive reminders - just note "reminded about X N times" if applicable
+- Keep tool call results if they contain important data
+- Maximum 300 words
+- Do NOT add any preamble like "Here is a summary" - just write the summary directly
+`;
+
 export const DEFAULT_HELP_PROMPT = () => `
 <system>
 Пользователь запросил помощь. Объясни доступные команды:
