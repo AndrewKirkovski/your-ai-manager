@@ -28,7 +28,7 @@ COPY --from=builder /app .
 RUN mkdir -p /app/data
 
 # Set database location to persistent volume
-ENV DB_PATH=/app/data/bot.sqlite
+ENV DB_PATH=/app/data/db.sqlite
 
 # Expose web UI port
 EXPOSE 3000
