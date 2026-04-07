@@ -18,6 +18,7 @@ export interface ParsedMedia {
         emoji?: string;        // For stickers
         setName?: string;      // For stickers
         fileSize?: number;
+        fileId?: string;       // Telegram file_id for re-downloading
         mimeType?: string;
         // Location metadata
         latitude?: number;
@@ -99,7 +100,7 @@ export class MediaParser {
                 case 'voice':
                     return await this.parseVoiceMessage(msg.voice!);
                 case 'photo':
-                    return await this.parsePhoto(msg.photo!);
+                    return await this.parsePhoto(msg.photo!, msg.caption);
                 case 'sticker':
                     return await this.parseSticker(msg.sticker!);
                 case 'location':
@@ -219,57 +220,39 @@ export class MediaParser {
     // ============== PHOTO PARSING ==============
 
     /**
-     * Download and analyze photo using Claude Vision
+     * Download and analyze photo using Claude Vision.
+     * If caption is provided, uses it to focus the analysis.
      */
-    async parsePhoto(photos: PhotoSize[]): Promise<ParsedMedia> {
+    async parsePhoto(photos: PhotoSize[], caption?: string): Promise<ParsedMedia> {
         try {
             // Get highest resolution photo (last in array)
             const bestPhoto = photos[photos.length - 1];
 
             // Step 1: Download photo from Telegram
-            const fileStream = this.bot.getFileStream(bestPhoto.file_id);
-            const chunks: Buffer[] = [];
-
-            for await (const chunk of fileStream) {
-                chunks.push(chunk as Buffer);
-            }
-            const imageBuffer = Buffer.concat(chunks);
+            const imageBuffer = await this.downloadFile(bestPhoto.file_id);
 
             // Step 2: Convert to base64 for Vision API
             const base64Image = imageBuffer.toString('base64');
-            const imageUrl = `data:image/jpeg;base64,${base64Image}`;
 
-            // Step 3: Analyze with Claude Vision
-            const response = await this.anthropic.chat.completions.create({
-                model: this.visionModel,
-                messages: [
-                    {
-                        role: 'user',
-                        content: [
-                            {
-                                type: 'text',
-                                text: 'Describe this image in detail. Include any text visible in the image. ' +
-                                    'If it appears to be a screenshot, describe what application or content is shown. ' +
-                                    'Be concise but thorough.'
-                            },
-                            {
-                                type: 'image_url',
-                                image_url: { url: imageUrl }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens: this.maxImageTokens
-            });
+            // Step 3: Build prompt — caption-aware if provided
+            const prompt = caption
+                ? `The user sent this photo with the message: "${caption}". ` +
+                  'Analyze the image with that context in mind. Describe what you see, focusing on what\'s relevant to the user\'s message. ' +
+                  'Include any text visible in the image.'
+                : 'Describe this image in detail. Include any text visible in the image. ' +
+                  'If it appears to be a screenshot, describe what application or content is shown. ' +
+                  'Be concise but thorough.';
 
-            const description = response.choices[0]?.message?.content || 'Unable to analyze image';
+            // Step 4: Analyze with Claude Vision
+            const description = await this.analyzeImageBase64(base64Image, prompt, 500);
 
             return {
                 type: 'photo',
                 content: description,
                 originalType: 'photo',
                 metadata: {
-                    fileSize: bestPhoto.file_size
+                    fileSize: bestPhoto.file_size,
+                    fileId: bestPhoto.file_id,
                 }
             };
         } catch (error) {
@@ -284,6 +267,49 @@ export class MediaParser {
                 error: error instanceof Error ? error.message : 'Unknown vision error'
             };
         }
+    }
+
+    // ============== SHARED HELPERS ==============
+
+    /**
+     * Download a file from Telegram by file_id, return as Buffer.
+     */
+    private async downloadFile(fileId: string): Promise<Buffer> {
+        const fileStream = this.bot.getFileStream(fileId);
+        const chunks: Buffer[] = [];
+        for await (const chunk of fileStream) {
+            chunks.push(chunk as Buffer);
+        }
+        return Buffer.concat(chunks);
+    }
+
+    /**
+     * Send a base64 image to Claude Vision with a custom prompt.
+     */
+    private async analyzeImageBase64(base64: string, prompt: string, maxTokens?: number): Promise<string> {
+        const imageUrl = `data:image/jpeg;base64,${base64}`;
+        const response = await this.anthropic.chat.completions.create({
+            model: this.visionModel,
+            messages: [{
+                role: 'user',
+                content: [
+                    { type: 'text', text: prompt },
+                    { type: 'image_url', image_url: { url: imageUrl } }
+                ]
+            }],
+            max_tokens: maxTokens ?? this.maxImageTokens
+        });
+        return response.choices[0]?.message?.content || 'Unable to analyze image';
+    }
+
+    /**
+     * Re-analyze a previously sent image by Telegram file_id with a custom prompt.
+     * Used by the AnalyzeImage tool for follow-up analysis.
+     */
+    async analyzeImageByFileId(fileId: string, prompt: string): Promise<string> {
+        const imageBuffer = await this.downloadFile(fileId);
+        const base64 = imageBuffer.toString('base64');
+        return this.analyzeImageBase64(base64, prompt, 800);
     }
 
     // ============== STICKER PARSING ==============

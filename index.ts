@@ -21,7 +21,11 @@ import {
     setUser,
     getAllUsers,
     getAllRoutines,
-    getAllTasks, Task, updateUserTask
+    getAllTasks, Task, updateUserTask,
+    cleanupOldTasks,
+    addImageToCache,
+    getTrackedStatNames, getLatestStat, getStatCount,
+    getTodayStats,
 } from "./userStore";
 import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
@@ -29,6 +33,7 @@ import {runHistoryCompaction} from './historyCompaction';
 import {CronExpressionParser} from 'cron-parser';
 import {formatDateHuman, formatCronHuman, getCurrentTime} from './dateUtils';
 import {initializeMediaParser, getMediaParser} from './mediaParser';
+import {initStatTools} from './tools.stats';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN!;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
@@ -62,6 +67,9 @@ initializeMediaParser({
     language: 'ru'
 });
 
+// Initialize stat tools with bot instance (for sending chart images)
+initStatTools(bot);
+
 async function getCurrentInfo(userId: number): Promise<string> {
     const user = await getUser(userId);
     if (!user) throw new Error('Ошибка: пользователь не найден');
@@ -72,6 +80,17 @@ async function getCurrentInfo(userId: number): Promise<string> {
     const tasks = await getAllTasks(userId);
     const pendingTasks = tasks.filter(t => t.status === 'pending');
     const replanningTasks = tasks.filter(t => t.status === 'needs_replanning');
+
+    let todayStatsStr = 'no stats tracked today';
+    try {
+        const todayStats = await getTodayStats(userId);
+        if (todayStats.length > 0) {
+            todayStatsStr = todayStats.map(s => `${s.name}: ${s.total}${s.unit ? ' ' + s.unit : ''} (${s.count} entries)`).join(', ');
+        }
+    } catch (e) {
+        // Don't let stat errors break the entire context
+    }
+
     const Memory = `
 Goal: ${user.preferences.goal || 'not set'}
 
@@ -81,10 +100,12 @@ ${activeRoutines.map(r => `id: ${r.id} cron: ${r.cron} defaultAnnoyance: ${r.def
 Pending Tasks: 
 ${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'no active tasks'}
 
-Tasks that need AI agent to update them: 
-${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'no active tasks'}
+Tasks that need replanning (AI must update these):
+${replanningTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'none'}
 
 Memory: ${JSON.stringify(user.memory || {}, null, 2)}
+
+Today's stats: ${todayStatsStr}
         `
 
     return Memory;
@@ -139,24 +160,14 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
             }
         });
 
-        // Cleanup old completed/failed tasks after processing (keep last 50 per user)
-        const userForCleanup = await getUser(userId);
-        if (userForCleanup && userForCleanup.tasks && userForCleanup.tasks.length > 50) {
-            const sortedTasks = [...userForCleanup.tasks].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-            const tasksToKeep = sortedTasks.slice(0, 50);
-            const removedCount = userForCleanup.tasks.length - tasksToKeep.length;
-
-            userForCleanup.tasks = tasksToKeep;
-            await setUser(userForCleanup);
-
-            if (removedCount > 0) {
-                console.log(`🧹 Cleaned up old tasks:`, {
-                    userId,
-                    removedCount,
-                    tasksKept: tasksToKeep.length,
-                    timestamp: new Date().toISOString()
-                });
-            }
+        // Cleanup old tasks after processing (keep last 50 per user)
+        const removedCount = await cleanupOldTasks(userId, 50);
+        if (removedCount > 0) {
+            console.log(`🧹 Cleaned up old tasks:`, {
+                userId,
+                removedCount,
+                timestamp: new Date().toISOString()
+            });
         }
 
         // Combine the clean message with command results if any
@@ -200,7 +211,7 @@ cron.schedule('* * * * *', async () => {
             try {
                 // Check if routine should fire based on cron
                 const cronInterval = CronExpressionParser.parse(routine.cron);
-                const nextFireTime = cronInterval.next().toDate();
+                cronInterval.next(); // advance iterator so .prev() returns the last fire time
                 const lastFireTime = cronInterval.prev().toDate();
 
                 // If lastFireTime is within the last minute, this routine should fire
@@ -564,6 +575,31 @@ bot.onText(/\/memory/, async (msg) => {
     }
 });
 
+bot.onText(/\/stats/, async (msg) => {
+    try {
+        const userId = msg.from?.id;
+        if (!userId) return;
+
+        const statNames = await getTrackedStatNames(userId);
+        if (statNames.length === 0) {
+            await bot.sendMessage(msg.chat.id, 'Пока нет отслеживаемых статистик. Просто скажи мне что-то вроде "выпил 500мл воды" или "настроение 7/10".');
+            return;
+        }
+
+        const lines = await Promise.all(statNames.map(async (s) => {
+            const latest = await getLatestStat(userId, s.name);
+            const count = await getStatCount(userId, s.name);
+            const lastVal = latest ? `${latest.value}${s.unit ? ' ' + s.unit : ''}` : '—';
+            return `• **${s.name}** — последнее: ${lastVal}, записей: ${count}`;
+        }));
+
+        await bot.sendMessage(msg.chat.id, `📊 Отслеживаемые статистики:\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.error('Error showing stats:', error);
+        await bot.sendMessage(msg.chat.id, 'Ошибка при загрузке статистик.');
+    }
+});
+
 bot.onText(/\/help/, async (msg) => {
     try {
         const result = await AIService.streamAIResponse({
@@ -583,9 +619,10 @@ bot.onText(/\/help/, async (msg) => {
         console.error('Error showing help:', error);
         await bot.sendMessage(msg.chat.id, `Доступные команды:
 /goal - установить цель
-/cleargoal - очистить цель  
+/cleargoal - очистить цель
 /routines - показать активные рутины
 /tasks - показать задачи
+/stats - показать отслеживаемые статистики
 /memory - показать сохраненную информацию
 /help - эта справка`);
     }
@@ -628,6 +665,11 @@ bot.on('message', async (msg) => {
             // Format for AI conversation
             processedContent = mediaParser.formatForAI(parsed);
             logIndicator = mediaParser.getMediaIndicator(parsed);
+
+            // Cache photo for re-analysis via AnalyzeImage tool
+            if (parsed.type === 'photo' && parsed.metadata?.fileId) {
+                await addImageToCache(userId, parsed.metadata.fileId, msg.caption, parsed.content);
+            }
 
             // Include any caption with photos/stickers
             if (msg.caption) {

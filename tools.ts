@@ -39,6 +39,8 @@ import {
     GetLocationSummary
 } from "./tools.location";
 import { GetWeather } from "./tools.weather";
+import { AnalyzeImage } from "./tools.image";
+import { TrackStat, GetStatHistory, ListTrackedStats, GenerateStatChart } from "./tools.stats";
 
 export const tools = {
     get_current_time,
@@ -76,6 +78,13 @@ export const tools = {
     ReverseGeocode,
     SearchNearbyPlaces,
     GetLocationSummary,
+    // Image tools
+    AnalyzeImage,
+    // Stat tracking tools
+    TrackStat,
+    GetStatHistory,
+    ListTrackedStats,
+    GenerateStatChart,
 } as const;
 
 

@@ -3,6 +3,10 @@
 .env
 node_modules
 db.json
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 
 
 .claude/
+.local/

@@ -91,6 +91,8 @@
                 ${renderGoal()}
                 ${renderTasks()}
                 ${renderRoutines()}
+                ${renderStats()}
+                ${renderImages()}
                 ${renderMemory()}
                 ${renderMessages()}
             `;
@@ -257,7 +259,87 @@
             `;
         }
 
-        // Messages section
+        // Stats section (read-only)
+        function renderStats() {
+            if (!currentUser.stats || !currentUser.stats.length) {
+                return `
+                    <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                        <h2 class="text-lg font-semibold mb-2">📊 Stats</h2>
+                        <p class="text-dark-muted">No stats tracked yet</p>
+                    </div>
+                `;
+            }
+
+            const rows = currentUser.stats.map(s => `
+                <tr class="border-b border-dark-border">
+                    <td class="py-2 px-2 font-medium">${escapeHtml(s.name)}</td>
+                    <td class="py-2 px-2">${s.lastValue != null ? s.lastValue : '—'}${s.unit ? ' ' + escapeHtml(s.unit) : ''}</td>
+                    <td class="py-2 px-2 text-dark-muted">${s.totalEntries}</td>
+                    <td class="py-2 px-2 text-dark-muted text-xs">${s.lastRecorded ? new Date(s.lastRecorded).toLocaleString() : '—'}</td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                    <h2 class="text-lg font-semibold mb-3">📊 Stats (${currentUser.stats.length}) <span class="text-dark-muted text-sm font-normal">read-only</span></h2>
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-left text-dark-muted border-b border-dark-border">
+                                <th class="py-2 px-2">Name</th>
+                                <th class="py-2 px-2">Last Value</th>
+                                <th class="py-2 px-2 w-20">Entries</th>
+                                <th class="py-2 px-2 w-40">Last Recorded</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        // Image cache section (read-only)
+        function renderImages() {
+            if (!currentUser.images || !currentUser.images.length) {
+                return `
+                    <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                        <h2 class="text-lg font-semibold mb-2">🖼️ Recent Images</h2>
+                        <p class="text-dark-muted">No cached images</p>
+                    </div>
+                `;
+            }
+
+            const rows = currentUser.images.map((img, i) => `
+                <tr class="border-b border-dark-border">
+                    <td class="py-2 px-2 text-dark-muted">${i}</td>
+                    <td class="py-2 px-2 font-mono text-xs truncate max-w-[200px]">${escapeHtml(img.fileId)}</td>
+                    <td class="py-2 px-2 text-sm">${escapeHtml(img.caption) || '<span class="text-dark-muted">—</span>'}</td>
+                    <td class="py-2 px-2 text-sm truncate max-w-[250px]">${escapeHtml(img.description) || '—'}</td>
+                    <td class="py-2 px-2 text-dark-muted text-xs">${new Date(img.timestamp).toLocaleString()}</td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                    <h2 class="text-lg font-semibold mb-3">🖼️ Recent Images (${currentUser.images.length}) <span class="text-dark-muted text-sm font-normal">read-only</span></h2>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="text-left text-dark-muted border-b border-dark-border">
+                                    <th class="py-2 px-2 w-10">#</th>
+                                    <th class="py-2 px-2">File ID</th>
+                                    <th class="py-2 px-2">Caption</th>
+                                    <th class="py-2 px-2">Description</th>
+                                    <th class="py-2 px-2 w-36">Time</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Messages section (uses message IDs for editing)
         function renderMessages() {
             if (!currentUser.messages.length) {
                 return `
@@ -268,8 +350,8 @@
                 `;
             }
 
-            const rows = currentUser.messages.map((m, i) => `
-                <div class="border-b border-dark-border py-3" id="msg-${i}">
+            const rows = currentUser.messages.map(m => `
+                <div class="border-b border-dark-border py-3" id="msg-${m.id}">
                     <div class="flex items-start gap-3">
                         <span class="px-2 py-1 rounded text-xs ${m.role === 'user' ? 'bg-blue-600' : 'bg-green-600'} shrink-0">
                             ${m.role}
@@ -278,7 +360,7 @@
                             <textarea
                                 class="bg-transparent border border-transparent hover:border-dark-border focus:border-blue-500 outline-none w-full resize-none rounded p-1 overflow-hidden"
                                 rows="1"
-                                onchange="updateMessage(${i}, this.value)"
+                                onchange="updateMessage(${m.id}, this.value)"
                             >${escapeHtml(m.content)}</textarea>
                             <div class="text-xs text-dark-muted mt-1">
                                 ${m.timestamp ? new Date(m.timestamp).toLocaleString() : ''}
@@ -328,16 +410,17 @@
             }
         }
 
-        async function updateMessage(index, content) {
+        async function updateMessage(messageId, content) {
             const userId = document.getElementById('userSelect').value;
             try {
-                await fetch(`/api/users/${userId}/messages/${index}`, {
+                await fetch(`/api/users/${userId}/messages/${messageId}`, {
                     method: 'PATCH',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ content })
                 });
-                currentUser.messages[index].content = content;
-                showSaved(`msg-${index}`);
+                const msg = currentUser.messages.find(m => m.id === messageId);
+                if (msg) msg.content = content;
+                showSaved(`msg-${messageId}`);
             } catch (e) {
                 console.error('Failed to update message:', e);
             }
@@ -357,7 +440,8 @@
                 .replace(/&/g, '&amp;')
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;');
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
 
         function autoResize(textarea) {

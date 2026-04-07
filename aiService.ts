@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import TelegramBot from 'node-telegram-bot-api';
 import {AICommandService} from './aiCommandService';
-import {addMessageToHistory, getUser, getUserMessageHistory} from './userStore';
+import {addMessageToHistory, getRecentMessageHistory} from './userStore';
 import {getAllToolDefinitions, executeTool, tools} from './tools';
 import {ChatCompletionCreateParamsStreaming} from "openai/src/resources/chat/completions/completions";
 import {ToolCall, ToolResult} from "./tool.types";
@@ -372,8 +372,7 @@ ${error instanceof Error ? error.message : String(error)}
      * Get recent messages for context
      */
     private static async getRecentMessages(userId: number, limit: number = 30): Promise<OpenAIMessage[]> {
-        const messageHistory = await getUserMessageHistory(userId);
-        const recentMessages = messageHistory.slice(-limit);
+        const recentMessages = await getRecentMessageHistory(userId, limit);
 
         return recentMessages.map(m => ({
             role: m.role as 'user' | 'assistant',

@@ -1,4 +1,7 @@
-FROM node:20-alpine
+FROM node:20-alpine AS builder
+
+# Required for better-sqlite3 native compilation
+RUN apk add --no-cache python3 make g++
 
 WORKDIR /app
 
@@ -11,13 +14,24 @@ COPY *.ts ./
 COPY tsconfig.json ./
 COPY web/ ./web/
 
+FROM node:20-alpine
+
+# Required for better-sqlite3 native module at runtime
+RUN apk add --no-cache libstdc++
+
+WORKDIR /app
+
+# Copy built node_modules and source from builder
+COPY --from=builder /app .
+
 # Create data directory for persistent volume
 RUN mkdir -p /app/data
 
-# Set db.json location to persistent volume
-ENV DB_PATH=/app/data/db.json
+# Set database location to persistent volume
+ENV DB_PATH=/app/data/bot.sqlite
 
 # Expose web UI port
 EXPOSE 3000
 
-CMD ["yarn", "start"]
+# Run migration then start bot
+CMD ["sh", "-c", "npx tsx migrate-to-sqlite.ts && yarn start"]

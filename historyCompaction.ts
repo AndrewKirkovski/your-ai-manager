@@ -1,12 +1,12 @@
 import OpenAI from 'openai';
-import {getAllUsers, getUser, MessageHistory, setUser} from './userStore';
+import {getAllUsers, getMessageHistoryWithIds, MessageHistory, compactMessages} from './userStore';
 import {formatDateHuman} from './dateUtils';
 import {HISTORY_COMPACTION_PROMPT} from './constants';
 
-/** A run of consecutive assistant messages with their indices in the history array */
+/** A run of consecutive assistant messages with their DB IDs */
 type CompactableRun = {
-    startIndex: number;
-    endIndex: number; // inclusive
+    startId: number;
+    endId: number; // inclusive
     messages: MessageHistory[];
 };
 
@@ -14,6 +14,7 @@ const MAX_COMPACTIONS_PER_RUN = 5;
 
 /**
  * Find runs of 2+ consecutive assistant messages in history.
+ * Messages must have IDs (from SQLite autoincrement).
  */
 function findCompactableRuns(history: MessageHistory[]): CompactableRun[] {
     const runs: CompactableRun[] = [];
@@ -26,10 +27,11 @@ function findCompactableRuns(history: MessageHistory[]): CompactableRun[] {
             }
         } else {
             if (runStart !== null && i - runStart >= 2) {
+                const msgs = history.slice(runStart, i);
                 runs.push({
-                    startIndex: runStart,
-                    endIndex: i - 1,
-                    messages: history.slice(runStart, i),
+                    startId: msgs[0].id,
+                    endId: msgs[msgs.length - 1].id,
+                    messages: msgs,
                 });
             }
             runStart = null;
@@ -38,10 +40,11 @@ function findCompactableRuns(history: MessageHistory[]): CompactableRun[] {
 
     // Handle run that ends at the end of history
     if (runStart !== null && history.length - runStart >= 2) {
+        const msgs = history.slice(runStart);
         runs.push({
-            startIndex: runStart,
-            endIndex: history.length - 1,
-            messages: history.slice(runStart),
+            startId: msgs[0].id,
+            endId: msgs[msgs.length - 1].id,
+            messages: msgs,
         });
     }
 
@@ -94,49 +97,36 @@ export async function runHistoryCompaction(openai: OpenAI, model: string): Promi
             break;
         }
 
-        const user = await getUser(userData.userId);
-        if (!user?.messageHistory?.length) continue;
+        const history = await getMessageHistoryWithIds(userData.userId);
+        if (!history.length) continue;
 
-        const runs = findCompactableRuns(user.messageHistory);
+        const runs = findCompactableRuns(history);
         if (runs.length === 0) continue;
 
-        console.log(`🗜️ User ${user.userId}: found ${runs.length} compactable run(s)`);
+        console.log(`🗜️ User ${userData.userId}: found ${runs.length} compactable run(s)`);
 
-        let compactedThisUser = false;
-
-        // Process runs from last to first so indices stay valid after splicing
-        for (let i = runs.length - 1; i >= 0; i--) {
+        for (const run of runs) {
             if (totalCompactions >= MAX_COMPACTIONS_PER_RUN) break;
 
-            const run = runs[i];
             try {
                 const dateRange = buildDateRange(run);
                 const summary = await summarizeRun(run, dateRange, openai, model);
 
-                const compactedMessage: MessageHistory = {
-                    role: 'assistant',
-                    content: `<system>Compacted summary of ${run.messages.length} bot messages from ${dateRange}</system>\n${summary}`,
-                    timestamp: run.messages[0].timestamp,
-                };
+                const compactedContent = `<system>Compacted summary of ${run.messages.length} bot messages from ${dateRange}</system>\n${summary}`;
 
-                // Splice in place on the same object to keep indices valid
-                user.messageHistory.splice(
-                    run.startIndex,
-                    run.endIndex - run.startIndex + 1,
-                    compactedMessage,
+                compactMessages(
+                    userData.userId,
+                    run.startId,
+                    run.endId,
+                    compactedContent,
+                    run.messages[0].timestamp,
                 );
 
-                compactedThisUser = true;
                 totalCompactions++;
-                console.log(`🗜️ User ${user.userId}: compacted ${run.messages.length} messages (${dateRange}) → 1 summary`);
+                console.log(`🗜️ User ${userData.userId}: compacted ${run.messages.length} messages (${dateRange}) → 1 summary`);
             } catch (error) {
-                console.error(`🗜️ Compaction error for user ${user.userId}:`, error instanceof Error ? error.message : error);
+                console.error(`🗜️ Compaction error for user ${userData.userId}:`, error instanceof Error ? error.message : error);
             }
-        }
-
-        // Save once after all compactions for this user
-        if (compactedThisUser) {
-            await setUser(user);
         }
     }
 

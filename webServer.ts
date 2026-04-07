@@ -1,13 +1,19 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getAllUsers, getUser, updateUserTask, updateUserMemory, setUser } from './userStore';
+import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount } from './userStore';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
+
+// Express 5 types params as string | string[] — extract first string safely
+function param(req: Request, name: string): string {
+    const val = req.params[name];
+    return Array.isArray(val) ? val[0] : val;
+}
 
 // Serve static files from /web folder
 app.use(express.static(path.join(__dirname, 'web')));
@@ -31,16 +37,26 @@ app.get('/api/users', async (_req: Request, res: Response) => {
 // GET /api/users/:id - get full user data
 app.get('/api/users/:id', async (req: Request, res: Response) => {
     try {
-        const user = await getUser(parseInt(req.params.id));
+        const user = await getUser(parseInt(param(req, 'id')));
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
+        const images = await getRecentImages(user.userId);
+        const statNames = await getTrackedStatNames(user.userId);
+        const stats = await Promise.all(statNames.map(async (s) => {
+            const latest = await getLatestStat(user.userId, s.name);
+            const count = await getStatCount(user.userId, s.name);
+            return { name: s.name, unit: s.unit, lastValue: latest?.value, lastRecorded: latest?.timestamp.toISOString(), totalEntries: count };
+        }));
+
         res.json({
             userId: user.userId,
             tasks: user.tasks,
             routines: user.routines,
             memory: user.memory,
             messages: user.messageHistory,
+            images,
+            stats,
             goal: user.preferences.goal || ''
         });
     } catch (error) {
@@ -52,8 +68,8 @@ app.get('/api/users/:id', async (req: Request, res: Response) => {
 // PATCH /api/users/:id/tasks/:taskId - edit task
 app.patch('/api/users/:id/tasks/:taskId', async (req: Request, res: Response) => {
     try {
-        const userId = parseInt(req.params.id);
-        const { taskId } = req.params;
+        const userId = parseInt(param(req, 'id'));
+        const taskId = param(req, 'taskId');
         const updates = req.body;
 
         await updateUserTask(userId, taskId, (task) => {
@@ -74,8 +90,8 @@ app.patch('/api/users/:id/tasks/:taskId', async (req: Request, res: Response) =>
 // PATCH /api/users/:id/memory/:key - edit memory
 app.patch('/api/users/:id/memory/:key', async (req: Request, res: Response) => {
     try {
-        const userId = parseInt(req.params.id);
-        const { key } = req.params;
+        const userId = parseInt(param(req, 'id'));
+        const key = param(req, 'key');
         const { value } = req.body;
 
         await updateUserMemory(userId, key, value);
@@ -86,23 +102,17 @@ app.patch('/api/users/:id/memory/:key', async (req: Request, res: Response) => {
     }
 });
 
-// PATCH /api/users/:id/messages/:index - edit message
-app.patch('/api/users/:id/messages/:index', async (req: Request, res: Response) => {
+// PATCH /api/users/:id/messages/:messageId - edit message by ID
+app.patch('/api/users/:id/messages/:messageId', async (req: Request, res: Response) => {
     try {
-        const userId = parseInt(req.params.id);
-        const index = parseInt(req.params.index);
+        const userId = parseInt(param(req, 'id'));
+        const messageId = parseInt(param(req, 'messageId'));
         const { content } = req.body;
 
-        const user = await getUser(userId);
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        if (!user.messageHistory[index]) {
+        const updated = updateMessageById(userId, messageId, content);
+        if (!updated) {
             return res.status(404).json({ error: 'Message not found' });
         }
-
-        user.messageHistory[index].content = content;
-        await setUser(user);
         res.json({ success: true });
     } catch (error) {
         console.error('Error updating message:', error);
