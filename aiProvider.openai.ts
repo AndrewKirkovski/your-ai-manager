@@ -37,9 +37,12 @@ export class OpenAIProvider implements AIProvider {
             requestOptions.tool_choice = 'auto';
         }
 
-        // Enable thinking via extra_body for models that support it (Anthropic compat layer)
-        if (this.isAnthropicEndpoint && this.supportsThinking(request.model)) {
-            requestOptions.extra_body = { thinking: { type: 'adaptive' } };
+        // Enable extended thinking via extra_body (Anthropic compat layer)
+        if (this.isAnthropicEndpoint) {
+            const thinkingConfig = this.getThinkingConfig(request.model);
+            if (thinkingConfig) {
+                requestOptions.extra_body = { thinking: thinkingConfig };
+            }
         }
 
         const stream = await this.client.chat.completions.create(
@@ -132,9 +135,16 @@ export class OpenAIProvider implements AIProvider {
         return result;
     }
 
-    private supportsThinking(model: string): boolean {
-        // Only Opus and claude-3.7+ models support extended thinking
-        return /opus|claude-3[.-]7|claude-4/i.test(model);
+    private getThinkingConfig(model: string): Record<string, unknown> | null {
+        // 4.6 models: adaptive thinking (recommended)
+        if (/4-6|4\.6/i.test(model)) {
+            return { type: 'adaptive' };
+        }
+        // Older models that support thinking: use enabled with budget
+        if (/opus|sonnet-4|claude-3[.-]7/i.test(model)) {
+            return { type: 'enabled', budget_tokens: 8000 };
+        }
+        return null;
     }
 
     private convertTool(tool: ToolDefinition): OpenAI.ChatCompletionTool {
