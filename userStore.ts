@@ -278,6 +278,16 @@ const stmts = {
             home_lng = COALESCE(@home_lng, home_lng),
             max_transit_minutes = COALESCE(@max_transit_minutes, max_transit_minutes)
     `),
+
+    // LuxMed Monitorings
+    insertLuxmedMonitoring: db.prepare(`
+        INSERT INTO luxmed_monitorings (id, user_id, account_id, service_id, service_name, city_id, city_name, clinic_ids, doctor_ids, english_only, date_from, date_to, time_from, time_to, autobook, rebook_if_exists, active, created_at)
+        VALUES (@id, @user_id, @account_id, @service_id, @service_name, @city_id, @city_name, @clinic_ids, @doctor_ids, @english_only, @date_from, @date_to, @time_from, @time_to, @autobook, @rebook_if_exists, 1, @created_at)
+    `),
+    getActiveLuxmedMonitorings: db.prepare<[], { id: string; user_id: number; account_id: number; service_id: number; service_name: string; city_id: number; city_name: string; clinic_ids: string | null; doctor_ids: string | null; english_only: number; date_from: string; date_to: string; time_from: string; time_to: string; autobook: number; rebook_if_exists: number; last_check: string | null; created_at: string }>('SELECT * FROM luxmed_monitorings WHERE active = 1'),
+    getActiveLuxmedMonitoringsByUser: db.prepare<[number], { id: string; user_id: number; account_id: number; service_id: number; service_name: string; city_id: number; city_name: string; clinic_ids: string | null; doctor_ids: string | null; english_only: number; date_from: string; date_to: string; time_from: string; time_to: string; autobook: number; rebook_if_exists: number; last_check: string | null; created_at: string }>('SELECT * FROM luxmed_monitorings WHERE active = 1 AND user_id = ?'),
+    deactivateLuxmedMonitoring: db.prepare('UPDATE luxmed_monitorings SET active = 0 WHERE id = ? AND user_id = ?'),
+    updateLuxmedMonitoringLastCheck: db.prepare('UPDATE luxmed_monitorings SET last_check = ? WHERE id = ?'),
 };
 
 // ============== USER FUNCTIONS ==============
@@ -643,4 +653,90 @@ export function saveLuxmedPreferences(userId: number, prefs: LuxmedPreferences):
         home_lng: prefs.homeLng ?? null,
         max_transit_minutes: prefs.maxTransitMinutes ?? null,
     });
+}
+
+// ============== LUXMED MONITORING FUNCTIONS ==============
+
+export interface LuxmedMonitoringConfig {
+    id: string;
+    userId: number;
+    accountId: number;
+    serviceId: number;
+    serviceName: string;
+    cityId: number;
+    cityName: string;
+    clinicIds: number[] | null;
+    doctorIds: number[] | null;
+    englishOnly: boolean;
+    dateFrom: string;
+    dateTo: string;
+    timeFrom: string;
+    timeTo: string;
+    autobook: boolean;
+    rebookIfExists: boolean;
+    lastCheck: string | null;
+    createdAt: string;
+}
+
+function rowToMonitoringConfig(row: any): LuxmedMonitoringConfig {
+    return {
+        id: row.id,
+        userId: row.user_id,
+        accountId: row.account_id,
+        serviceId: row.service_id,
+        serviceName: row.service_name,
+        cityId: row.city_id,
+        cityName: row.city_name,
+        clinicIds: row.clinic_ids ? JSON.parse(row.clinic_ids) : null,
+        doctorIds: row.doctor_ids ? JSON.parse(row.doctor_ids) : null,
+        englishOnly: row.english_only === 1,
+        dateFrom: row.date_from,
+        dateTo: row.date_to,
+        timeFrom: row.time_from,
+        timeTo: row.time_to,
+        autobook: row.autobook === 1,
+        rebookIfExists: row.rebook_if_exists === 1,
+        lastCheck: row.last_check,
+        createdAt: row.created_at,
+    };
+}
+
+export function createLuxmedMonitoring(config: Omit<LuxmedMonitoringConfig, 'lastCheck' | 'createdAt'>): LuxmedMonitoringConfig {
+    const now = new Date().toISOString();
+    stmts.insertLuxmedMonitoring.run({
+        id: config.id,
+        user_id: config.userId,
+        account_id: config.accountId,
+        service_id: config.serviceId,
+        service_name: config.serviceName,
+        city_id: config.cityId,
+        city_name: config.cityName,
+        clinic_ids: config.clinicIds ? JSON.stringify(config.clinicIds) : null,
+        doctor_ids: config.doctorIds ? JSON.stringify(config.doctorIds) : null,
+        english_only: config.englishOnly ? 1 : 0,
+        date_from: config.dateFrom,
+        date_to: config.dateTo,
+        time_from: config.timeFrom,
+        time_to: config.timeTo,
+        autobook: config.autobook ? 1 : 0,
+        rebook_if_exists: config.rebookIfExists ? 1 : 0,
+        created_at: now,
+    });
+    return { ...config, lastCheck: null, createdAt: now };
+}
+
+export function getActiveLuxmedMonitorings(): LuxmedMonitoringConfig[] {
+    return stmts.getActiveLuxmedMonitorings.all().map(rowToMonitoringConfig);
+}
+
+export function getActiveLuxmedMonitoringsByUser(userId: number): LuxmedMonitoringConfig[] {
+    return stmts.getActiveLuxmedMonitoringsByUser.all(userId).map(rowToMonitoringConfig);
+}
+
+export function deactivateLuxmedMonitoring(id: string, userId: number): void {
+    stmts.deactivateLuxmedMonitoring.run(id, userId);
+}
+
+export function updateLuxmedMonitoringLastCheck(id: string): void {
+    stmts.updateLuxmedMonitoringLastCheck.run(new Date().toISOString(), id);
 }

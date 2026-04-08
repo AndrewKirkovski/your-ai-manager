@@ -2,10 +2,13 @@ import { Tool } from './tool.types';
 import {
     luxmedLogin, luxmedGetCities, luxmedGetServices,
     luxmedSearchSlots, luxmedBookSlot, luxmedCancelVisit, luxmedGetReserved,
-    luxmedCreateMonitoring, luxmedGetMonitorings, luxmedDeactivateMonitoring,
     LuxmedTerm,
 } from './luxmedAdapter';
-import { getLuxmedAccountId, saveLuxmedAccount, getLuxmedPreferences, saveLuxmedPreferences, LuxmedPreferences } from './userStore';
+import {
+    getLuxmedAccountId, saveLuxmedAccount, getLuxmedPreferences, saveLuxmedPreferences,
+    LuxmedPreferences, generateShortId,
+    createLuxmedMonitoring, getActiveLuxmedMonitoringsByUser, deactivateLuxmedMonitoring,
+} from './userStore';
 
 function requireAccount(userId: number): number {
     const accountId = getLuxmedAccountId(userId);
@@ -244,7 +247,7 @@ export const LuxmedSetPreferences: Tool = {
 
 export const LuxmedMonitorSlot: Tool = {
     name: 'LuxmedMonitorSlot',
-    description: 'Start monitoring for available appointments. The system will check every 10-15 minutes and auto-book when a matching slot appears.',
+    description: 'Start monitoring for available appointments. Checks every 10 minutes with client-side filtering (English-speaking doctors, specific clinics/doctors). Auto-books when a matching slot appears.',
     parameters: {
         type: 'object',
         properties: {
@@ -252,12 +255,11 @@ export const LuxmedMonitorSlot: Tool = {
             service_name: { type: 'string', description: 'Service name (for display in notifications)' },
             city_id: { type: 'number', description: 'City ID. Omit to use default.' },
             city_name: { type: 'string', description: 'City name (for display)' },
-            clinic_id: { type: 'number', description: 'Clinic ID to filter. Omit for any clinic.' },
-            clinic_name: { type: 'string', description: 'Clinic name (for display)' },
-            doctor_id: { type: 'number', description: 'Doctor ID to filter. Omit for any doctor.' },
-            doctor_name: { type: 'string', description: 'Doctor name (for display)' },
-            date_from: { type: 'string', description: 'Start of date range (ISO with timezone, e.g. "2026-04-10T00:00:00+02:00")' },
-            date_to: { type: 'string', description: 'End of date range (ISO with timezone)' },
+            clinic_ids: { type: 'string', description: 'Comma-separated clinic IDs to filter. Omit for any clinic. E.g. "5,7,142"' },
+            doctor_ids: { type: 'string', description: 'Comma-separated doctor IDs to filter. Omit for any doctor. E.g. "12218,62477"' },
+            english_only: { type: 'string', description: 'Only English-speaking doctors? "true" or "false". Default "false".' },
+            date_from: { type: 'string', description: 'Start of date range (ISO, e.g. "2026-04-10T00:00:00")' },
+            date_to: { type: 'string', description: 'End of date range (ISO)' },
             time_from: { type: 'string', description: 'Earliest time, e.g. "10:00"' },
             time_to: { type: 'string', description: 'Latest time, e.g. "14:00"' },
             autobook: { type: 'string', description: 'Auto-book first matching slot? "true" or "false". Default "true".' },
@@ -265,7 +267,7 @@ export const LuxmedMonitorSlot: Tool = {
         },
         required: ['service_id', 'service_name', 'date_from', 'date_to', 'time_from', 'time_to'],
     },
-    execute: async (args: { userId: number; service_id: number; service_name: string; city_id?: number; city_name?: string; clinic_id?: number; clinic_name?: string; doctor_id?: number; doctor_name?: string; date_from: string; date_to: string; time_from: string; time_to: string; autobook?: string; rebook_if_exists?: string }) => {
+    execute: async (args: { userId: number; service_id: number; service_name: string; city_id?: number; city_name?: string; clinic_ids?: string; doctor_ids?: string; english_only?: string; date_from: string; date_to: string; time_from: string; time_to: string; autobook?: string; rebook_if_exists?: string }) => {
         const accountId = requireAccount(args.userId);
         const prefs = getLuxmedPreferences(args.userId);
         const cityId = args.city_id || prefs.defaultCityId;
@@ -273,17 +275,20 @@ export const LuxmedMonitorSlot: Tool = {
             return { success: false, message: 'City not specified and no default city set.' };
         }
 
-        const monitoring = await luxmedCreateMonitoring(accountId, {
-            chatId: String(args.userId),
-            payerId: 0,
-            cityId,
-            cityName: args.city_name || prefs.defaultCityName || 'Unknown',
+        const clinicIds = args.clinic_ids ? args.clinic_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
+        const doctorIds = args.doctor_ids ? args.doctor_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
+
+        const monitoring = createLuxmedMonitoring({
+            id: generateShortId(),
+            userId: args.userId,
+            accountId,
             serviceId: args.service_id,
             serviceName: args.service_name,
-            clinicId: args.clinic_id,
-            clinicName: args.clinic_name || 'Any',
-            doctorId: args.doctor_id,
-            doctorName: args.doctor_name || 'Any',
+            cityId,
+            cityName: args.city_name || prefs.defaultCityName || 'Unknown',
+            clinicIds,
+            doctorIds,
+            englishOnly: args.english_only === 'true',
             dateFrom: args.date_from,
             dateTo: args.date_to,
             timeFrom: args.time_from,
@@ -292,9 +297,15 @@ export const LuxmedMonitorSlot: Tool = {
             rebookIfExists: args.rebook_if_exists === 'true',
         });
 
+        const filters = [];
+        if (clinicIds) filters.push(`clinics: ${clinicIds.length}`);
+        if (doctorIds) filters.push(`doctors: ${doctorIds.length}`);
+        if (args.english_only === 'true') filters.push('english-speaking only');
+        const filterStr = filters.length > 0 ? ` Filters: ${filters.join(', ')}.` : '';
+
         return {
             success: true,
-            message: `Monitoring started (#${monitoring.recordId}): ${args.service_name}, ${args.time_from}-${args.time_to}, auto-book: ${args.autobook !== 'false' ? 'yes' : 'no'}. Checking every 10-15 min.`,
+            message: `Monitoring started (${monitoring.id}): ${args.service_name}, ${args.time_from}-${args.time_to}, auto-book: ${args.autobook !== 'false' ? 'yes' : 'no'}.${filterStr} Checking every 10 min.`,
         };
     },
 };
@@ -305,14 +316,13 @@ export const LuxmedStopMonitoring: Tool = {
     parameters: {
         type: 'object',
         properties: {
-            monitoring_id: { type: 'number', description: 'Monitoring ID to deactivate (from LuxmedListMonitorings)' },
+            monitoring_id: { type: 'string', description: 'Monitoring ID to deactivate (from LuxmedListMonitorings)' },
         },
         required: ['monitoring_id'],
     },
-    execute: async (args: { userId: number; monitoring_id: number }) => {
-        const accountId = requireAccount(args.userId);
-        await luxmedDeactivateMonitoring(accountId, args.monitoring_id);
-        return { success: true, message: `Monitoring #${args.monitoring_id} stopped.` };
+    execute: async (args: { userId: number; monitoring_id: string }) => {
+        deactivateLuxmedMonitoring(args.monitoring_id, args.userId);
+        return { success: true, message: `Monitoring ${args.monitoring_id} stopped.` };
     },
 };
 
@@ -324,8 +334,7 @@ export const LuxmedListMonitorings: Tool = {
         properties: {},
     },
     execute: async (args: { userId: number }) => {
-        const accountId = requireAccount(args.userId);
-        const monitorings = await luxmedGetMonitorings(accountId);
+        const monitorings = getActiveLuxmedMonitoringsByUser(args.userId);
         if (monitorings.length === 0) {
             return { success: true, message: 'No active monitorings.', monitorings: [] };
         }
@@ -333,14 +342,16 @@ export const LuxmedListMonitorings: Tool = {
             success: true,
             message: `${monitorings.length} active monitoring(s)`,
             monitorings: monitorings.map(m => ({
-                id: m.recordId,
+                id: m.id,
                 service: m.serviceName,
                 city: m.cityName,
-                clinic: m.clinicName,
-                doctor: m.doctorName,
+                clinics: m.clinicIds ? `${m.clinicIds.length} specific` : 'any',
+                doctors: m.doctorIds ? `${m.doctorIds.length} specific` : 'any',
+                englishOnly: m.englishOnly,
                 dateRange: `${m.dateFrom} — ${m.dateTo}`,
                 timeRange: `${m.timeFrom} — ${m.timeTo}`,
                 autobook: m.autobook,
+                lastCheck: m.lastCheck,
             })),
         };
     },

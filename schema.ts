@@ -78,6 +78,28 @@ export const SCHEMA_SQL = `
         max_transit_minutes INTEGER DEFAULT 30
     );
 
+    CREATE TABLE IF NOT EXISTS luxmed_monitorings (
+        id          TEXT PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+        account_id  INTEGER NOT NULL,
+        service_id  INTEGER NOT NULL,
+        service_name TEXT NOT NULL,
+        city_id     INTEGER NOT NULL,
+        city_name   TEXT NOT NULL,
+        clinic_ids  TEXT,
+        doctor_ids  TEXT,
+        english_only INTEGER NOT NULL DEFAULT 0,
+        date_from   TEXT NOT NULL,
+        date_to     TEXT NOT NULL,
+        time_from   TEXT NOT NULL DEFAULT '07:00',
+        time_to     TEXT NOT NULL DEFAULT '21:00',
+        autobook    INTEGER NOT NULL DEFAULT 1,
+        rebook_if_exists INTEGER NOT NULL DEFAULT 0,
+        active      INTEGER NOT NULL DEFAULT 1,
+        last_check  TEXT,
+        created_at  TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS stat_entries (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id   INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
@@ -97,4 +119,5 @@ export const INDEXES_SQL = `
     CREATE INDEX IF NOT EXISTS idx_messages_user_id_desc ON message_history(user_id, id DESC);
     CREATE INDEX IF NOT EXISTS idx_images_user ON image_cache(user_id);
     CREATE INDEX IF NOT EXISTS idx_stats_user_name_ts ON stat_entries(user_id, name, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_luxmed_monitorings_active ON luxmed_monitorings(active, user_id);
 `;

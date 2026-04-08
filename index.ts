@@ -8,6 +8,7 @@ import './webServer';
 import TelegramBot from 'node-telegram-bot-api';
 import OpenAI from 'openai';
 import cron from 'node-cron';
+import { initLuxmedMonitor, runLuxmedMonitoringCycle } from './luxmedMonitor';
 import {
     SYSTEM_PROMPT,
     GREETING_PROMPT,
@@ -46,6 +47,7 @@ const WHISPER_MODEL = process.env.WHISPER_MODEL || 'whisper-1';
 const VISION_MODEL = process.env.VISION_MODEL || 'claude-sonnet-4-20250514';
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: true});
+initLuxmedMonitor(bot);
 
 const openai = new OpenAI({
     apiKey: OPENAI_API_KEY,
@@ -318,6 +320,15 @@ cron.schedule('0 * * * *', async () => {
         await runHistoryCompaction(openai, OPEN_AI_MODEL);
     } catch (error) {
         console.error('🗜️ History compaction cron error:', error instanceof Error ? error.message : error);
+    }
+});
+
+// LuxMed monitoring — check every 10 minutes
+cron.schedule('*/10 * * * *', async () => {
+    try {
+        await runLuxmedMonitoringCycle();
+    } catch (error) {
+        console.error('[LuxMed Monitor] Cron error:', error instanceof Error ? error.message : error);
     }
 });
 

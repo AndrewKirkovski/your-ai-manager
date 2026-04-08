@@ -39,6 +39,8 @@ export interface LuxmedDoctor {
     lastName: string;
     academicTitle: string;
     name: string;
+    isEnglishSpeaker?: boolean;
+    facilityGroupIds?: number[];
 }
 
 export interface LuxmedTerm {
