@@ -24,6 +24,8 @@ function cleanAIResponse(text: string): string {
 
     // Remove <system> tags (injected timestamps, not for user display)
     cleaned = cleaned.replace(/<system[^>]*>.*?<\/system>/gs, '');
+    // Also remove incomplete/unclosed <system> tags (e.g. from truncated responses)
+    cleaned = cleaned.replace(/<system[^>]*>.*$/gs, '');
 
     // Clean up excessive whitespace
     cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();

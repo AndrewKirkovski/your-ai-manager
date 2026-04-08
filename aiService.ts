@@ -77,7 +77,7 @@ export class AIService {
             // Function to update Telegram message during streaming
             async function updateTelegramMessage(isFinal = false) {
                 try {
-                    const stripped = aiResponseAccumulated.replace(/<system[^>]*>.*?<\/system>/gs, '').trim();
+                    const stripped = aiResponseAccumulated.replace(/<system[^>]*>.*?<\/system>/gs, '').replace(/<system[^>]*>.*$/gs, '').trim();
                     const contentToSend = isFinal ? stripped : stripped + ' ...';
 
                     if(!aiResponseAccumulated.length) {
