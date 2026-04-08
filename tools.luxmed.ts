@@ -27,7 +27,7 @@ function formatTerm(term: LuxmedTerm, index: number): string {
 }
 
 // Store last search results per user for booking by index
-const lastSearchResults = new Map<number, LuxmedTerm[]>();
+const lastSearchResults = new Map<number, { terms: LuxmedTerm[]; cityId: number }>();
 
 export const LuxmedLogin: Tool = {
     name: 'LuxmedLogin',
@@ -42,8 +42,10 @@ export const LuxmedLogin: Tool = {
     },
     execute: async (args: { userId: number; username: string; password: string }) => {
         const chatId = String(args.userId);
+        console.log(`[LuxMed] Login attempt for user ${args.userId} (${args.username})`);
         const result = await luxmedLogin(args.username, args.password, chatId);
         saveLuxmedAccount(args.userId, result.accountId, result.username);
+        console.log(`[LuxMed] Login success: userId=${result.userId}, accountId=${result.accountId}`);
         return { success: true, message: `LuxMed login successful. Account linked (${result.username}).` };
     },
 };
@@ -75,6 +77,7 @@ export const LuxmedSearchSlots: Tool = {
 
         const now = new Date();
         const twoWeeks = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+        console.log(`[LuxMed] Search: service=${args.service_id}, city=${cityId}, time=${args.time_from || '07:00'}-${args.time_to || '21:00'}`);
         const terms = await luxmedSearchSlots(accountId, {
             cityId,
             serviceId: args.service_id,
@@ -86,7 +89,8 @@ export const LuxmedSearchSlots: Tool = {
             timeTo: args.time_to || prefs.preferredTimeTo || '21:00',
         });
 
-        lastSearchResults.set(args.userId, terms);
+        lastSearchResults.set(args.userId, { terms, cityId });
+        console.log(`[LuxMed] Search returned ${terms.length} slots`);
 
         if (terms.length === 0) {
             return { success: true, message: 'No available slots found for the given criteria.', slots: [] };
@@ -120,22 +124,24 @@ export const LuxmedBookSlot: Tool = {
     },
     execute: async (args: { userId: number; slot_index: number; rebook_if_exists?: string }) => {
         const accountId = requireAccount(args.userId);
-        const terms = lastSearchResults.get(args.userId);
-        if (!terms || terms.length === 0) {
+        const cached = lastSearchResults.get(args.userId);
+        if (!cached || cached.terms.length === 0) {
             return { success: false, message: 'No search results available. Use LuxmedSearchSlots first.' };
         }
         const idx = args.slot_index - 1;
-        if (idx < 0 || idx >= terms.length) {
-            return { success: false, message: `Invalid slot index. Choose between 1 and ${terms.length}.` };
+        if (idx < 0 || idx >= cached.terms.length) {
+            return { success: false, message: `Invalid slot index. Choose between 1 and ${cached.terms.length}.` };
         }
 
-        const term = terms[idx];
+        const term = cached.terms[idx];
         const rebookIfExists = args.rebook_if_exists === 'true';
-        await luxmedBookSlot(accountId, term, rebookIfExists);
-
         const t = term.term;
         const doctor = `${t.doctor.academicTitle} ${t.doctor.firstName} ${t.doctor.lastName}`.trim();
         const dt = t.dateTimeFrom.dateTimeLocal || t.dateTimeFrom.dateTimeTz;
+        console.log(`[LuxMed] Booking slot #${args.slot_index}: ${dt}, ${doctor}, ${t.clinic} (rebook=${rebookIfExists})`);
+        await luxmedBookSlot(accountId, term, cached.cityId, rebookIfExists);
+        console.log(`[LuxMed] Booking successful!`);
+
         return {
             success: true,
             message: `Appointment booked: ${dt}, ${doctor}, ${t.clinic}`,
@@ -278,6 +284,7 @@ export const LuxmedMonitorSlot: Tool = {
         const clinicIds = args.clinic_ids ? args.clinic_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
         const doctorIds = args.doctor_ids ? args.doctor_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
 
+        console.log(`[LuxMed] Creating monitoring: ${args.service_name}, city=${cityId}, time=${args.time_from}-${args.time_to}, clinics=${clinicIds?.join(',') ?? 'any'}, doctors=${doctorIds?.join(',') ?? 'any'}, english=${args.english_only === 'true'}, autobook=${args.autobook !== 'false'}`);
         const monitoring = createLuxmedMonitoring({
             id: generateShortId(),
             userId: args.userId,

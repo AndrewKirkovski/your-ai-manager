@@ -24,6 +24,9 @@ export function initLuxmedMonitor(bot: TelegramBot): void {
 // Cache english-speaking doctor IDs per city+service (refreshed each cycle)
 const englishDoctorCache = new Map<string, Set<number>>();
 
+// Track monitorings that already notified about auto-book failure (avoid spam every 10 min)
+const autobookFailureNotified = new Set<string>();
+
 async function getEnglishDoctorIds(accountId: number, cityId: number, serviceId: number): Promise<Set<number>> {
     const key = `${accountId}:${cityId}:${serviceId}`;
     if (englishDoctorCache.has(key)) return englishDoctorCache.get(key)!;
@@ -81,6 +84,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
     const dateTo = new Date(config.dateTo);
     if (dateTo < now) {
         deactivateLuxmedMonitoring(config.id, config.userId);
+        autobookFailureNotified.delete(config.id);
         if (botInstance) {
             botInstance.sendMessage(config.userId,
                 `⏰ LuxMed мониторинг "${config.serviceName}" истёк (период до ${config.dateTo}). Деактивирован.`
@@ -101,6 +105,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
         });
 
         updateLuxmedMonitoringLastCheck(config.id);
+        console.log(`[LuxMed Monitor] ${config.id}: ${terms.length} raw slots for "${config.serviceName}"`);
 
         if (terms.length === 0) return;
 
@@ -112,6 +117,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
 
         // Apply client-side filters
         const filtered = filterTerms(terms, config, englishDoctorIds);
+        console.log(`[LuxMed Monitor] ${config.id}: ${filtered.length}/${terms.length} after filters (clinics: ${config.clinicIds?.length ?? 'any'}, doctors: ${config.doctorIds?.length ?? 'any'}, english: ${config.englishOnly})`);
         if (filtered.length === 0) return;
 
         console.log(`[LuxMed Monitor] ${config.id}: Found ${filtered.length} matching slots for "${config.serviceName}"`);
@@ -120,8 +126,9 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
             // Auto-book the first matching slot
             const best = filtered[0];
             try {
-                await luxmedBookSlot(config.accountId, best, config.rebookIfExists);
+                await luxmedBookSlot(config.accountId, best, config.cityId, config.rebookIfExists);
                 deactivateLuxmedMonitoring(config.id, config.userId);
+                autobookFailureNotified.delete(config.id);
 
                 if (botInstance) {
                     const msg = `✅ LuxMed: Записал автоматически!\n\n${formatTermForNotification(best)}\n\nСервис: ${config.serviceName}`;
@@ -131,16 +138,18 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
                 const errMsg = err instanceof Error ? err.message : String(err);
                 console.error(`[LuxMed Monitor] ${config.id}: Auto-book failed: ${errMsg}`);
                 // Don't deactivate — try again next cycle
-                // But notify user about the available slot
-                if (botInstance) {
+                // But notify user only once to avoid spam every 10 min
+                if (botInstance && !autobookFailureNotified.has(config.id)) {
+                    autobookFailureNotified.add(config.id);
                     const slotsText = filtered.slice(0, 5).map((t, i) => `${i + 1}. ${formatTermForNotification(t)}`).join('\n');
-                    const msg = `⚠️ LuxMed: Нашёл слоты для "${config.serviceName}", но автозапись не удалась (${errMsg}).\n\nДоступные слоты:\n${slotsText}\n\nЗапиши вручную через бот.`;
+                    const msg = `⚠️ LuxMed: Нашёл слоты для "${config.serviceName}", но автозапись не удалась (${errMsg}).\n\nДоступные слоты:\n${slotsText}\n\nЗапиши вручную через бот. Мониторинг продолжает попытки автозаписи.`;
                     botInstance.sendMessage(config.userId, msg).catch(() => {});
                 }
             }
         } else {
             // Just notify
             deactivateLuxmedMonitoring(config.id, config.userId);
+            autobookFailureNotified.delete(config.id);
             if (botInstance) {
                 const slotsText = filtered.slice(0, 5).map((t, i) => `${i + 1}. ${formatTermForNotification(t)}`).join('\n');
                 const msg = `🔔 LuxMed: Нашёл ${filtered.length} слот(ов) для "${config.serviceName}"!\n\n${slotsText}${filtered.length > 5 ? `\n... и ещё ${filtered.length - 5}` : ''}\n\nИспользуй LuxmedSearchSlots чтобы найти и записаться.`;
@@ -153,6 +162,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
         // If auth error, notify user and deactivate
         if (errMsg.includes('Invalid login') || errMsg.includes('password')) {
             deactivateLuxmedMonitoring(config.id, config.userId);
+            autobookFailureNotified.delete(config.id);
             if (botInstance) {
                 botInstance.sendMessage(config.userId,
                     `❌ LuxMed: Ошибка авторизации. Мониторинг "${config.serviceName}" деактивирован. Обнови логин/пароль.`

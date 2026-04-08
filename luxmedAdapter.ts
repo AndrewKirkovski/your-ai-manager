@@ -89,6 +89,9 @@ export interface LuxmedMonitoring {
 
 async function sidecarRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${SIDECAR_URL}${path}`;
+    const start = Date.now();
+    console.log(`[LuxMed API] ${method} ${path}`);
+
     const options: RequestInit = {
         method,
         headers: { 'Content-Type': 'application/json' },
@@ -102,16 +105,31 @@ async function sidecarRequest<T>(method: string, path: string, body?: unknown): 
     try {
         response = await fetch(url, options);
     } catch (err) {
+        const elapsed = Date.now() - start;
         if (err instanceof Error && err.name === 'TimeoutError') {
+            console.error(`[LuxMed API] ${method} ${path} TIMEOUT after ${elapsed}ms`);
             throw new Error('LuxMed service timeout — try again later');
         }
+        console.error(`[LuxMed API] ${method} ${path} CONNECT FAILED after ${elapsed}ms`);
         throw new Error('LuxMed service unavailable — is the sidecar running?');
     }
 
-    const result = await response.json() as ApiResponse<T>;
+    let result: ApiResponse<T>;
+    try {
+        result = await response.json() as ApiResponse<T>;
+    } catch {
+        const elapsed = Date.now() - start;
+        console.error(`[LuxMed API] ${method} ${path} ${response.status} non-JSON (${elapsed}ms)`);
+        throw new Error(`LuxMed API error (${response.status}): non-JSON response`);
+    }
+
+    const elapsed = Date.now() - start;
     if (!result.success) {
+        console.error(`[LuxMed API] ${method} ${path} FAILED (${elapsed}ms): ${result.error}`);
         throw new Error(result.error || `LuxMed API error (${response.status})`);
     }
+
+    console.log(`[LuxMed API] ${method} ${path} OK (${elapsed}ms)`);
     return result.data as T;
 }
 
@@ -154,12 +172,12 @@ export async function luxmedSearchSlots(accountId: number, params: {
     return sidecarRequest<LuxmedTerm[]>('POST', `/api/v1/accounts/${accountId}/terms/search`, params);
 }
 
-export async function luxmedBookSlot(accountId: number, term: LuxmedTerm, rebookIfExists: boolean = false): Promise<unknown> {
+export async function luxmedBookSlot(accountId: number, term: LuxmedTerm, cityId: number, rebookIfExists: boolean = false): Promise<unknown> {
     const t = term.term;
     const dateTimeFrom = t.dateTimeFrom.dateTimeLocal || t.dateTimeFrom.dateTimeTz || '';
     const dateTimeTo = t.dateTimeTo.dateTimeLocal || t.dateTimeTo.dateTimeTz || '';
     return sidecarRequest('POST', `/api/v1/accounts/${accountId}/book`, {
-        cityId: t.clinicId,
+        cityId,
         clinicId: t.clinicId,
         clinicGroupId: t.clinicGroupId,
         clinic: t.clinic,
