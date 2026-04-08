@@ -190,6 +190,88 @@ export async function getDirections(
     return result;
 }
 
+export async function getDirectionsMulti(
+    origin: { lat: number; lng: number },
+    destination: { lat: number; lng: number },
+    mode: 'transit' | 'driving',
+    options?: {
+        arrivalTime?: Date;
+        departureTime?: Date;
+        alternatives?: boolean;
+        transitMode?: string;       // "bus", "subway", "tram", "rail" or comma-separated
+        transitPreference?: string; // "less_walking" or "fewer_transfers"
+    },
+): Promise<RouteResult[]> {
+    requireApiKey();
+    const originStr = `${origin.lat},${origin.lng}`;
+    const destStr = `${destination.lat},${destination.lng}`;
+    const opts = options || {};
+
+    const cacheKey = `dirm:${originStr}:${destStr}:${mode}:${opts.transitMode || ''}:${opts.transitPreference || ''}:${
+        opts.arrivalTime ? `a${Math.floor(opts.arrivalTime.getTime() / 300000)}` :
+        opts.departureTime ? `d${Math.floor(opts.departureTime.getTime() / 300000)}` : 'now'}`;
+    const cached = cacheGet<RouteResult[]>(cacheKey);
+    if (cached !== undefined) {
+        console.log(`[Maps] Directions multi (cached): ${mode} ${originStr} → ${destStr}`);
+        return cached;
+    }
+
+    let url = `${BASE}/directions/json?origin=${originStr}&destination=${destStr}&mode=${mode}&language=pl&key=${API_KEY}`;
+    if (opts.alternatives !== false) url += '&alternatives=true';
+    if (mode === 'transit') {
+        if (opts.arrivalTime) url += `&arrival_time=${Math.floor(opts.arrivalTime.getTime() / 1000)}`;
+        else if (opts.departureTime) url += `&departure_time=${Math.floor(opts.departureTime.getTime() / 1000)}`;
+        else url += '&departure_time=now';
+        if (opts.transitMode) url += `&transit_mode=${opts.transitMode}`;
+        if (opts.transitPreference) url += `&transit_routing_preference=${opts.transitPreference}`;
+    }
+
+    console.log(`[Maps] Directions multi: ${mode} from ${originStr} to ${destStr} (alternatives=${opts.alternatives !== false})`);
+    const res = await fetch(url);
+    const data = await res.json() as any;
+
+    if (data.status !== 'OK' || !data.routes?.length) {
+        console.log(`[Maps] Directions multi failed: ${data.status}`);
+        return [];
+    }
+
+    const results: RouteResult[] = data.routes.map((route: any) => {
+        const leg = route.legs[0];
+        const steps: RouteStep[] = (leg.steps || []).map((s: any) => {
+            const step: RouteStep = {
+                instruction: (s.html_instructions || '').replace(/<[^>]*>/g, ''),
+                distance: s.distance?.text || '',
+                duration: s.duration?.text || '',
+                travelMode: s.travel_mode,
+            };
+            if (s.transit_details) {
+                step.transitDetails = {
+                    line: s.transit_details.line?.short_name || s.transit_details.line?.name || '',
+                    vehicle: s.transit_details.line?.vehicle?.type || '',
+                    departureStop: s.transit_details.departure_stop?.name || '',
+                    arrivalStop: s.transit_details.arrival_stop?.name || '',
+                    numStops: s.transit_details.num_stops || 0,
+                };
+            }
+            return step;
+        });
+        return {
+            mode,
+            distance: leg.distance?.text || '',
+            duration: leg.duration?.text || '',
+            durationSeconds: leg.duration?.value || 0,
+            departureTime: leg.departure_time?.text,
+            arrivalTime: leg.arrival_time?.text,
+            summary: route.summary || '',
+            steps,
+            fare: route.fare?.text,
+        } as RouteResult;
+    });
+
+    cacheSet(cacheKey, results, DIRECTIONS_TTL);
+    return results;
+}
+
 // === Distance Matrix (batch) ===
 
 export interface DistanceMatrixEntry {

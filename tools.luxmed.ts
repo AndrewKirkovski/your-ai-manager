@@ -9,7 +9,36 @@ import {
     getLuxmedAccountId, saveLuxmedAccount, getLuxmedPreferences, saveLuxmedPreferences,
     LuxmedPreferences, generateShortId,
     createLuxmedMonitoring, getActiveLuxmedMonitoringsByUser, deactivateLuxmedMonitoring,
+    getUserAddress, getLuxmedClinicByName, saveLuxmedClinic,
 } from './userStore';
+
+// Cache valid service IDs per account to catch AI hallucinations
+const serviceIdCache = new Map<number, { ids: Set<number>; expires: number }>();
+
+async function validateServiceId(accountId: number, serviceId: number): Promise<string | null> {
+    let cached = serviceIdCache.get(accountId);
+    if (!cached || Date.now() > cached.expires) {
+        try {
+            const services = await luxmedGetServices(accountId);
+            const ids = new Set<number>();
+            const flatten = (list: any[]) => {
+                for (const s of list) {
+                    if (s.id) ids.add(s.id);
+                    if (s.children?.length) flatten(s.children);
+                }
+            };
+            flatten(services);
+            cached = { ids, expires: Date.now() + 60 * 60 * 1000 }; // 1 hour
+            serviceIdCache.set(accountId, cached);
+        } catch {
+            return null; // can't validate, let it through
+        }
+    }
+    if (!cached.ids.has(serviceId)) {
+        return `Service ID ${serviceId} not found. Use LuxmedListServices to find the correct ID.`;
+    }
+    return null;
+}
 
 function requireAccount(userId: number): number {
     const accountId = getLuxmedAccountId(userId);
@@ -77,6 +106,11 @@ export const LuxmedSearchSlots: Tool = {
             return { success: false, message: 'City not specified and no default city in preferences. Use LuxmedListCities to find the city ID, or set a default with LuxmedSetPreferences.' };
         }
 
+        const validationError = await validateServiceId(accountId, args.service_id);
+        if (validationError) {
+            return { success: false, message: validationError };
+        }
+
         const now = new Date();
         const twoWeeks = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
         console.log(`[LuxMed] Search: service=${args.service_id}, city=${cityId}, time=${args.time_from || '07:00'}-${args.time_to || '21:00'}`);
@@ -100,25 +134,34 @@ export const LuxmedSearchSlots: Tool = {
             if (!isGoogleMapsConfigured()) {
                 return { success: false, message: 'Transit filtering requires GOOGLE_MAPS_API_KEY. Set it in .env.' };
             }
-            if (!prefs.homeLat || !prefs.homeLng) {
-                return { success: false, message: 'Transit filtering requires home location. Set it with LuxmedSetPreferences (home_lat, home_lng).' };
+            const home = getUserAddress(args.userId, 'home');
+            if (!home) {
+                return { success: false, message: 'Transit filtering requires home location. Use SaveAddress to save your home address first.' };
             }
 
-            // Get unique clinic addresses and geocode them
+            // Get unique clinic addresses — check persistent cache first, then geocode
             const uniqueClinics = [...new Set(terms.map(t => t.term.clinic))];
-            console.log(`[LuxMed] Transit filter: geocoding ${uniqueClinics.length} unique clinics`);
+            console.log(`[LuxMed] Transit filter: resolving ${uniqueClinics.length} unique clinics`);
 
             const clinicCoords: { clinic: string; lat: number; lng: number }[] = [];
             for (const clinicName of uniqueClinics) {
+                // Check luxmed_clinics cache first
+                const cached = getLuxmedClinicByName(clinicName);
+                if (cached) {
+                    clinicCoords.push({ clinic: clinicName, lat: cached.lat, lng: cached.lng });
+                    continue;
+                }
+                // Geocode and cache permanently
                 const place = await geocode(`${clinicName}, ${prefs.defaultCityName || 'Warszawa'}`);
                 if (place) {
                     clinicCoords.push({ clinic: clinicName, lat: place.lat, lng: place.lng });
+                    saveLuxmedClinic(0, clinicName, place.formattedAddress, place.lat, place.lng, cityId);
                 }
             }
 
             if (clinicCoords.length > 0) {
                 const distances = await getDistanceMatrix(
-                    { lat: prefs.homeLat, lng: prefs.homeLng },
+                    { lat: home.lat, lng: home.lng },
                     clinicCoords.map(c => ({ lat: c.lat, lng: c.lng })),
                     'transit',
                 );

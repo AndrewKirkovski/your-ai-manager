@@ -1,6 +1,6 @@
 import { Tool } from './tool.types';
-import { geocode, getDirections, getWeatherForecast, isGoogleMapsConfigured, RouteResult } from './googleMapsService';
-import { getLuxmedPreferences } from './userStore';
+import { geocode, getDirectionsMulti, getWeatherForecast, isGoogleMapsConfigured, RouteResult, RouteStep } from './googleMapsService';
+import { getUserAddress } from './userStore';
 
 function formatRoute(route: RouteResult): string {
     const lines: string[] = [];
@@ -90,9 +90,26 @@ export const GetDirections: Tool = {
                 type: 'string',
                 description: 'Origin address (will be geocoded). Omit to use home location.',
             },
+            origin_label: {
+                type: 'string',
+                description: 'Saved address label to use as origin (e.g., "home", "work"). Omit to default to "home".',
+            },
             buffer_minutes: {
                 type: 'number',
                 description: 'Minutes of buffer before arrival (default 10). E.g., if arrival_time=10:00 and buffer=10, calculates to arrive by 9:50.',
+            },
+            transit_mode: {
+                type: 'string',
+                description: 'Filter transit types: "bus", "subway", "tram", "rail", or comma-separated like "subway,tram". Omit for all types.',
+            },
+            prefer: {
+                type: 'string',
+                description: 'Transit routing preference: "fewer_transfers" (simpler route) or "less_walking". Default: none.',
+                enum: ['fewer_transfers', 'less_walking'],
+            },
+            max_options: {
+                type: 'number',
+                description: 'Max number of transit route alternatives to return (default 3).',
             },
         },
         required: ['destination'],
@@ -105,7 +122,11 @@ export const GetDirections: Tool = {
         origin_lat?: number;
         origin_lng?: number;
         origin_address?: string;
+        origin_label?: string;
         buffer_minutes?: number;
+        transit_mode?: string;
+        prefer?: string;
+        max_options?: number;
     }) => {
         if (!isGoogleMapsConfigured()) {
             return { success: false, message: 'Google Maps API key not configured. Set GOOGLE_MAPS_API_KEY.' };
@@ -129,13 +150,14 @@ export const GetDirections: Tool = {
             }
             origin = { lat: originPlace.lat, lng: originPlace.lng };
         } else {
-            const prefs = getLuxmedPreferences(args.userId);
-            if (prefs.homeLat != null && prefs.homeLng != null) {
-                origin = { lat: prefs.homeLat, lng: prefs.homeLng };
+            const label = args.origin_label || 'home';
+            const saved = getUserAddress(args.userId, label);
+            if (saved) {
+                origin = { lat: saved.lat, lng: saved.lng };
             } else {
                 return {
                     success: false,
-                    message: 'No origin specified and no home location saved. Provide origin_address or set home location with LuxmedSetPreferences (home_lat, home_lng).',
+                    message: `No origin specified and no "${label}" address saved. Use SaveAddress to save your home location, or provide origin_address.`,
                 };
             }
         }
@@ -153,17 +175,25 @@ export const GetDirections: Tool = {
             departureTime = new Date(args.departure_time);
         }
 
-        // Get both transit and driving routes in parallel
-        const [transitRoute, drivingRoute] = await Promise.all([
-            getDirections(origin, dest, 'transit', arrivalTime, departureTime).catch(() => null),
-            getDirections(origin, dest, 'driving', undefined, departureTime || arrivalTime ? undefined : undefined).catch(() => null),
+        // Get transit + driving routes in parallel
+        const maxOptions = args.max_options || 3;
+        const [transitRoutes, drivingRoutes] = await Promise.all([
+            getDirectionsMulti(origin, dest, 'transit', {
+                arrivalTime, departureTime,
+                transitMode: args.transit_mode,
+                transitPreference: args.prefer,
+            }).catch(() => [] as RouteResult[]),
+            getDirectionsMulti(origin, dest, 'driving', { departureTime }).catch(() => [] as RouteResult[]),
         ]);
 
-        // Get weather forecast at the departure/arrival time
+        const transitOptions = transitRoutes.slice(0, maxOptions);
+        const drivingRoute = drivingRoutes[0] || null;
+
+        // Weather forecast at departure/arrival time
         const weatherTime = arrivalTime || departureTime || new Date();
         const weather = await getWeatherForecast(dest.lat, dest.lng, weatherTime).catch(() => null);
 
-        // Build comprehensive result
+        // Build result
         const result: any = {
             success: true,
             destination: dest.formattedAddress,
@@ -177,32 +207,36 @@ export const GetDirections: Tool = {
         }
         reportParts.push('');
 
-        if (transitRoute) {
-            result.transit = {
-                duration: transitRoute.duration,
-                durationSeconds: transitRoute.durationSeconds,
-                distance: transitRoute.distance,
-                departureTime: transitRoute.departureTime,
-                arrivalTime: transitRoute.arrivalTime,
-                fare: transitRoute.fare,
-                steps: transitRoute.steps.filter(s => s.transitDetails).map(s => ({
+        // Transit options
+        if (transitOptions.length > 0) {
+            result.transitOptions = transitOptions.map(r => ({
+                duration: r.duration,
+                durationSeconds: r.durationSeconds,
+                distance: r.distance,
+                departureTime: r.departureTime,
+                arrivalTime: r.arrivalTime,
+                fare: r.fare,
+                steps: r.steps.filter((s: RouteStep) => s.transitDetails).map((s: RouteStep) => ({
                     line: s.transitDetails!.line,
                     vehicle: s.transitDetails!.vehicle,
                     from: s.transitDetails!.departureStop,
                     to: s.transitDetails!.arrivalStop,
                     stops: s.transitDetails!.numStops,
                 })),
-            };
-            reportParts.push(formatRoute(transitRoute));
+            }));
+            transitOptions.forEach((route, i) => {
+                if (transitOptions.length > 1) reportParts.push(`--- Transit option ${i + 1} ---`);
+                reportParts.push(formatRoute(route));
+                reportParts.push('');
+            });
         } else {
-            reportParts.push('Public transport: route not available');
+            reportParts.push('Public transport: no routes available');
+            reportParts.push('');
         }
 
-        reportParts.push('');
-
+        // Taxi estimate
         if (drivingRoute) {
-            // Estimate taxi: driving time + 5-10 min wait
-            const waitMinutes = 7; // average taxi wait in Warsaw
+            const waitMinutes = 7;
             const totalTaxiSeconds = drivingRoute.durationSeconds + waitMinutes * 60;
             const totalTaxiMin = Math.ceil(totalTaxiSeconds / 60);
 
@@ -224,6 +258,7 @@ export const GetDirections: Tool = {
             reportParts.push(`  Distance: ${drivingRoute.distance}`);
         }
 
+        // Weather
         if (weather) {
             result.weather = weather;
             reportParts.push('');
@@ -231,11 +266,11 @@ export const GetDirections: Tool = {
         }
 
         // Smart recommendation
-        if (transitRoute && drivingRoute) {
+        if (transitOptions.length > 0 && drivingRoute) {
             reportParts.push('');
-            const transitMin = Math.ceil(transitRoute.durationSeconds / 60);
+            const bestTransitMin = Math.ceil(transitOptions[0].durationSeconds / 60);
             const taxiMin = Math.ceil(drivingRoute.durationSeconds / 60) + 7;
-            const timeSaved = transitMin - taxiMin;
+            const timeSaved = bestTransitMin - taxiMin;
 
             if (weather?.precipitation && weather.precipitation > 1) {
                 reportParts.push(`Recommendation: Taxi recommended — rain expected (${weather.precipitation}mm). Saves ~${timeSaved} min vs transit.`);

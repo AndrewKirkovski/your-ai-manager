@@ -47,6 +47,7 @@ import {
     LuxmedMonitorSlot, LuxmedStopMonitoring, LuxmedListMonitorings
 } from "./tools.luxmed";
 import { GetDirections } from "./tools.directions";
+import { SaveAddress, ListAddresses, DeleteAddress } from "./tools.address";
 
 export const tools = {
     get_current_time,
@@ -105,6 +106,10 @@ export const tools = {
     LuxmedListMonitorings,
     // Directions & Maps
     GetDirections,
+    // Address management
+    SaveAddress,
+    ListAddresses,
+    DeleteAddress,
 } as const;
 
 

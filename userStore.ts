@@ -288,6 +288,20 @@ const stmts = {
     getActiveLuxmedMonitoringsByUser: db.prepare<[number], { id: string; user_id: number; account_id: number; service_id: number; service_name: string; city_id: number; city_name: string; clinic_ids: string | null; doctor_ids: string | null; english_only: number; date_from: string; date_to: string; time_from: string; time_to: string; autobook: number; rebook_if_exists: number; last_check: string | null; created_at: string }>('SELECT * FROM luxmed_monitorings WHERE active = 1 AND user_id = ?'),
     deactivateLuxmedMonitoring: db.prepare('UPDATE luxmed_monitorings SET active = 0 WHERE id = ? AND user_id = ?'),
     updateLuxmedMonitoringLastCheck: db.prepare('UPDATE luxmed_monitorings SET last_check = ? WHERE id = ?'),
+
+    // User Addresses
+    upsertAddress: db.prepare(`INSERT INTO user_addresses (user_id, label, address, lat, lng, created_at) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, label) DO UPDATE SET address = excluded.address, lat = excluded.lat, lng = excluded.lng, created_at = excluded.created_at`),
+    getAddressByLabel: db.prepare<[number, string], { id: number; user_id: number; label: string; address: string; lat: number; lng: number }>('SELECT * FROM user_addresses WHERE user_id = ? AND label = ?'),
+    getAddressesByUser: db.prepare<[number], { id: number; label: string; address: string; lat: number; lng: number }>('SELECT id, label, address, lat, lng FROM user_addresses WHERE user_id = ?'),
+    deleteAddress: db.prepare('DELETE FROM user_addresses WHERE user_id = ? AND label = ?'),
+
+    // LuxMed Clinics
+    upsertClinic: db.prepare(`INSERT INTO luxmed_clinics (id, name, address, lat, lng, city_id, geocoded_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET address = excluded.address, lat = excluded.lat, lng = excluded.lng, geocoded_at = excluded.geocoded_at`),
+    getClinic: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE id = ?'),
+    getClinicsByCity: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE city_id = ?'),
+    getClinicByName: db.prepare<[string], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE name = ?'),
 };
 
 // ============== USER FUNCTIONS ==============
@@ -739,4 +753,47 @@ export function deactivateLuxmedMonitoring(id: string, userId: number): void {
 
 export function updateLuxmedMonitoringLastCheck(id: string): void {
     stmts.updateLuxmedMonitoringLastCheck.run(new Date().toISOString(), id);
+}
+
+// ============== USER ADDRESSES ==============
+
+export interface UserAddress {
+    label: string;
+    address: string;
+    lat: number;
+    lng: number;
+}
+
+export function saveUserAddress(userId: number, label: string, address: string, lat: number, lng: number): void {
+    stmts.upsertAddress.run(userId, label.toLowerCase().trim(), address, lat, lng, new Date().toISOString());
+}
+
+export function getUserAddress(userId: number, label: string): UserAddress | null {
+    const row = stmts.getAddressByLabel.get(userId, label.toLowerCase().trim());
+    return row ? { label: row.label, address: row.address, lat: row.lat, lng: row.lng } : null;
+}
+
+export function getUserAddresses(userId: number): UserAddress[] {
+    return stmts.getAddressesByUser.all(userId).map(r => ({ label: r.label, address: r.address, lat: r.lat, lng: r.lng }));
+}
+
+export function deleteUserAddress(userId: number, label: string): void {
+    stmts.deleteAddress.run(userId, label.toLowerCase().trim());
+}
+
+// ============== LUXMED CLINICS CACHE ==============
+
+export function saveLuxmedClinic(id: number, name: string, address: string | null, lat: number | null, lng: number | null, cityId: number): void {
+    stmts.upsertClinic.run(id, name, address, lat, lng, cityId, new Date().toISOString());
+}
+
+export function getLuxmedClinicByName(name: string): { id: number; name: string; lat: number; lng: number } | null {
+    const row = stmts.getClinicByName.get(name);
+    return row && row.lat != null && row.lng != null ? { id: row.id, name: row.name, lat: row.lat, lng: row.lng } : null;
+}
+
+export function getLuxmedClinicsByCity(cityId: number): { id: number; name: string; lat: number; lng: number }[] {
+    return stmts.getClinicsByCity.all(cityId)
+        .filter(r => r.lat != null && r.lng != null)
+        .map(r => ({ id: r.id, name: r.name, lat: r.lat!, lng: r.lng! }));
 }

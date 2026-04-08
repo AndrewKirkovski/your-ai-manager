@@ -60,6 +60,27 @@ export const SCHEMA_SQL = `
         timestamp   TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS user_addresses (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+        label      TEXT NOT NULL,
+        address    TEXT NOT NULL,
+        lat        REAL NOT NULL,
+        lng        REAL NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(user_id, label)
+    );
+
+    CREATE TABLE IF NOT EXISTS luxmed_clinics (
+        id          INTEGER PRIMARY KEY,
+        name        TEXT NOT NULL,
+        address     TEXT,
+        lat         REAL,
+        lng         REAL,
+        city_id     INTEGER,
+        geocoded_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS luxmed_accounts (
         user_id    INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
         account_id INTEGER NOT NULL,
@@ -126,4 +147,5 @@ export const INDEXES_SQL = `
     CREATE INDEX IF NOT EXISTS idx_images_user ON image_cache(user_id);
     CREATE INDEX IF NOT EXISTS idx_stats_user_name_ts ON stat_entries(user_id, name, timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_luxmed_monitorings_active ON luxmed_monitorings(active, user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_addresses_user ON user_addresses(user_id);
 `;
