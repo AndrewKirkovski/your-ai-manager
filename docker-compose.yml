@@ -7,12 +7,44 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      LUXMED_SIDECAR_URL: "http://luxmed-sidecar:8080"
     ports:
       - "3000:3000"
     volumes:
       - bot-data:/app/data
+    depends_on:
+      - luxmed-sidecar
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
+
+  luxmed-sidecar:
+    image: ghcr.io/andrewkirkovski/your-ai-manager-luxmed-sidecar:latest
+    container_name: luxmed-sidecar
+    restart: unless-stopped
+    environment:
+      DB_HOST: luxmed-db
+      DB_PORT: 5432
+      TELEGRAM_ENABLED: "false"
+      SERVER_PORT: 8080
+      SECURITY_SECRET: "${LUXMED_SECURITY_SECRET:-luxmed-prod-secret-change-me}"
+      MONITORING_WEBHOOK_URL: "http://bot:3000/api/luxmed/monitoring-callback"
+    depends_on:
+      - luxmed-db
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  luxmed-db:
+    image: postgres:10.6
+    container_name: luxmed-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lbs
+      POSTGRES_PASSWORD: "${LUXMED_DB_PASSWORD:-lsb123}"
+      POSTGRES_DB: lbs
+      TZ: Europe/Warsaw
+    volumes:
+      - luxmed-postgres:/var/lib/postgresql/data
 
   watchtower:
     image: containrrr/watchtower
@@ -29,3 +61,4 @@ services:
 
 volumes:
   bot-data:
+  luxmed-postgres:
