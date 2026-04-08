@@ -36,7 +36,7 @@ function getPeriodRange(period: string, customFrom?: string, customTo?: string):
         return { from, to };
     }
 
-    const to = now.toJSDate();
+    const to = now.endOf('day').toJSDate();
     let from: Date;
 
     switch (period) {
@@ -245,11 +245,19 @@ export const GenerateStatChart: Tool = {
                 type: 'string',
                 description: 'How to aggregate values within each bucket. "sum" for additive stats (calories, water, steps). "avg" for non-additive stats (mood, weight, sleep hours). Defaults to "sum" for bar charts, "avg" for line charts.',
                 enum: ['sum', 'avg']
+            },
+            y_min: {
+                type: 'number',
+                description: 'Minimum Y-axis value. Use for better detail on metrics like weight (e.g., y_min=80 for weight range 80-100kg). Omit to start from 0.'
+            },
+            y_max: {
+                type: 'number',
+                description: 'Maximum Y-axis value. Omit to auto-scale based on data.'
             }
         },
         required: ['name']
     },
-    execute: async (args: { userId: number; name: string; period?: string; from?: string; to?: string; chart_type?: string; aggregation?: string }) => {
+    execute: async (args: { userId: number; name: string; period?: string; from?: string; to?: string; chart_type?: string; aggregation?: string; y_min?: number; y_max?: number }) => {
         if (!botInstance) {
             return { success: false, message: 'Chart generation not available (bot not initialized).' };
         }
@@ -295,6 +303,8 @@ export const GenerateStatChart: Tool = {
             title,
             yAxisLabel: unit,
             timeUnit: bucketUnit,
+            yMin: args.y_min,
+            yMax: args.y_max,
         });
 
         try {

@@ -4,6 +4,8 @@ export interface ChartConfig {
     title: string;
     yAxisLabel?: string;
     timeUnit?: 'day' | 'week' | 'month';
+    yMin?: number;
+    yMax?: number;
 }
 
 /**
@@ -45,7 +47,9 @@ export async function generateChartUrl(config: ChartConfig): Promise<string> {
                     ticks: { maxRotation: 45 },
                 },
                 y: {
-                    beginAtZero: true,
+                    beginAtZero: config.yMin == null,
+                    ...(config.yMin != null ? { min: config.yMin } : {}),
+                    ...(config.yMax != null ? { max: config.yMax } : {}),
                     ...(config.yAxisLabel ? { title: { display: true, text: config.yAxisLabel } } : {}),
                 },
             },
