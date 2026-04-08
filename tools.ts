@@ -46,6 +46,7 @@ import {
     LuxmedMyBookings, LuxmedListCities, LuxmedListServices, LuxmedSetPreferences,
     LuxmedMonitorSlot, LuxmedStopMonitoring, LuxmedListMonitorings
 } from "./tools.luxmed";
+import { GetDirections } from "./tools.directions";
 
 export const tools = {
     get_current_time,
@@ -102,6 +103,8 @@ export const tools = {
     LuxmedMonitorSlot,
     LuxmedStopMonitoring,
     LuxmedListMonitorings,
+    // Directions & Maps
+    GetDirections,
 } as const;
 
 

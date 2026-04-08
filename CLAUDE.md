@@ -102,6 +102,7 @@ git push origin rest-api        # push to fork
 - `DB_PATH` — database file path (default: `./db.json`)
 - `WEB_PORT` — admin UI port (default: 3000)
 - `LUXMED_SIDECAR_URL` — LuxMed sidecar REST API (default: `http://localhost:8080`)
+- `GOOGLE_MAPS_API_KEY` — for GetDirections tool and LuxMed transit filtering (Geocoding, Directions, Distance Matrix APIs)
 
 ## Deployment — Acer Revo Box (murzik)
 

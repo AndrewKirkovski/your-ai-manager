@@ -4,6 +4,7 @@ import {
     luxmedSearchSlots, luxmedBookSlot, luxmedCancelVisit, luxmedGetReserved,
     LuxmedTerm,
 } from './luxmedAdapter';
+import { geocode, getDistanceMatrix, isGoogleMapsConfigured } from './googleMapsService';
 import {
     getLuxmedAccountId, saveLuxmedAccount, getLuxmedPreferences, saveLuxmedPreferences,
     LuxmedPreferences, generateShortId,
@@ -64,10 +65,11 @@ export const LuxmedSearchSlots: Tool = {
             date_to: { type: 'string', description: 'End date ISO (e.g. "2026-04-20T00:00:00"). Defaults to 14 days from now.' },
             time_from: { type: 'string', description: 'Earliest appointment time (e.g. "10:00"). Defaults to "07:00".' },
             time_to: { type: 'string', description: 'Latest appointment time (e.g. "14:00"). Defaults to "21:00".' },
+            max_transit_minutes: { type: 'number', description: 'Max transit time from home in minutes (e.g. 20). Requires home location in preferences and Google Maps API key. Filters out clinics that are too far.' },
         },
         required: ['service_id'],
     },
-    execute: async (args: { userId: number; service_id: number; city_id?: number; clinic_id?: number; doctor_id?: number; date_from?: string; date_to?: string; time_from?: string; time_to?: string }) => {
+    execute: async (args: { userId: number; service_id: number; city_id?: number; clinic_id?: number; doctor_id?: number; date_from?: string; date_to?: string; time_from?: string; time_to?: string; max_transit_minutes?: number }) => {
         const accountId = requireAccount(args.userId);
         const prefs = getLuxmedPreferences(args.userId);
         const cityId = args.city_id || prefs.defaultCityId;
@@ -89,23 +91,77 @@ export const LuxmedSearchSlots: Tool = {
             timeTo: args.time_to || prefs.preferredTimeTo || '21:00',
         });
 
-        lastSearchResults.set(args.userId, { terms, cityId });
         console.log(`[LuxMed] Search returned ${terms.length} slots`);
 
-        if (terms.length === 0) {
-            return { success: true, message: 'No available slots found for the given criteria.', slots: [] };
+        // Transit time filtering
+        let filteredTerms = terms;
+        const transitTimes = new Map<string, number>(); // clinic address → minutes
+        if (args.max_transit_minutes && terms.length > 0) {
+            if (!isGoogleMapsConfigured()) {
+                return { success: false, message: 'Transit filtering requires GOOGLE_MAPS_API_KEY. Set it in .env.' };
+            }
+            if (!prefs.homeLat || !prefs.homeLng) {
+                return { success: false, message: 'Transit filtering requires home location. Set it with LuxmedSetPreferences (home_lat, home_lng).' };
+            }
+
+            // Get unique clinic addresses and geocode them
+            const uniqueClinics = [...new Set(terms.map(t => t.term.clinic))];
+            console.log(`[LuxMed] Transit filter: geocoding ${uniqueClinics.length} unique clinics`);
+
+            const clinicCoords: { clinic: string; lat: number; lng: number }[] = [];
+            for (const clinicName of uniqueClinics) {
+                const place = await geocode(`${clinicName}, ${prefs.defaultCityName || 'Warszawa'}`);
+                if (place) {
+                    clinicCoords.push({ clinic: clinicName, lat: place.lat, lng: place.lng });
+                }
+            }
+
+            if (clinicCoords.length > 0) {
+                const distances = await getDistanceMatrix(
+                    { lat: prefs.homeLat, lng: prefs.homeLng },
+                    clinicCoords.map(c => ({ lat: c.lat, lng: c.lng })),
+                    'transit',
+                );
+
+                const maxSeconds = args.max_transit_minutes * 60;
+                const allowedClinics = new Set<string>();
+                for (const d of distances) {
+                    const clinic = clinicCoords[d.destinationIndex];
+                    const minutes = Math.ceil(d.durationSeconds / 60);
+                    transitTimes.set(clinic.clinic, minutes);
+                    if (d.status === 'OK' && d.durationSeconds <= maxSeconds) {
+                        allowedClinics.add(clinic.clinic);
+                    }
+                }
+
+                filteredTerms = terms.filter(t => allowedClinics.has(t.term.clinic));
+                console.log(`[LuxMed] Transit filter: ${filteredTerms.length}/${terms.length} within ${args.max_transit_minutes} min`);
+            }
         }
 
-        const summary = terms.slice(0, 10).map((t, i) => formatTerm(t, i)).join('\n');
+        lastSearchResults.set(args.userId, { terms: filteredTerms, cityId });
+
+        if (filteredTerms.length === 0) {
+            const transitNote = args.max_transit_minutes ? ` within ${args.max_transit_minutes} min transit` : '';
+            return { success: true, message: `No available slots found${transitNote}.`, slots: [] };
+        }
+
+        const summary = filteredTerms.slice(0, 10).map((t, i) => {
+            const base = formatTerm(t, i);
+            const tt = transitTimes.get(t.term.clinic);
+            return tt != null ? `${base} [${tt} min]` : base;
+        }).join('\n');
+
         return {
             success: true,
-            message: `Found ${terms.length} available slot(s):\n${summary}${terms.length > 10 ? `\n... and ${terms.length - 10} more` : ''}`,
-            totalSlots: terms.length,
-            slots: terms.slice(0, 10).map(t => ({
+            message: `Found ${filteredTerms.length} available slot(s):\n${summary}${filteredTerms.length > 10 ? `\n... and ${filteredTerms.length - 10} more` : ''}`,
+            totalSlots: filteredTerms.length,
+            slots: filteredTerms.slice(0, 10).map(t => ({
                 dateTime: t.term.dateTimeFrom.dateTimeLocal || t.term.dateTimeFrom.dateTimeTz,
                 doctor: `${t.term.doctor.academicTitle} ${t.term.doctor.firstName} ${t.term.doctor.lastName}`.trim(),
                 clinic: t.term.clinic,
                 isTelemedicine: t.term.isTelemedicine,
+                transitMinutes: transitTimes.get(t.term.clinic),
             })),
         };
     },
