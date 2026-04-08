@@ -70,6 +70,15 @@ yarn install
 yarn start   # runs tsx index.ts
 ```
 
+### Google Maps API (for GetDirections tool + LuxMed transit filtering)
+1. [Google Cloud Console](https://console.cloud.google.com/) → create/select project
+2. APIs & Services → Library → enable: **Geocoding API**, **Directions API**, **Distance Matrix API**
+3. APIs & Services → Credentials → Create API Key
+4. Add to `.env`: `GOOGLE_MAPS_API_KEY=your_key`
+5. Optional: restrict key to those 3 APIs only
+
+Free tier: $200/month credit (~40k geocode or ~20k direction requests).
+
 ### LuxMed Sidecar (luxmed-bot submodule)
 **Prerequisites**: JDK 11+ (Temurin via Scoop: `scoop bucket add java && scoop install temurin11-jdk`), Docker
 
