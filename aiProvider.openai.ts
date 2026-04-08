@@ -37,8 +37,8 @@ export class OpenAIProvider implements AIProvider {
             requestOptions.tool_choice = 'auto';
         }
 
-        // Enable thinking via extra_body when proxying through Anthropic's compat layer
-        if (this.isAnthropicEndpoint) {
+        // Enable thinking via extra_body for models that support it (Anthropic compat layer)
+        if (this.isAnthropicEndpoint && this.supportsThinking(request.model)) {
             requestOptions.extra_body = { thinking: { type: 'adaptive' } };
         }
 
@@ -130,6 +130,11 @@ export class OpenAIProvider implements AIProvider {
         }
 
         return result;
+    }
+
+    private supportsThinking(model: string): boolean {
+        // Only Opus and claude-3.7+ models support extended thinking
+        return /opus|claude-3[.-]7|claude-4/i.test(model);
     }
 
     private convertTool(tool: ToolDefinition): OpenAI.ChatCompletionTool {

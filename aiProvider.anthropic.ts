@@ -21,12 +21,13 @@ export class AnthropicProvider implements AIProvider {
         const messages = this.convertMessages(request.messages);
         const tools = request.tools?.map(t => this.convertTool(t));
 
+        const supportsThinking = /opus|claude-3[.-]7|claude-4/i.test(request.model);
         const params: Anthropic.MessageCreateParams = {
             model: request.model,
             max_tokens: request.maxTokens,
             system: request.systemPrompt,
             messages,
-            thinking: { type: 'adaptive' },
+            ...(supportsThinking ? { thinking: { type: 'adaptive' as const } } : {}),
             stream: true as const,
         };
 
