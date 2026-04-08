@@ -23,7 +23,7 @@ async function validateServiceId(accountId: number, serviceId: number): Promise<
             const ids = new Set<number>();
             const flatten = (list: any[]) => {
                 for (const s of list) {
-                    if (s.id) ids.add(s.id);
+                    if (s.id != null) ids.add(s.id);
                     if (s.children?.length) flatten(s.children);
                 }
             };
