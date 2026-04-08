@@ -22,6 +22,9 @@ function cleanAIResponse(text: string): string {
     // Remove <thinking> tags (internal thoughts, not for user display)
     cleaned = cleaned.replace(/<thinking>.*?<\/thinking>/gs, '');
 
+    // Remove <system> tags (injected timestamps, not for user display)
+    cleaned = cleaned.replace(/<system[^>]*>.*?<\/system>/gs, '');
+
     // Clean up excessive whitespace
     cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
 
