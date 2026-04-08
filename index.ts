@@ -9,6 +9,9 @@ import TelegramBot from 'node-telegram-bot-api';
 import OpenAI from 'openai';
 import cron from 'node-cron';
 import { initLuxmedMonitor, runLuxmedMonitoringCycle } from './luxmedMonitor';
+import { OpenAIProvider } from './aiProvider.openai';
+import { AnthropicProvider } from './aiProvider.anthropic';
+import type { AIProvider } from './aiProvider';
 import {
     SYSTEM_PROMPT,
     GREETING_PROMPT,
@@ -41,6 +44,9 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
 const OPEN_AI_ENDPOINT = process.env.OPEN_AI_ENDPOINT;
 const OPEN_AI_MODEL = process.env.OPENAI_MODEL || 'gpt-4-1106-preview';
 
+// AI provider selection
+const AI_PROVIDER_TYPE = (process.env.AI_PROVIDER || 'openai') as 'openai' | 'anthropic';
+
 // Media parsing configuration
 const OPENAI_WHISPER_API_KEY = process.env.OPENAI_WHISPER_API_KEY;
 const WHISPER_MODEL = process.env.WHISPER_MODEL || 'whisper-1';
@@ -49,6 +55,14 @@ const VISION_MODEL = process.env.VISION_MODEL || 'claude-sonnet-4-20250514';
 const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: true});
 initLuxmedMonitor(bot);
 
+// AI provider (switchable via AI_PROVIDER env var)
+const provider: AIProvider = AI_PROVIDER_TYPE === 'anthropic'
+    ? new AnthropicProvider(OPENAI_API_KEY)
+    : new OpenAIProvider(OPENAI_API_KEY, OPEN_AI_ENDPOINT);
+
+console.log(`🤖 AI provider: ${provider.name}`);
+
+// OpenAI client kept for Whisper (voice) and Vision (image analysis via compat layer)
 const openai = new OpenAI({
     apiKey: OPENAI_API_KEY,
     ...(OPEN_AI_ENDPOINT && {baseURL: OPEN_AI_ENDPOINT}),
@@ -129,7 +143,7 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
             userMessage,
             systemPrompt: fullPrompt,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: true,
             addUserToHistory: true,
@@ -284,7 +298,7 @@ cron.schedule('* * * * *', async () => {
                         userMessage: taskPrompt,
                         systemPrompt: SYSTEM_PROMPT,
                         bot,
-                        openai,
+                        provider,
                         model: OPEN_AI_MODEL,
                         addUserToHistory: false,
                         addAssistantToHistory: true,
@@ -317,7 +331,7 @@ cron.schedule('* * * * *', async () => {
 // Compact history once per hour
 cron.schedule('0 * * * *', async () => {
     try {
-        await runHistoryCompaction(openai, OPEN_AI_MODEL);
+        await runHistoryCompaction(provider, OPEN_AI_MODEL);
     } catch (error) {
         console.error('🗜️ History compaction cron error:', error instanceof Error ? error.message : error);
     }
@@ -379,7 +393,7 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
             userMessage: GOAL_SET_PROMPT(newGoal),
             systemPrompt: SYSTEM_PROMPT,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             addUserToHistory: true,
             addAssistantToHistory: true,
@@ -394,7 +408,7 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
             userMessage: ERROR_MESSAGE_PROMPT,
             systemPrompt: SYSTEM_PROMPT,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             addUserToHistory: false,
             addAssistantToHistory: false,
@@ -436,7 +450,7 @@ bot.onText(/\/cleargoal/, async (msg) => {
             userMessage: GOAL_CLEAR_PROMPT(),
             systemPrompt: SYSTEM_PROMPT,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
             addUserToHistory: false,
@@ -452,7 +466,7 @@ bot.onText(/\/cleargoal/, async (msg) => {
             userMessage: ERROR_MESSAGE_PROMPT,
             systemPrompt: SYSTEM_PROMPT,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
             addUserToHistory: false,
@@ -499,7 +513,7 @@ bot.onText(/\/routines/, async (msg) => {
             userMessage: ERROR_MESSAGE_PROMPT,
             systemPrompt: SYSTEM_PROMPT,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
             addUserToHistory: false,
@@ -541,7 +555,7 @@ bot.onText(/\/tasks/, async (msg) => {
             userMessage: ERROR_MESSAGE_PROMPT,
             systemPrompt: SYSTEM_PROMPT,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
             addUserToHistory: false,
@@ -575,7 +589,7 @@ bot.onText(/\/memory/, async (msg) => {
             userMessage: ERROR_MESSAGE_PROMPT,
             systemPrompt: SYSTEM_PROMPT,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
             addUserToHistory: false,
@@ -618,7 +632,7 @@ bot.onText(/\/help/, async (msg) => {
             userMessage: DEFAULT_HELP_PROMPT(),
             systemPrompt: SYSTEM_PROMPT,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
             addUserToHistory: false,
@@ -728,7 +742,7 @@ bot.on('message', async (msg) => {
                 userMessage: GREETING_PROMPT,
                 systemPrompt: SYSTEM_PROMPT,
                 bot,
-                openai,
+                provider,
                 model: OPEN_AI_MODEL,
                 shouldUpdateTelegram: false,
                 addUserToHistory: true,
@@ -764,7 +778,7 @@ bot.on('message', async (msg) => {
             userMessage: ERROR_MESSAGE_PROMPT,
             systemPrompt: SYSTEM_PROMPT,
             bot,
-            openai,
+            provider,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: false,
             addUserToHistory: false,

@@ -1,7 +1,7 @@
-import OpenAI from 'openai';
 import {getAllUsers, getMessageHistoryWithIds, MessageHistory, compactMessages} from './userStore';
 import {formatDateHuman} from './dateUtils';
 import {HISTORY_COMPACTION_PROMPT} from './constants';
+import type {AIProvider} from './aiProvider';
 
 /** A run of consecutive assistant messages with their DB IDs */
 type CompactableRun = {
@@ -61,7 +61,7 @@ function buildDateRange(run: CompactableRun): string {
 async function summarizeRun(
     run: CompactableRun,
     dateRange: string,
-    openai: OpenAI,
+    provider: AIProvider,
     model: string,
 ): Promise<string> {
     const messagesText = run.messages
@@ -70,22 +70,18 @@ async function summarizeRun(
 
     const prompt = HISTORY_COMPACTION_PROMPT(dateRange, messagesText);
 
-    const response = await openai.chat.completions.create({
+    return provider.completeChat({
         model,
-        max_tokens: 800,
-        messages: [
-            {role: 'user', content: prompt},
-        ],
+        maxTokens: 800,
+        messages: [{ role: 'user', content: prompt }],
     });
-
-    return response.choices[0]?.message?.content || '[compaction failed]';
 }
 
 /**
  * Run history compaction for all users.
  * Returns number of compactions performed.
  */
-export async function runHistoryCompaction(openai: OpenAI, model: string): Promise<number> {
+export async function runHistoryCompaction(provider: AIProvider, model: string): Promise<number> {
     let totalCompactions = 0;
     const users = await getAllUsers();
 
@@ -110,7 +106,7 @@ export async function runHistoryCompaction(openai: OpenAI, model: string): Promi
 
             try {
                 const dateRange = buildDateRange(run);
-                const summary = await summarizeRun(run, dateRange, openai, model);
+                const summary = await summarizeRun(run, dateRange, provider, model);
 
                 const compactedContent = `<system>Compacted summary of ${run.messages.length} bot messages from ${dateRange}</system>\n${summary}`;
 

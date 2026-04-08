@@ -18,11 +18,13 @@ Telegram bot — an anthropomorphic wolf character that helps with ADHD task man
 ```
 Telegram msg → bot.on('message') → mediaParser.parseMedia(msg)
   → formatForAI(parsed) + caption → replyToUser(userId, content)
-  → AIService.streamAIResponse({systemPrompt: SYSTEM_PROMPT + getCurrentInfo(), ...})
-  → stream chunks → update Telegram message in-place
+  → AIService.streamAIResponse({systemPrompt, provider, ...})
+  → provider.streamChat() → normalized StreamChunks → update Telegram in-place
   → if tool_calls: executeTool() → recursive call (max depth 5)
   → save to messageHistory
 ```
+
+Provider is selected at startup via `AI_PROVIDER` env (`anthropic` = native SDK with thinking, `openai` = compat layer).
 
 ### Key Files
 | File | Purpose |
@@ -37,6 +39,9 @@ Telegram msg → bot.on('message') → mediaParser.parseMedia(msg)
 | `historyCompaction.ts` | Hourly: summarizes consecutive assistant messages to save tokens |
 | `webServer.ts` | Express API for admin dashboard |
 | `aiCommandService.ts` | DEPRECATED — only strips legacy XML tags |
+| `aiProvider.ts` | Abstract AI provider interface, types, factory |
+| `aiProvider.openai.ts` | OpenAI SDK provider (adds thinking via `extra_body` for Anthropic compat) |
+| `aiProvider.anthropic.ts` | Native Anthropic SDK provider (full thinking, proper tool format) |
 
 ### Tool Pattern
 Every tool follows this interface (`tool.types.ts`):
@@ -102,11 +107,12 @@ git push origin rest-api        # push to fork
 
 ## Environment Variables
 - `TELEGRAM_TOKEN` — required
-- `OPENAI_API_KEY` — Anthropic API key (despite the name)
-- `OPEN_AI_ENDPOINT` — `https://api.anthropic.com/v1/`
-- `OPENAI_MODEL` — e.g. `claude-opus-4-5-20251101`
-- `VISION_MODEL` — for image analysis
-- `OPENAI_WHISPER_API_KEY` — optional, actual OpenAI key for voice
+- `AI_PROVIDER` — `anthropic` (native SDK, full thinking support) or `openai` (OpenAI-compat layer). Default: `openai`
+- `OPENAI_API_KEY` — API key for the AI provider (Anthropic key when using either provider mode)
+- `OPEN_AI_ENDPOINT` — base URL for OpenAI-compat mode (e.g. `https://api.anthropic.com/v1/`). Ignored when `AI_PROVIDER=anthropic`
+- `OPENAI_MODEL` — model ID (e.g. `claude-sonnet-4-20250514`, `claude-opus-4-5-20251101`)
+- `VISION_MODEL` — for image analysis (always uses OpenAI-compat client)
+- `OPENAI_WHISPER_API_KEY` — optional, actual OpenAI key for voice transcription
 - `GOOGLE_SEARCH_ENGINE_ID` + `GOOGLE_SEARCH_API_KEY` — optional, for web search
 - `DB_PATH` — database file path (default: `./db.json`)
 - `WEB_PORT` — admin UI port (default: 3000)

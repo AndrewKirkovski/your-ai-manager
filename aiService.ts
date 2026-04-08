@@ -1,25 +1,16 @@
-import OpenAI from 'openai';
 import TelegramBot from 'node-telegram-bot-api';
 import {AICommandService} from './aiCommandService';
 import {addMessageToHistory, getRecentMessageHistory} from './userStore';
-import {getAllToolDefinitions, executeTool, tools} from './tools';
-import {ChatCompletionCreateParamsStreaming} from "openai/src/resources/chat/completions/completions";
-import {ToolCall, ToolResult} from "./tool.types";
+import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
-
-// Proper types for OpenAI messages with tool support
-type OpenAIMessage =
-    | { role: 'system'; content: string }
-    | { role: 'user'; content: string }
-    | { role: 'assistant'; content: string; tool_calls?: ToolCall[] }
-    | { role: 'tool'; content: string; tool_call_id: string };
+import type {AIProvider, ProviderMessage, ToolCallInfo, ToolDefinition, ThinkingBlockData} from './aiProvider';
 
 export interface AIStreamOptions {
     userId: number;
     userMessage: string;
     systemPrompt: string;
     bot: TelegramBot;
-    openai: OpenAI;
+    provider: AIProvider;
     model: string;
     maxTokens?: number;
     shouldUpdateTelegram?: boolean;
@@ -27,7 +18,7 @@ export interface AIStreamOptions {
     addAssistantToHistory?: boolean;
     currentRecursionDepth?: number;
     enableToolCalls?: boolean;
-    appendMessagesAfterUser?: OpenAIMessage[];
+    appendMessagesAfterUser?: ProviderMessage[];
     /** Callback to handle images from search results (sent separately, not in history) */
     onImageResults?: (images: string[]) => Promise<void>;
 }
@@ -36,8 +27,7 @@ export interface AIStreamResult {
     message: string;
     commandResults: string[];
     rawResponse: string;
-    toolCalls?: ToolCall[];
-    toolResults?: ToolResult[];
+    toolCalls?: ToolCallInfo[];
 }
 
 export class AIService {
@@ -61,7 +51,7 @@ export class AIService {
             userMessage,
             systemPrompt,
             bot,
-            openai,
+            provider,
             model,
             maxTokens = 1500,
             addUserToHistory = true,
@@ -124,37 +114,37 @@ export class AIService {
             // Get recent message history for context
             const recentMessages = await this.getRecentMessages(userId, 30);
 
-            const messages: OpenAIMessage[] = [
-                {
-                    role: 'system',
-                    content: systemPrompt
-                },
+            // Build messages for provider
+            const messages: ProviderMessage[] = [
                 ...recentMessages,
-                {role: 'user', content: `<system>At ${new Date().toISOString()}</system>\n${userMessage}`},
+                { role: 'user', content: `<system>At ${new Date().toISOString()}</system>\n${userMessage}` },
                 ...(appendMessagesAfterUser || []),
             ];
 
-            // Create streaming request
-            const requestOptions: ChatCompletionCreateParamsStreaming = {
-                max_tokens: maxTokens,
-                model: model,
-                stream: true,
-                messages
-            };
+            // Get tool definitions if enabled
+            const toolDefs: ToolDefinition[] | undefined = enableToolCalls
+                ? getAllToolDefinitions().map(t => ({
+                    name: t.function.name,
+                    description: t.function.description || '',
+                    parameters: t.function.parameters as Record<string, unknown>,
+                }))
+                : undefined;
 
-            // Add tools if tool calling is enabled
-            if (enableToolCalls) {
-                requestOptions.tools = getAllToolDefinitions()
-                requestOptions.tool_choice = 'auto';
-            }
+            console.debug('💬 AI request via', provider.name, { model, maxTokens, toolCount: toolDefs?.length ?? 0 });
 
-            console.debug('💬 FULL AI PROMPT:', requestOptions);
-
-            const stream = await openai.chat.completions.create(requestOptions);
+            // Stream from provider
+            const stream = provider.streamChat({
+                systemPrompt,
+                messages,
+                tools: toolDefs,
+                maxTokens,
+                model,
+            });
 
             let aiResponseAccumulated = '';
             let historyResponseAccumulated = '';
-            let toolCalls: ToolCall[] = [];
+            const toolCalls: ToolCallInfo[] = [];
+            let thinkingBlocks: ThinkingBlockData[] | undefined;
 
             await bot.sendChatAction(userId, 'typing');
 
@@ -171,45 +161,49 @@ export class AIService {
 
             // Process streaming response
             for await (const chunk of stream) {
-                const delta = chunk.choices[0]?.delta;
+                switch (chunk.type) {
+                    case 'text':
+                        aiResponseAccumulated += chunk.content;
+                        break;
 
-                // Handle content
-                if (delta?.content) {
-                    aiResponseAccumulated += delta.content;
-                }
-
-                // Handle tool calls
-                if (delta?.tool_calls) {
-                    for (const toolCallDelta of delta.tool_calls) {
-                        if (toolCallDelta.index !== undefined) {
-                            let currentToolCall = toolCalls[toolCallDelta.index];
-                            // Start of a new tool call
-                            if (!currentToolCall) {
-                                currentToolCall = toolCalls[toolCallDelta.index] = {
-                                    id: toolCallDelta.id || '',
-                                    type: 'function',
-                                    function: {
-                                        name: '',
-                                        arguments: ''
-                                    }
-                                };
-                            }
-                            if (toolCallDelta.function?.name) {
-                                currentToolCall.function!.name += toolCallDelta.function.name;
-                            }
-                            if (toolCallDelta.function?.arguments) {
-                                currentToolCall.function!.arguments += toolCallDelta.function.arguments;
-                            }
+                    case 'tool_call_start': {
+                        if (!toolCalls[chunk.index]) {
+                            toolCalls[chunk.index] = {
+                                id: chunk.id,
+                                name: chunk.name,
+                                arguments: '',
+                            };
+                        } else {
+                            // Append name if streamed in parts
+                            toolCalls[chunk.index].name += chunk.name;
                         }
+                        break;
                     }
-                }
 
-                // Check if stream is done
-                if (chunk.choices[0]?.finish_reason) {
-                    clearInterval(updateInterval_id);
-                    break;
+                    case 'tool_call_args': {
+                        if (toolCalls[chunk.index]) {
+                            toolCalls[chunk.index].arguments += chunk.args;
+                        }
+                        break;
+                    }
+
+                    case 'thinking':
+                        console.debug(`💭 [thinking] ${chunk.content.substring(0, 200)}`);
+                        break;
+
+                    case 'thinking_blocks':
+                        // Captured thinking blocks (with signatures) for multi-turn continuity
+                        thinkingBlocks = chunk.blocks;
+                        break;
+
+                    case 'done':
+                        clearInterval(updateInterval_id);
+                        break;
                 }
             }
+
+            // Ensure interval is cleared even if 'done' wasn't received
+            clearInterval(updateInterval_id);
 
             console.log('🤖 AI RAW:', {
                 userId,
@@ -235,22 +229,21 @@ export class AIService {
                     timestamp: new Date().toISOString()
                 });
 
-                const newAppendedMessages = [...appendMessagesAfterUser || []];
-               newAppendedMessages.push({
+                const newAppendedMessages: ProviderMessage[] = [...(appendMessagesAfterUser || [])];
+                newAppendedMessages.push({
                     role: 'assistant',
                     content: aiResponseAccumulated,
-                    tool_calls: toolCalls.map(tc => ({
-                        ...tc,
-                        function: {
-                            name: tc.function.name,
-                            arguments: tc.function.arguments || '{}'
-                        }
-                    }))
+                    toolCalls: toolCalls.map(tc => ({
+                        id: tc.id,
+                        name: tc.name,
+                        arguments: tc.arguments || '{}',
+                    })),
+                    thinkingBlocks,
                 });
 
                 for (const toolCall of toolCalls) {
-                    const toolName = toolCall.function.name;
-                    const toolArgs = toolCall.function.arguments;
+                    const toolName = toolCall.name;
+                    const toolArgs = toolCall.arguments;
                     let parsedArgs: Record<string, unknown> = {};
                     try {
                         parsedArgs = JSON.parse(toolArgs || '{}');
@@ -291,10 +284,10 @@ export class AIService {
                         console.log(`   ✅ Success\n`);
 
                         newAppendedMessages.push({
-                            role: 'tool',
+                            role: 'tool_result',
+                            toolCallId: toolCall.id,
                             content: JSON.stringify(result),
-                            tool_call_id: toolCall.id,
-                        })
+                        });
 
                         historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nOutput: ${historySummary}\n`;
                     } catch (error) {
@@ -302,10 +295,10 @@ export class AIService {
                         console.log(`   ❌ Error: ${errorMsg}\n`);
 
                         newAppendedMessages.push({
-                            tool_call_id: toolCall.id,
-                            role: 'tool',
-                            content: JSON.stringify({error: errorMsg})
-                        })
+                            role: 'tool_result',
+                            toolCallId: toolCall.id,
+                            content: JSON.stringify({error: errorMsg}),
+                        });
 
                         historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nError: ${errorMsg}\n`;
                     }
@@ -323,9 +316,6 @@ export class AIService {
                 historyResponseAccumulated = historyResponseAccumulated + recursiveResult.rawResponse;
 
             }
-
-
-
 
             if(addAssistantToHistory) {
                 await addMessageToHistory(userId, 'assistant', historyResponseAccumulated);
@@ -354,7 +344,7 @@ export class AIService {
 Ой 🐺
 \`\`\`
 ${error instanceof Error ? error.message : String(error)}
-\`\`\`            
+\`\`\`
             `;
             await bot.sendMessage(userId, errorMessage, {
                 parse_mode: 'Markdown',
@@ -371,7 +361,7 @@ ${error instanceof Error ? error.message : String(error)}
     /**
      * Get recent messages for context
      */
-    private static async getRecentMessages(userId: number, limit: number = 30): Promise<OpenAIMessage[]> {
+    private static async getRecentMessages(userId: number, limit: number = 30): Promise<ProviderMessage[]> {
         const recentMessages = await getRecentMessageHistory(userId, limit);
 
         return recentMessages.map(m => ({
@@ -379,4 +369,4 @@ ${error instanceof Error ? error.message : String(error)}
             content: `<system>At ${formatDateHuman(m.timestamp)}</system>\n${m.content}`
         }));
     }
-} 
+}
