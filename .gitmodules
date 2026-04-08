@@ -1,3 +1,4 @@
 [submodule "luxmed-bot"]
 	path = luxmed-bot
-	url = https://github.com/dyrkin/luxmed-bot.git
+	url = https://github.com/AndrewKirkovski/luxmed-bot.git
+	branch = rest-api

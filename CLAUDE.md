@@ -70,6 +70,21 @@ yarn install
 yarn start   # runs tsx index.ts
 ```
 
+### LuxMed Sidecar (luxmed-bot submodule)
+**Prerequisites**: JDK 11+ (Temurin via Scoop: `scoop bucket add java && scoop install temurin11-jdk`)
+
+```bash
+# Set JDK 11 (system default is JDK 8, won't work)
+export JAVA_HOME="$HOME/scoop/apps/temurin11-jdk/current"
+export PATH="$JAVA_HOME/bin:$PATH"
+
+# Build (use :server:build, NOT bare build — root bootJar has no main class)
+cd luxmed-bot && ./gradlew.bat :server:build -x test
+
+# Run with Docker Compose (needs PostgreSQL)
+docker compose -f docker-compose.dev.yml up luxmed-db luxmed-sidecar
+```
+
 ## Environment Variables
 - `TELEGRAM_TOKEN` — required
 - `OPENAI_API_KEY` — Anthropic API key (despite the name)
