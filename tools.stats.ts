@@ -8,6 +8,7 @@ import {
 } from "./userStore";
 import {generateChartUrl} from "./chartService";
 import TelegramBot from "node-telegram-bot-api";
+import {DateTime} from 'luxon';
 
 // Bot instance reference — set via initStatTools()
 let botInstance: TelegramBot | null = null;
@@ -16,12 +17,25 @@ export function initStatTools(bot: TelegramBot): void {
     botInstance = bot;
 }
 
-import {DateTime} from 'luxon';
-
 const TZ = 'Europe/Warsaw';
 
-function getPeriodRange(period: string): { from: Date; to: Date } {
+function getPeriodRange(period: string, customFrom?: string, customTo?: string): { from: Date; to: Date } {
     const now = DateTime.now().setZone(TZ);
+
+    if (period === 'custom' && customFrom) {
+        const fromDt = DateTime.fromISO(customFrom, { zone: TZ });
+        if (!fromDt.isValid) throw new Error(`Invalid "from" date: ${customFrom}`);
+        const from = fromDt.startOf('day').toJSDate();
+
+        let to = now.toJSDate();
+        if (customTo) {
+            const toDt = DateTime.fromISO(customTo, { zone: TZ });
+            if (!toDt.isValid) throw new Error(`Invalid "to" date: ${customTo}`);
+            to = toDt.endOf('day').toJSDate();
+        }
+        return { from, to };
+    }
+
     const to = now.toJSDate();
     let from: Date;
 
@@ -38,12 +52,28 @@ function getPeriodRange(period: string): { from: Date; to: Date } {
         case '3months':
             from = now.minus({ months: 3 }).toJSDate();
             break;
+        case 'year':
+            from = now.minus({ years: 1 }).toJSDate();
+            break;
         default:
             from = new Date('2000-01-01');
             break;
     }
 
     return { from, to };
+}
+
+/** Pick aggregation bucket size based on the date range span. */
+function autoBucketUnit(from: Date, to: Date): 'day' | 'week' | 'month' {
+    const days = Math.round((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24));
+    if (days <= 31) return 'day';
+    if (days <= 180) return 'week';
+    return 'month';
+}
+
+/** Bucket a DateTime to the start of its period (day/week/month). */
+function toBucketKey(dt: DateTime, unit: 'day' | 'week' | 'month'): string {
+    return dt.startOf(unit).toISODate()!;
 }
 
 export const TrackStat: Tool = {
@@ -106,15 +136,23 @@ export const GetStatHistory: Tool = {
             },
             period: {
                 type: 'string',
-                description: 'Time period: "today", "week", "month", "all". Defaults to "week".',
-                enum: ['today', 'week', 'month', 'all']
+                description: 'Time period: "today", "week", "month", "year", "custom", "all". Defaults to "week". Use "custom" with from/to.',
+                enum: ['today', 'week', 'month', '3months', 'year', 'custom', 'all']
+            },
+            from: {
+                type: 'string',
+                description: 'Start date for custom range (ISO date, e.g. "2026-03-01"). Only used when period="custom".'
+            },
+            to: {
+                type: 'string',
+                description: 'End date for custom range (ISO date). Defaults to today. Only used when period="custom".'
             }
         },
         required: ['name']
     },
-    execute: async (args: { userId: number; name: string; period?: string }) => {
+    execute: async (args: { userId: number; name: string; period?: string; from?: string; to?: string }) => {
         const period = args.period || 'week';
-        const { from, to } = getPeriodRange(period);
+        const { from, to } = getPeriodRange(period, args.from, args.to);
         const entries = await getStatEntries(args.userId, args.name, from, to);
 
         if (entries.length === 0) {
@@ -187,60 +225,76 @@ export const GenerateStatChart: Tool = {
             },
             period: {
                 type: 'string',
-                description: 'Time period for chart: "week", "month", "3months". Defaults to "week".',
-                enum: ['week', 'month', '3months']
+                description: 'Time period for chart: "week", "month", "3months", "year", "custom". Defaults to "week". Use "custom" with from/to.',
+                enum: ['week', 'month', '3months', 'year', 'custom']
+            },
+            from: {
+                type: 'string',
+                description: 'Start date for custom range (ISO date, e.g. "2026-01-01"). Only used when period="custom".'
+            },
+            to: {
+                type: 'string',
+                description: 'End date for custom range (ISO date). Defaults to today. Only used when period="custom".'
             },
             chart_type: {
                 type: 'string',
-                description: 'Type of chart: "line" for trends, "bar" for daily totals.',
+                description: 'Type of chart: "line" for trends, "bar" for daily/weekly totals.',
                 enum: ['line', 'bar']
+            },
+            aggregation: {
+                type: 'string',
+                description: 'How to aggregate values within each bucket. "sum" for additive stats (calories, water, steps). "avg" for non-additive stats (mood, weight, sleep hours). Defaults to "sum" for bar charts, "avg" for line charts.',
+                enum: ['sum', 'avg']
             }
         },
         required: ['name']
     },
-    execute: async (args: { userId: number; name: string; period?: string; chart_type?: string }) => {
+    execute: async (args: { userId: number; name: string; period?: string; from?: string; to?: string; chart_type?: string; aggregation?: string }) => {
         if (!botInstance) {
             return { success: false, message: 'Chart generation not available (bot not initialized).' };
         }
 
         const period = args.period || 'week';
         const chartType = (args.chart_type || 'line') as 'line' | 'bar';
-        const { from, to } = getPeriodRange(period);
+        const { from, to } = getPeriodRange(period, args.from, args.to);
         const entries = await getStatEntries(args.userId, args.name, from, to);
 
         if (entries.length === 0) {
-            return { success: false, message: `No "${args.name}" data found for the last ${period}.` };
+            const rangeDesc = period === 'custom' ? `${args.from} — ${args.to || 'now'}` : period;
+            return { success: false, message: `No "${args.name}" data found for ${rangeDesc}.` };
         }
 
-        // Group by date for daily aggregation
-        const dailyData = new Map<string, number[]>();
+        // Auto-pick bucket size based on date range span
+        const bucketUnit = autoBucketUnit(from, to);
+        const bucketData = new Map<string, number[]>();
         for (const entry of entries) {
-            const dateKey = entry.timestamp.toISOString().split('T')[0];
-            const existing = dailyData.get(dateKey) ?? [];
+            const dt = DateTime.fromJSDate(entry.timestamp).setZone(TZ);
+            const bucketKey = toBucketKey(dt, bucketUnit);
+            const existing = bucketData.get(bucketKey) ?? [];
             existing.push(entry.value);
-            dailyData.set(dateKey, existing);
+            bucketData.set(bucketKey, existing);
         }
 
-        // Sort by date ascending
-        const sortedDates = [...dailyData.keys()].sort();
-        const labels = sortedDates.map(d => {
-            const parts = d.split('-');
-            return `${parts[2]}.${parts[1]}`; // DD.MM format
-        });
-        const data = sortedDates.map(d => {
-            const values = dailyData.get(d)!;
-            return Math.round(values.reduce((a, b) => a + b, 0) * 100) / 100;
+        // Build {x, y} data points sorted by date
+        const agg = args.aggregation || (chartType === 'bar' ? 'sum' : 'avg');
+        const sortedBuckets = [...bucketData.keys()].sort();
+        const data = sortedBuckets.map(dateStr => {
+            const values = bucketData.get(dateStr)!;
+            const total = values.reduce((a, b) => a + b, 0);
+            const y = agg === 'avg' ? total / values.length : total;
+            return { x: dateStr, y: Math.round(y * 100) / 100 };
         });
 
         const unit = entries[0].unit;
-        const title = `${args.name}${unit ? ` (${unit})` : ''} — ${period}`;
+        const bucketLabel = bucketUnit !== 'day' ? ` (${bucketUnit}ly ${agg})` : '';
+        const title = `${args.name}${unit ? ` (${unit})` : ''}${bucketLabel} — ${period}`;
 
         const chartUrl = await generateChartUrl({
             type: chartType,
-            labels,
             data,
             title,
             yAxisLabel: unit,
+            timeUnit: bucketUnit,
         });
 
         try {

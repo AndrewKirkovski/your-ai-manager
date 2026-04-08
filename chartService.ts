@@ -1,21 +1,19 @@
 export interface ChartConfig {
     type: 'line' | 'bar';
-    labels: string[];
-    data: number[];
+    data: { x: string; y: number }[];
     title: string;
     yAxisLabel?: string;
+    timeUnit?: 'day' | 'week' | 'month';
 }
 
 /**
  * Generate a chart image URL via QuickChart.io.
- * Uses POST to avoid URL length limits with large datasets.
- * Returns a short URL pointing to the rendered PNG.
+ * Uses Chart.js v4 time scale for proper date spacing.
  */
 export async function generateChartUrl(config: ChartConfig): Promise<string> {
     const chartJsConfig = {
         type: config.type,
         data: {
-            labels: config.labels,
             datasets: [{
                 label: config.title,
                 data: config.data,
@@ -25,6 +23,7 @@ export async function generateChartUrl(config: ChartConfig): Promise<string> {
                 tension: 0.3,
                 borderWidth: 2,
                 pointRadius: 3,
+                spanGaps: true,
             }]
         },
         options: {
@@ -33,12 +32,21 @@ export async function generateChartUrl(config: ChartConfig): Promise<string> {
                 legend: { display: false },
             },
             scales: {
+                x: {
+                    type: 'time',
+                    time: {
+                        unit: config.timeUnit || 'day',
+                        displayFormats: {
+                            day: 'MMM D',
+                            week: 'MMM D',
+                            month: 'MMM YYYY',
+                        },
+                    },
+                    ticks: { maxRotation: 45 },
+                },
                 y: {
                     beginAtZero: true,
                     ...(config.yAxisLabel ? { title: { display: true, text: config.yAxisLabel } } : {}),
-                },
-                x: {
-                    ticks: { maxRotation: 45 },
                 },
             },
         },
@@ -48,6 +56,7 @@ export async function generateChartUrl(config: ChartConfig): Promise<string> {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+            version: '4',
             chart: chartJsConfig,
             width: 600,
             height: 400,

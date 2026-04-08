@@ -1,0 +1,3 @@
+[submodule "luxmed-bot"]
+	path = luxmed-bot
+	url = https://github.com/dyrkin/luxmed-bot.git
