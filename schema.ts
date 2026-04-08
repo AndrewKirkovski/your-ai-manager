@@ -72,8 +72,8 @@ export const SCHEMA_SQL = `
     );
 
     CREATE TABLE IF NOT EXISTS luxmed_clinics (
-        id          INTEGER PRIMARY KEY,
-        name        TEXT NOT NULL,
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL UNIQUE,
         address     TEXT,
         lat         REAL,
         lng         REAL,
@@ -148,4 +148,5 @@ export const INDEXES_SQL = `
     CREATE INDEX IF NOT EXISTS idx_stats_user_name_ts ON stat_entries(user_id, name, timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_luxmed_monitorings_active ON luxmed_monitorings(active, user_id);
     CREATE INDEX IF NOT EXISTS idx_user_addresses_user ON user_addresses(user_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_clinics_name ON luxmed_clinics(name);
 `;

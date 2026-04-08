@@ -155,7 +155,7 @@ export const LuxmedSearchSlots: Tool = {
                 const place = await geocode(`${clinicName}, ${prefs.defaultCityName || 'Warszawa'}`);
                 if (place) {
                     clinicCoords.push({ clinic: clinicName, lat: place.lat, lng: place.lng });
-                    saveLuxmedClinic(0, clinicName, place.formattedAddress, place.lat, place.lng, cityId);
+                    saveLuxmedClinic(clinicName, place.formattedAddress, place.lat, place.lng, cityId);
                 }
             }
 

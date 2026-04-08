@@ -297,8 +297,8 @@ const stmts = {
     deleteAddress: db.prepare('DELETE FROM user_addresses WHERE user_id = ? AND label = ?'),
 
     // LuxMed Clinics
-    upsertClinic: db.prepare(`INSERT INTO luxmed_clinics (id, name, address, lat, lng, city_id, geocoded_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET address = excluded.address, lat = excluded.lat, lng = excluded.lng, geocoded_at = excluded.geocoded_at`),
+    upsertClinic: db.prepare(`INSERT INTO luxmed_clinics (name, address, lat, lng, city_id, geocoded_at) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET address = excluded.address, lat = excluded.lat, lng = excluded.lng, geocoded_at = excluded.geocoded_at`),
     getClinic: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE id = ?'),
     getClinicsByCity: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE city_id = ?'),
     getClinicByName: db.prepare<[string], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE name = ?'),
@@ -783,8 +783,8 @@ export function deleteUserAddress(userId: number, label: string): void {
 
 // ============== LUXMED CLINICS CACHE ==============
 
-export function saveLuxmedClinic(id: number, name: string, address: string | null, lat: number | null, lng: number | null, cityId: number): void {
-    stmts.upsertClinic.run(id, name, address, lat, lng, cityId, new Date().toISOString());
+export function saveLuxmedClinic(name: string, address: string | null, lat: number | null, lng: number | null, cityId: number): void {
+    stmts.upsertClinic.run(name, address, lat, lng, cityId, new Date().toISOString());
 }
 
 export function getLuxmedClinicByName(name: string): { id: number; name: string; lat: number; lng: number } | null {
