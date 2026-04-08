@@ -41,6 +41,11 @@ import {
 import { GetWeather } from "./tools.weather";
 import { AnalyzeImage } from "./tools.image";
 import { TrackStat, GetStatHistory, ListTrackedStats, GenerateStatChart } from "./tools.stats";
+import {
+    LuxmedLogin, LuxmedSearchSlots, LuxmedBookSlot, LuxmedCancelBooking,
+    LuxmedMyBookings, LuxmedListCities, LuxmedListServices, LuxmedSetPreferences,
+    LuxmedMonitorSlot, LuxmedStopMonitoring, LuxmedListMonitorings
+} from "./tools.luxmed";
 
 export const tools = {
     get_current_time,
@@ -85,6 +90,18 @@ export const tools = {
     GetStatHistory,
     ListTrackedStats,
     GenerateStatChart,
+    // LuxMed appointment tools
+    LuxmedLogin,
+    LuxmedSearchSlots,
+    LuxmedBookSlot,
+    LuxmedCancelBooking,
+    LuxmedMyBookings,
+    LuxmedListCities,
+    LuxmedListServices,
+    LuxmedSetPreferences,
+    LuxmedMonitorSlot,
+    LuxmedStopMonitoring,
+    LuxmedListMonitorings,
 } as const;
 
 

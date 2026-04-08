@@ -120,6 +120,24 @@ app.patch('/api/users/:id/messages/:messageId', async (req: Request, res: Respon
     }
 });
 
+// LuxMed monitoring webhook — receives notifications from the sidecar
+app.post('/api/luxmed/monitoring-callback', (req: Request, res: Response) => {
+    try {
+        const { chatId, message } = req.body as { chatId?: string; sourceSystemId?: number; message?: string };
+        if (!chatId || !message) {
+            res.status(400).json({ error: 'Missing chatId or message' });
+            return;
+        }
+        console.log(`[LuxMed webhook] chatId=${chatId}: ${message.slice(0, 100)}`);
+        // TODO: Forward message to Telegram user via bot.sendMessage(chatId, message)
+        // This requires access to the bot instance — will be wired in Phase 5
+        res.json({ success: true });
+    } catch (error) {
+        console.error('LuxMed webhook error:', error);
+        res.status(500).json({ error: 'Webhook processing failed' });
+    }
+});
+
 const PORT = process.env.WEB_PORT || 3000;
 app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`🌐 Web UI available at http://localhost:${PORT}`);

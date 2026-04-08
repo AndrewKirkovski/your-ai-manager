@@ -60,6 +60,24 @@ export const SCHEMA_SQL = `
         timestamp   TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS luxmed_accounts (
+        user_id    INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+        account_id INTEGER NOT NULL,
+        username   TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS luxmed_preferences (
+        user_id            INTEGER PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+        default_city_id    INTEGER,
+        default_city_name  TEXT,
+        preferred_time_from TEXT,
+        preferred_time_to   TEXT,
+        home_lat           REAL,
+        home_lng           REAL,
+        max_transit_minutes INTEGER DEFAULT 30
+    );
+
     CREATE TABLE IF NOT EXISTS stat_entries (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id   INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,

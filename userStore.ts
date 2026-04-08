@@ -259,6 +259,25 @@ const stmts = {
     getLatestStat: db.prepare<[number, string], StatRow>('SELECT * FROM stat_entries WHERE user_id = ? AND name = ? ORDER BY timestamp DESC, id DESC LIMIT 1'),
     countStatEntries: db.prepare<[number, string], CountRow>('SELECT COUNT(*) as count FROM stat_entries WHERE user_id = ? AND name = ?'),
     getTodayStats: db.prepare<[number, string], TodayStatRow>('SELECT name, SUM(value) as total, COUNT(*) as count, unit FROM stat_entries WHERE user_id = ? AND timestamp >= ? GROUP BY name'),
+
+    // LuxMed Accounts
+    getLuxmedAccount: db.prepare<[number], { user_id: number; account_id: number; username: string; created_at: string }>('SELECT * FROM luxmed_accounts WHERE user_id = ?'),
+    upsertLuxmedAccount: db.prepare('INSERT INTO luxmed_accounts (user_id, account_id, username, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET account_id = excluded.account_id, username = excluded.username'),
+
+    // LuxMed Preferences
+    getLuxmedPrefs: db.prepare<[number], { user_id: number; default_city_id: number | null; default_city_name: string | null; preferred_time_from: string | null; preferred_time_to: string | null; home_lat: number | null; home_lng: number | null; max_transit_minutes: number | null }>('SELECT * FROM luxmed_preferences WHERE user_id = ?'),
+    upsertLuxmedPrefs: db.prepare(`
+        INSERT INTO luxmed_preferences (user_id, default_city_id, default_city_name, preferred_time_from, preferred_time_to, home_lat, home_lng, max_transit_minutes)
+        VALUES (@user_id, @default_city_id, @default_city_name, @preferred_time_from, @preferred_time_to, @home_lat, @home_lng, @max_transit_minutes)
+        ON CONFLICT(user_id) DO UPDATE SET
+            default_city_id = COALESCE(@default_city_id, default_city_id),
+            default_city_name = COALESCE(@default_city_name, default_city_name),
+            preferred_time_from = COALESCE(@preferred_time_from, preferred_time_from),
+            preferred_time_to = COALESCE(@preferred_time_to, preferred_time_to),
+            home_lat = COALESCE(@home_lat, home_lat),
+            home_lng = COALESCE(@home_lng, home_lng),
+            max_transit_minutes = COALESCE(@max_transit_minutes, max_transit_minutes)
+    `),
 };
 
 // ============== USER FUNCTIONS ==============
@@ -576,4 +595,52 @@ export async function getTodayStats(userId: number, timezone?: string): Promise<
         count: row.count,
         unit: row.unit ?? undefined,
     }));
+}
+
+// ============== LUXMED FUNCTIONS ==============
+
+export function getLuxmedAccountId(userId: number): number | null {
+    const row = stmts.getLuxmedAccount.get(userId);
+    return row?.account_id ?? null;
+}
+
+export function saveLuxmedAccount(userId: number, accountId: number, username: string): void {
+    stmts.upsertLuxmedAccount.run(userId, accountId, username, new Date().toISOString());
+}
+
+export interface LuxmedPreferences {
+    defaultCityId?: number;
+    defaultCityName?: string;
+    preferredTimeFrom?: string;
+    preferredTimeTo?: string;
+    homeLat?: number;
+    homeLng?: number;
+    maxTransitMinutes?: number;
+}
+
+export function getLuxmedPreferences(userId: number): LuxmedPreferences {
+    const row = stmts.getLuxmedPrefs.get(userId);
+    if (!row) return {};
+    return {
+        defaultCityId: row.default_city_id ?? undefined,
+        defaultCityName: row.default_city_name ?? undefined,
+        preferredTimeFrom: row.preferred_time_from ?? undefined,
+        preferredTimeTo: row.preferred_time_to ?? undefined,
+        homeLat: row.home_lat ?? undefined,
+        homeLng: row.home_lng ?? undefined,
+        maxTransitMinutes: row.max_transit_minutes ?? undefined,
+    };
+}
+
+export function saveLuxmedPreferences(userId: number, prefs: LuxmedPreferences): void {
+    stmts.upsertLuxmedPrefs.run({
+        user_id: userId,
+        default_city_id: prefs.defaultCityId ?? null,
+        default_city_name: prefs.defaultCityName ?? null,
+        preferred_time_from: prefs.preferredTimeFrom ?? null,
+        preferred_time_to: prefs.preferredTimeTo ?? null,
+        home_lat: prefs.homeLat ?? null,
+        home_lng: prefs.homeLng ?? null,
+        max_transit_minutes: prefs.maxTransitMinutes ?? null,
+    });
 }
