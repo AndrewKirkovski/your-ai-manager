@@ -24,11 +24,16 @@ export class AnthropicProvider implements AIProvider {
         const thinkingConfig = /4-6|4\.6/i.test(request.model)
             ? { type: 'adaptive' as const }
             : /opus|sonnet-4|claude-3[.-]7/i.test(request.model)
-                ? { type: 'enabled' as const, budget_tokens: 8000 }
+                ? { type: 'enabled' as const, budget_tokens: 2000 }
                 : null;
+        let maxTokens = request.maxTokens;
+        const budget = thinkingConfig && 'budget_tokens' in thinkingConfig ? thinkingConfig.budget_tokens : 0;
+        if (budget && maxTokens <= budget) {
+            maxTokens = budget + 4000;
+        }
         const params: Anthropic.MessageCreateParams = {
             model: request.model,
-            max_tokens: request.maxTokens,
+            max_tokens: maxTokens,
             system: request.systemPrompt,
             messages,
             ...(thinkingConfig ? { thinking: thinkingConfig } : {}),

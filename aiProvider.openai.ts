@@ -42,6 +42,11 @@ export class OpenAIProvider implements AIProvider {
             const thinkingConfig = this.getThinkingConfig(request.model);
             if (thinkingConfig) {
                 requestOptions.extra_body = { thinking: thinkingConfig };
+                // max_tokens must be > budget_tokens
+                const budget = (thinkingConfig as any).budget_tokens;
+                if (budget && (request.maxTokens || 1500) <= budget) {
+                    requestOptions.max_tokens = budget + 4000;
+                }
             }
         }
 
@@ -142,7 +147,7 @@ export class OpenAIProvider implements AIProvider {
         }
         // Older models that support thinking: use enabled with budget
         if (/opus|sonnet-4|claude-3[.-]7/i.test(model)) {
-            return { type: 'enabled', budget_tokens: 8000 };
+            return { type: 'enabled', budget_tokens: 2000 };
         }
         return null;
     }
