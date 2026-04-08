@@ -65,7 +65,10 @@ export async function geocode(query: string): Promise<GeocodedPlace | null> {
 
     if (data.status !== 'OK' || !data.results?.[0]) {
         console.log(`[Maps] Geocode failed: ${data.status}`);
-        cacheSet(cacheKey, null, GEOCODE_TTL);
+        // Only cache "not found" for genuine no-results, not for API errors (rate limit, billing, etc.)
+        if (data.status === 'ZERO_RESULTS') {
+            cacheSet(cacheKey, null, GEOCODE_TTL);
+        }
         return null;
     }
 
@@ -198,6 +201,8 @@ export interface DistanceMatrixEntry {
     status: string;
 }
 
+const DISTANCE_MATRIX_BATCH_SIZE = 25; // Google API limit per request
+
 export async function getDistanceMatrix(
     origin: { lat: number; lng: number },
     destinations: { lat: number; lng: number }[],
@@ -216,30 +221,53 @@ export async function getDistanceMatrix(
         return cached;
     }
 
-    const url = `${BASE}/distancematrix/json?origins=${originStr}&destinations=${destStr}&mode=${mode}&departure_time=now&language=pl&key=${API_KEY}`;
-    console.log(`[Maps] Distance Matrix: ${destinations.length} destinations (${mode})`);
+    // Batch destinations in groups of 25 (Google API limit)
+    const allResults: DistanceMatrixEntry[] = [];
+    for (let offset = 0; offset < destinations.length; offset += DISTANCE_MATRIX_BATCH_SIZE) {
+        const batch = destinations.slice(offset, offset + DISTANCE_MATRIX_BATCH_SIZE);
+        const batchDestStr = batch.map(d => `${d.lat},${d.lng}`).join('|');
 
-    const res = await fetch(url);
-    const data = await res.json() as any;
+        const url = `${BASE}/distancematrix/json?origins=${originStr}&destinations=${batchDestStr}&mode=${mode}&departure_time=now&language=pl&key=${API_KEY}`;
+        console.log(`[Maps] Distance Matrix: batch ${Math.floor(offset / DISTANCE_MATRIX_BATCH_SIZE) + 1}, ${batch.length} destinations (${mode})`);
 
-    if (data.status !== 'OK' || !data.rows?.[0]) {
-        console.log(`[Maps] Distance Matrix failed: ${data.status}`);
-        return [];
+        const res = await fetch(url);
+        const data = await res.json() as any;
+
+        if (data.status !== 'OK' || !data.rows?.[0]) {
+            console.log(`[Maps] Distance Matrix batch failed: ${data.status}`);
+            continue;
+        }
+
+        for (let i = 0; i < data.rows[0].elements.length; i++) {
+            const el = data.rows[0].elements[i];
+            allResults.push({
+                destinationIndex: offset + i,
+                distance: el.distance?.text || '',
+                distanceMeters: el.distance?.value || 0,
+                duration: el.duration?.text || '',
+                durationSeconds: el.duration?.value || 0,
+                status: el.status,
+            });
+        }
     }
 
-    const results: DistanceMatrixEntry[] = data.rows[0].elements.map((el: any, i: number) => ({
-        destinationIndex: i,
-        distance: el.distance?.text || '',
-        distanceMeters: el.distance?.value || 0,
-        duration: el.duration?.text || '',
-        durationSeconds: el.duration?.value || 0,
-        status: el.status,
-    }));
-    cacheSet(cacheKey, results, DISTANCE_MATRIX_TTL);
-    return results;
+    cacheSet(cacheKey, allResults, DISTANCE_MATRIX_TTL);
+    return allResults;
 }
 
 // === Weather forecast at specific time ===
+
+// Get hour in Warsaw timezone regardless of server's local timezone
+function getWarsawHour(time: Date): number {
+    const warsawStr = time.toLocaleString('en-US', { timeZone: 'Europe/Warsaw', hour: 'numeric', hour12: false });
+    return parseInt(warsawStr, 10);
+}
+
+function getWarsawDate(time: Date): string {
+    // Returns YYYY-MM-DD in Warsaw timezone
+    const parts = time.toLocaleDateString('en-CA', { timeZone: 'Europe/Warsaw' }); // en-CA gives YYYY-MM-DD format
+    return parts;
+}
 
 export async function getWeatherForecast(lat: number, lng: number, time: Date): Promise<{
     temperature: number;
@@ -249,8 +277,8 @@ export async function getWeatherForecast(lat: number, lng: number, time: Date): 
     windSpeed: number;
     weatherCode: number;
 } | null> {
-    const date = time.toISOString().slice(0, 10);
-    const hour = time.getHours();
+    const date = getWarsawDate(time);
+    const hour = getWarsawHour(time);
     const cacheKey = `wx:${lat.toFixed(2)},${lng.toFixed(2)}:${date}:${hour}`;
     const cached = cacheGet<any>(cacheKey);
     if (cached !== undefined) {
@@ -260,16 +288,14 @@ export async function getWeatherForecast(lat: number, lng: number, time: Date): 
 
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&hourly=temperature_2m,apparent_temperature,weather_code,precipitation,wind_speed_10m&start_date=${date}&end_date=${date}&timezone=Europe/Warsaw`;
 
-    console.log(`[Weather] Forecast for ${lat},${lng} at ${time.toISOString()}`);
+    console.log(`[Weather] Forecast for ${lat},${lng} at ${date} ${hour}:00 Warsaw`);
     const res = await fetch(url);
     if (!res.ok) return null;
 
     const data = await res.json() as any;
     if (!data.hourly?.time) return null;
 
-    // Find the closest hour
-    const targetHour = time.getHours();
-    const hourIndex = Math.min(targetHour, (data.hourly.time.length || 1) - 1);
+    const hourIndex = Math.min(hour, (data.hourly.time.length || 1) - 1);
 
     const weatherCodes: Record<number, string> = {
         0: 'Clear sky', 1: 'Mainly clear', 2: 'Partly cloudy', 3: 'Overcast',
