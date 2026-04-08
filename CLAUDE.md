@@ -7,7 +7,7 @@ Telegram bot — an anthropomorphic wolf character that helps with ADHD task man
 - **Runtime**: Node.js 20 + TypeScript (via `tsx`, no build step)
 - **AI**: Anthropic Claude (OpenAI-compatible endpoint), OpenAI Whisper for voice
 - **Bot**: `node-telegram-bot-api` (polling mode)
-- **DB**: LowDB (JSON file) — migrating to SQLite
+- **DB**: SQLite (via `better-sqlite3`)
 - **Web**: Express admin UI on port 3000 (Tailwind CSS, vanilla JS)
 - **Scheduling**: `node-cron` (1-minute tick for task reminders)
 - **Deploy**: Docker (Alpine), auto-update via Watchtower, GHCR
@@ -35,13 +35,18 @@ Provider is selected at startup via `AI_PROVIDER` env (`anthropic` = native SDK 
 | `constants.ts` | System prompts: CHARACTER, API, MEMORY, MEDIA, combined SYSTEM_PROMPT |
 | `mediaParser.ts` | Voice/photo/sticker/location parsing, Claude Vision calls |
 | `tools.ts` | Tool registry + `executeTool()` dispatcher |
-| `tools.*.ts` | Individual tool implementations (tasks, routines, memory, user, search, location, weather, meta) |
+| `tools.*.ts` | Individual tool implementations (tasks, routines, memory, user, search, location, weather, meta, stats, image, luxmed, directions) |
 | `historyCompaction.ts` | Hourly: summarizes consecutive assistant messages to save tokens |
-| `webServer.ts` | Express API for admin dashboard |
-| `aiCommandService.ts` | DEPRECATED — only strips legacy XML tags |
+| `webServer.ts` | Express API for admin dashboard + LuxMed monitoring webhook |
 | `aiProvider.ts` | Abstract AI provider interface, types, factory |
 | `aiProvider.openai.ts` | OpenAI SDK provider (adds thinking via `extra_body` for Anthropic compat) |
 | `aiProvider.anthropic.ts` | Native Anthropic SDK provider (full thinking, proper tool format) |
+| `schema.ts` | SQLite schema definitions (single source of truth for all tables) |
+| `database.ts` | SQLite database initialization (`better-sqlite3`) |
+| `luxmedAdapter.ts` | HTTP client for LuxMed sidecar REST API |
+| `luxmedMonitor.ts` | LuxMed appointment monitoring loop (every 10 min, client-side filtering) |
+| `googleMapsService.ts` | Google Maps API wrapper (geocoding, directions, distance matrix) + persistent cache |
+| `chartService.ts` | QuickChart.io chart generation for stat tracking |
 
 ### Tool Pattern
 Every tool follows this interface (`tool.types.ts`):
@@ -66,6 +71,7 @@ Only last 30 messages sent as context. History capped at 5000 per user.
 
 ### Cron Jobs
 - **Every minute**: Check routines (create task from cron), check pending tasks (ping if `pingAt <= now`)
+- **Every 10 minutes**: LuxMed monitoring cycle (search for appointment slots, auto-book if configured)
 - **Every hour**: History compaction (summarize consecutive assistant messages)
 
 ## Running Locally
@@ -114,7 +120,7 @@ git push origin rest-api        # push to fork
 - `VISION_MODEL` — for image analysis (always uses OpenAI-compat client)
 - `OPENAI_WHISPER_API_KEY` — optional, actual OpenAI key for voice transcription
 - `GOOGLE_SEARCH_ENGINE_ID` + `GOOGLE_SEARCH_API_KEY` — optional, for web search
-- `DB_PATH` — database file path (default: `./db.json`)
+- `DB_PATH` — database file path (default: `bot.sqlite`)
 - `WEB_PORT` — admin UI port (default: 3000)
 - `LUXMED_SIDECAR_URL` — LuxMed sidecar REST API (default: `http://localhost:8080`)
 - `GOOGLE_MAPS_API_KEY` — for GetDirections tool and LuxMed transit filtering (Geocoding, Directions, Distance Matrix APIs)
@@ -131,7 +137,7 @@ git push origin rest-api        # push to fork
 ### Container Layout
 - **Container name**: `ai-manager-bot`
 - **Volume**: `ai-manager-bot_bot-data` → `/app/data/` inside container
-- **DB file**: `/app/data/db.json` (migrating to `/app/data/bot.sqlite`)
+- **DB file**: `/app/data/db.sqlite`
 
 ### Debugging on Revo
 ```bash
@@ -147,7 +153,7 @@ docker logs -f ai-manager-bot
 docker compose restart ai-manager-bot
 
 # Copy db out of container for local inspection
-docker cp ai-manager-bot:/app/data/db.json /tmp/db.json
+docker cp ai-manager-bot:/app/data/db.sqlite /tmp/db.sqlite
 ```
 
 ## Conventions
