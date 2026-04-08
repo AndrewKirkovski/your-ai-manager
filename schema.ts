@@ -100,6 +100,12 @@ export const SCHEMA_SQL = `
         created_at  TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS kv_cache (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS stat_entries (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id   INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
