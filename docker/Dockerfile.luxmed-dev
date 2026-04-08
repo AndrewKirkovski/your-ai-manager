@@ -1,0 +1,18 @@
+# Simple runtime-only Dockerfile
+# Pre-build the JAR locally: cd luxmed-bot && ./gradlew.bat :server:build -x test
+# Then: ./gradlew.bat prepare (copies server.jar to docker/)
+
+FROM eclipse-temurin:11-jre-focal
+
+RUN apt-get update -y && apt-get install -y netcat && rm -rf /var/lib/apt/lists/*
+RUN ln -fs /usr/share/zoneinfo/Europe/Warsaw /etc/localtime && dpkg-reconfigure -f noninteractive tzdata
+
+RUN mkdir -p /app
+COPY luxmed-bot/server/build/libs/server.jar /app/server.jar
+
+EXPOSE 8080
+
+CMD echo "Waiting for database on ${DB_HOST:-localhost}:${DB_PORT:-5432}..." && \
+    while ! nc -z ${DB_HOST:-localhost} ${DB_PORT:-5432}; do sleep 2; done && \
+    echo "Database ready, starting sidecar..." && \
+    cd /app && java -Xmx128m -jar server.jar

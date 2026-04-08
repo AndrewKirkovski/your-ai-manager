@@ -10,3 +10,12 @@ db.json
 render.yaml
 template.json
 deploy
+.local
+luxmed-bot/.git
+luxmed-bot/.gradle
+luxmed-bot/api
+luxmed-bot/bot
+luxmed-bot/common
+luxmed-bot/docker
+luxmed-bot/server/src
+luxmed-bot/server/build/tmp

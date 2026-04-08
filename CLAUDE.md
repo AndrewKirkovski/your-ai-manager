@@ -71,18 +71,24 @@ yarn start   # runs tsx index.ts
 ```
 
 ### LuxMed Sidecar (luxmed-bot submodule)
-**Prerequisites**: JDK 11+ (Temurin via Scoop: `scoop bucket add java && scoop install temurin11-jdk`)
+**Prerequisites**: JDK 11+ (Temurin via Scoop: `scoop bucket add java && scoop install temurin11-jdk`), Docker
 
 ```bash
-# Set JDK 11 (system default is JDK 8, won't work)
+# Option A: Docker Compose (recommended — builds from source inside Docker)
+docker compose -f docker-compose.dev.yml up -d
+
+# Option B: Build locally (needs JDK 11)
 export JAVA_HOME="$HOME/scoop/apps/temurin11-jdk/current"
 export PATH="$JAVA_HOME/bin:$PATH"
+cd luxmed-bot && ./gradlew.bat :server:build -x test  # use :server:build, NOT bare build
+```
 
-# Build (use :server:build, NOT bare build — root bootJar has no main class)
-cd luxmed-bot && ./gradlew.bat :server:build -x test
-
-# Run with Docker Compose (needs PostgreSQL)
-docker compose -f docker-compose.dev.yml up luxmed-db luxmed-sidecar
+**Fork & update workflow** (submodule = AndrewKirkovski/luxmed-bot, branch rest-api):
+```bash
+cd luxmed-bot
+git fetch upstream              # get dyrkin's latest
+git rebase upstream/master      # replay our patches on top
+git push origin rest-api        # push to fork
 ```
 
 ## Environment Variables
@@ -95,6 +101,7 @@ docker compose -f docker-compose.dev.yml up luxmed-db luxmed-sidecar
 - `GOOGLE_SEARCH_ENGINE_ID` + `GOOGLE_SEARCH_API_KEY` — optional, for web search
 - `DB_PATH` — database file path (default: `./db.json`)
 - `WEB_PORT` — admin UI port (default: 3000)
+- `LUXMED_SIDECAR_URL` — LuxMed sidecar REST API (default: `http://localhost:8080`)
 
 ## Deployment — Acer Revo Box (murzik)
 
