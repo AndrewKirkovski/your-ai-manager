@@ -248,11 +248,11 @@ export const GenerateStatChart: Tool = {
             },
             y_min: {
                 type: 'number',
-                description: 'Minimum Y-axis value. Use for better detail on metrics like weight (e.g., y_min=80 for weight range 80-100kg). Omit to start from 0.'
+                description: 'Minimum Y-axis value. Omit for smart autorange (tight padding around data). Only set when you want to force a specific floor (e.g., y_min=0 to anchor at zero).'
             },
             y_max: {
                 type: 'number',
-                description: 'Maximum Y-axis value. Omit to auto-scale based on data.'
+                description: 'Maximum Y-axis value. Omit for smart autorange. Only set when you want to force a specific ceiling.'
             }
         },
         required: ['name']

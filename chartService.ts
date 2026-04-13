@@ -1,3 +1,5 @@
+import {DateTime} from 'luxon';
+
 export interface ChartConfig {
     type: 'line' | 'bar';
     data: { x: string; y: number }[];
@@ -9,10 +11,51 @@ export interface ChartConfig {
 }
 
 /**
+ * Pick a luxon date format that drops redundant year/month when all points share them.
+ * Luxon tokens: d=day, MMM=month abbr, yyyy=year.
+ */
+function smartDateFormat(dates: DateTime[], unit: 'day' | 'week' | 'month'): string {
+    if (dates.length === 0) {
+        return unit === 'month' ? 'MMM yyyy' : 'MMM d';
+    }
+    const years = new Set(dates.map(d => d.year));
+    const months = new Set(dates.map(d => `${d.year}-${d.month}`));
+    const sameYear = years.size === 1;
+    const sameMonth = months.size === 1;
+
+    if (unit === 'month') {
+        return sameYear ? 'MMM' : 'MMM yyyy';
+    }
+    if (sameMonth) return 'd';
+    if (sameYear) return 'MMM d';
+    return 'MMM d, yyyy';
+}
+
+/**
  * Generate a chart image URL via QuickChart.io.
  * Uses Chart.js v4 time scale for proper date spacing.
  */
 export async function generateChartUrl(config: ChartConfig): Promise<string> {
+    const unit = config.timeUnit || 'day';
+    const parsedDates = config.data
+        .map(d => DateTime.fromISO(d.x))
+        .filter(d => d.isValid);
+    const dateFormat = smartDateFormat(parsedDates, unit);
+
+    let yMin = config.yMin;
+    let yMax = config.yMax;
+    if (yMin == null || yMax == null) {
+        const values = config.data.map(d => d.y).filter(v => typeof v === 'number' && isFinite(v));
+        if (values.length > 0) {
+            const vmin = Math.min(...values);
+            const vmax = Math.max(...values);
+            const range = vmax - vmin;
+            const pad = range === 0 ? (Math.abs(vmin) * 0.1 || 1) : range * 0.1;
+            if (yMin == null) yMin = vmin - pad;
+            if (yMax == null) yMax = vmax + pad;
+        }
+    }
+
     const chartJsConfig = {
         type: config.type,
         data: {
@@ -37,19 +80,20 @@ export async function generateChartUrl(config: ChartConfig): Promise<string> {
                 x: {
                     type: 'time',
                     time: {
-                        unit: config.timeUnit || 'day',
+                        unit,
+                        tooltipFormat: dateFormat,
                         displayFormats: {
-                            day: 'MMM D',
-                            week: 'MMM D',
-                            month: 'MMM YYYY',
+                            day: dateFormat,
+                            week: dateFormat,
+                            month: dateFormat,
                         },
                     },
                     ticks: { maxRotation: 45 },
                 },
                 y: {
-                    beginAtZero: config.yMin == null,
-                    ...(config.yMin != null ? { min: config.yMin } : {}),
-                    ...(config.yMax != null ? { max: config.yMax } : {}),
+                    beginAtZero: false,
+                    ...(yMin != null ? { min: yMin } : {}),
+                    ...(yMax != null ? { max: yMax } : {}),
                     ...(config.yAxisLabel ? { title: { display: true, text: config.yAxisLabel } } : {}),
                 },
             },
