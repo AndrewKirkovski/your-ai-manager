@@ -108,7 +108,15 @@ interface MessageRow {
 interface MemoryRow {
     key: string;
     value: string;
+    first_recorded_at: string;
+    updated_at: string;
 }
+
+export type MemoryRecord = {
+    value: string;
+    firstRecordedAt: Date;
+    updatedAt: Date;
+};
 
 interface CountRow {
     count: number;
@@ -233,13 +241,19 @@ const stmts = {
     cleanupOldTasks: db.prepare('DELETE FROM tasks WHERE user_id = ? AND id NOT IN (SELECT id FROM tasks WHERE user_id = ? ORDER BY created_at DESC LIMIT ?)'),
 
     // Memory
-    getMemoryByUser: db.prepare<[number], MemoryRow>('SELECT key, value FROM memory WHERE user_id = ?'),
-    getMemoryByKey: db.prepare<[number, string], MemoryRow>('SELECT value FROM memory WHERE user_id = ? AND key = ?'),
-    upsertMemory: db.prepare('INSERT INTO memory (user_id, key, value) VALUES (?, ?, ?) ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value'),
+    getMemoryByUser: db.prepare<[number], MemoryRow>('SELECT key, value, first_recorded_at, updated_at FROM memory WHERE user_id = ?'),
+    getMemoryByKey: db.prepare<[number, string], MemoryRow>('SELECT key, value, first_recorded_at, updated_at FROM memory WHERE user_id = ? AND key = ?'),
+    upsertMemory: db.prepare(`
+        INSERT INTO memory (user_id, key, value, first_recorded_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `),
     deleteMemory: db.prepare('DELETE FROM memory WHERE user_id = ? AND key = ?'),
 
     // Message History
     getRecentMessages: db.prepare<[number, number], MessageRow>('SELECT * FROM message_history WHERE user_id = ? ORDER BY id DESC LIMIT ?'),
+    getUserMessagesSince: db.prepare<[number, string, number], MessageRow>(`SELECT * FROM message_history WHERE user_id = ? AND role = 'user' AND timestamp > ? ORDER BY id DESC LIMIT ?`),
+    countUserMessagesSince: db.prepare<[number, string], CountRow>(`SELECT COUNT(*) as count FROM message_history WHERE user_id = ? AND role = 'user' AND timestamp > ?`),
     getAllMessages: db.prepare<[number], MessageRow>('SELECT * FROM message_history WHERE user_id = ? ORDER BY id ASC'),
     insertMessage: db.prepare('INSERT INTO message_history (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)'),
     countMessages: db.prepare<[number], CountRow>('SELECT COUNT(*) as count FROM message_history WHERE user_id = ?'),
@@ -374,6 +388,16 @@ export async function getUserMessageHistory(userId: number): Promise<MessageHist
 export async function getRecentMessageHistory(userId: number, limit: number): Promise<MessageHistory[]> {
     // Reverse because query is ORDER BY id DESC, but we want chronological
     return stmts.getRecentMessages.all(userId, limit).map(rowToMessage).reverse();
+}
+
+/** Count user-role messages strictly newer than the given ISO timestamp. */
+export async function countUserMessagesSince(userId: number, sinceIso: string): Promise<number> {
+    return stmts.countUserMessagesSince.get(userId, sinceIso)?.count ?? 0;
+}
+
+/** Fetch user-role messages strictly newer than the given ISO timestamp, chronological order. */
+export async function getUserMessagesSince(userId: number, sinceIso: string, limit: number): Promise<MessageHistory[]> {
+    return stmts.getUserMessagesSince.all(userId, sinceIso, limit).map(rowToMessage).reverse();
 }
 
 // History compaction helpers
@@ -511,7 +535,8 @@ export async function removeUserTask(userId: number, taskId: string): Promise<vo
 // ============== MEMORY HELPERS ==============
 
 export async function updateUserMemory(userId: number, key: string, value: string): Promise<void> {
-    stmts.upsertMemory.run(userId, key, value);
+    const now = new Date().toISOString();
+    stmts.upsertMemory.run(userId, key, value, now, now);
 }
 
 export async function getUserMemory(userId: number, key: string): Promise<string | undefined> {
@@ -526,6 +551,29 @@ export async function getAllUserMemory(userId: number): Promise<Record<string, s
         memory[row.key] = row.value;
     }
     return memory;
+}
+
+export async function getUserMemoryRecord(userId: number, key: string): Promise<MemoryRecord | undefined> {
+    const row = stmts.getMemoryByKey.get(userId, key);
+    if (!row) return undefined;
+    return {
+        value: row.value,
+        firstRecordedAt: new Date(row.first_recorded_at),
+        updatedAt: new Date(row.updated_at),
+    };
+}
+
+export async function getAllUserMemoryRecords(userId: number): Promise<Record<string, MemoryRecord>> {
+    const rows = stmts.getMemoryByUser.all(userId);
+    const out: Record<string, MemoryRecord> = {};
+    for (const row of rows) {
+        out[row.key] = {
+            value: row.value,
+            firstRecordedAt: new Date(row.first_recorded_at),
+            updatedAt: new Date(row.updated_at),
+        };
+    }
+    return out;
 }
 
 export async function deleteUserMemory(userId: number, key: string): Promise<boolean> {

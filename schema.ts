@@ -37,9 +37,11 @@ export const SCHEMA_SQL = `
     );
 
     CREATE TABLE IF NOT EXISTS memory (
-        user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-        key     TEXT NOT NULL,
-        value   TEXT NOT NULL,
+        user_id           INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+        key               TEXT NOT NULL,
+        value             TEXT NOT NULL,
+        first_recorded_at TEXT NOT NULL DEFAULT '',
+        updated_at        TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (user_id, key)
     );
 

@@ -34,6 +34,7 @@ import {
 import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
 import {runHistoryCompaction} from './historyCompaction';
+import {runStyleScan} from './styleScan';
 import {CronExpressionParser} from 'cron-parser';
 import {formatDateHuman, formatCronHuman, getCurrentTime} from './dateUtils';
 import {initializeMediaParser, getMediaParser} from './mediaParser';
@@ -336,6 +337,15 @@ cron.schedule('0 * * * *', async () => {
         console.error('🗜️ History compaction cron error:', error instanceof Error ? error.message : error);
     }
 });
+
+// Daily user communication-style + ADHD-reaction scan at 04:00 Warsaw time
+cron.schedule('0 4 * * *', async () => {
+    try {
+        await runStyleScan(provider, OPEN_AI_MODEL);
+    } catch (error) {
+        console.error('🎭 Style scan cron error:', error instanceof Error ? error.message : error);
+    }
+}, { timezone: 'Europe/Warsaw' });
 
 // LuxMed monitoring — check every 10 minutes
 cron.schedule('*/10 * * * *', async () => {

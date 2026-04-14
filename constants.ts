@@ -263,6 +263,25 @@ Something broke. Tell the user briefly — don't over-apologize. "что-то с
 </system>
 `;
 
+export const STYLE_SCAN_PROMPT = (messagesText: string, priorStyle: string | null, priorAdhd: string | null) => `
+You are an expert on ADHD, behavior coaching, and interpersonal communication. Analyze a sample of recent messages from a user of an ADHD assistant bot.
+
+${priorStyle ? `Prior notes on communication style:\n${priorStyle}\n\n` : ''}${priorAdhd ? `Prior notes on ADHD reactions:\n${priorAdhd}\n\n` : ''}Recent user messages (newest last):
+${messagesText}
+
+Produce TWO short analyses. Each must be concrete, specific, and actionable for the bot — NOT generic platitudes. Write in ENGLISH regardless of the user's language. If the prior notes exist, UPDATE them (keep what still holds, revise what's changed). Base claims only on what you can observe in the sample; if a dimension has no signal, say so briefly instead of guessing.
+
+Format your response EXACTLY like this, with no preamble:
+
+<communication_style>
+2-5 sentences covering: formality level, swearing/profanity (does the user swear? how much? does the bot have license to swear back?), politeness, tone (warm/cold/sarcastic/blunt), message length habits, language mix. End with one line: "Bot should:" + 1-2 concrete adjustments.
+</communication_style>
+
+<adhd_reactions>
+2-5 sentences covering: how does the user react to reminders and nagging (resentful, grateful, ignores, negotiates)? do they follow through on tasks or deflect? any signs of RSD, avoidance, hyperfocus, or executive dysfunction patterns? what nudging style actually lands vs backfires? End with one line: "Bot should:" + 1-2 concrete adjustments.
+</adhd_reactions>
+`;
+
 export const HISTORY_COMPACTION_PROMPT = (dateRange: string, messages: string) => `
 You are summarizing a block of consecutive bot messages from a conversation history.
 These messages were sent by the bot without user replies in between (e.g. task reminders, routine pings, status updates).
