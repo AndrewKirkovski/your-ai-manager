@@ -63,14 +63,6 @@ function getPeriodRange(period: string, customFrom?: string, customTo?: string):
     return { from, to };
 }
 
-/** Pick aggregation bucket size based on the date range span. */
-function autoBucketUnit(from: Date, to: Date): 'day' | 'week' | 'month' {
-    const days = Math.round((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24));
-    if (days <= 31) return 'day';
-    if (days <= 180) return 'week';
-    return 'month';
-}
-
 /** Bucket a DateTime to the start of its period (day/week/month). */
 function toBucketKey(dt: DateTime, unit: 'day' | 'week' | 'month'): string {
     return dt.startOf(unit).toISODate()!;
@@ -225,8 +217,13 @@ export const GenerateStatChart: Tool = {
             },
             period: {
                 type: 'string',
-                description: 'Time period for chart: "week", "month", "3months", "year", "custom". Defaults to "week". Use "custom" with from/to.',
-                enum: ['week', 'month', '3months', 'year', 'custom']
+                description: 'Time period for chart: "today", "week", "month", "3months", "year", "all", "custom". Defaults to "all" (full history). Use "custom" with from/to.',
+                enum: ['today', 'week', 'month', '3months', 'year', 'all', 'custom']
+            },
+            bucket: {
+                type: 'string',
+                description: 'Aggregation bucket size. Defaults to "day" (one point per day). Use "week" or "month" ONLY when the user explicitly asks to group by week/month.',
+                enum: ['day', 'week', 'month']
             },
             from: {
                 type: 'string',
@@ -253,16 +250,20 @@ export const GenerateStatChart: Tool = {
             y_max: {
                 type: 'number',
                 description: 'Maximum Y-axis value. Omit for smart autorange. Only set when you want to force a specific ceiling.'
+            },
+            force: {
+                type: 'boolean',
+                description: 'Bypass the too-many-points safety check. Set to true only after the first call failed with a density error and you decided rendering a dense chart is still the right choice.'
             }
         },
         required: ['name']
     },
-    execute: async (args: { userId: number; name: string; period?: string; from?: string; to?: string; chart_type?: string; aggregation?: string; y_min?: number; y_max?: number }) => {
+    execute: async (args: { userId: number; name: string; period?: string; bucket?: string; from?: string; to?: string; chart_type?: string; aggregation?: string; y_min?: number; y_max?: number; force?: boolean }) => {
         if (!botInstance) {
             return { success: false, message: 'Chart generation not available (bot not initialized).' };
         }
 
-        const period = args.period || 'week';
+        const period = args.period || 'all';
         const chartType = (args.chart_type || 'line') as 'line' | 'bar';
         const { from, to } = getPeriodRange(period, args.from, args.to);
         const entries = await getStatEntries(args.userId, args.name, from, to);
@@ -272,8 +273,7 @@ export const GenerateStatChart: Tool = {
             return { success: false, message: `No "${args.name}" data found for ${rangeDesc}.` };
         }
 
-        // Auto-pick bucket size based on date range span
-        const bucketUnit = autoBucketUnit(from, to);
+        const bucketUnit = (args.bucket || 'day') as 'day' | 'week' | 'month';
         const bucketData = new Map<string, number[]>();
         for (const entry of entries) {
             const dt = DateTime.fromJSDate(entry.timestamp).setZone(TZ);
@@ -292,6 +292,17 @@ export const GenerateStatChart: Tool = {
             const y = agg === 'avg' ? total / values.length : total;
             return { x: dateStr, y: Math.round(y * 100) / 100 };
         });
+
+        const maxPoints = chartType === 'bar' ? 60 : 180;
+        if (data.length > maxPoints && !args.force) {
+            return {
+                success: false,
+                tooManyPoints: true,
+                dataPoints: data.length,
+                maxPoints,
+                message: `Chart would have ${data.length} ${bucketUnit} points (limit: ${maxPoints} for ${chartType}). Options: (1) retry with a coarser bucket (e.g. bucket="week" or "month"), (2) narrow the period/date range, or (3) retry with force=true to render anyway (labels will be dense).`,
+            };
+        }
 
         const unit = entries[0].unit;
         const bucketLabel = bucketUnit !== 'day' ? ` (${bucketUnit}ly ${agg})` : '';
