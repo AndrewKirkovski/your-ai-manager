@@ -310,6 +310,7 @@ export const DEFAULT_HELP_PROMPT = () => `
 /tasks - показать задачи
 /stats - показать отслеживаемые статистики
 /memory - показать сохраненную информацию
+/forget <ключ> - удалить запись из памяти
 
 Also mention they can just chat normally — you'll create tasks and routines from conversation when it makes sense.
 

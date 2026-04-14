@@ -31,6 +31,7 @@ import {
     getTrackedStatNames, getLatestStat, getStatCount,
     getTodayStats,
     getAllUserMemoryRecords,
+    deleteUserMemory,
 } from "./userStore";
 import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
@@ -609,14 +610,26 @@ bot.onText(/\/memory/, async (msg) => {
         const userId = msg.from?.id;
         if (!userId) return;
 
-        const user = await getUser(userId);
-        if (!user) {
-            await bot.sendMessage(msg.chat.id, 'Ошибка: пользователь не найден.');
+        const records = await getAllUserMemoryRecords(userId);
+        const keys = Object.keys(records).sort();
+
+        if (keys.length === 0) {
+            await bot.sendMessage(msg.chat.id, '🧠 Пока нечего помнить.\n\nУдалить запись: `/forget <ключ>`', { parse_mode: 'Markdown' });
             return;
         }
 
-        const memoryText = JSON.stringify(user.memory, null, 2);
-        await bot.sendMessage(msg.chat.id, `🧠 Сохраненная информация:\n\`\`\`${memoryText}\`\`\``, {
+        const lines = keys.map(k => {
+            const rec = records[k];
+            const sameDay = Math.abs(rec.updatedAt.getTime() - rec.firstRecordedAt.getTime()) < 86_400_000;
+            const stamp = sameDay
+                ? `записано ${ageLabel(rec.firstRecordedAt)}`
+                : `впервые ${ageLabel(rec.firstRecordedAt)}, обновлено ${ageLabel(rec.updatedAt)}`;
+            return `• *${k}* _(${stamp})_\n  ${rec.value}`;
+        });
+
+        const body = lines.join('\n\n');
+        const footer = '\n\n_Удалить запись:_ `/forget <ключ>`';
+        await bot.sendMessage(msg.chat.id, `🧠 Сохранённая информация:\n\n${body}${footer}`, {
             parse_mode: 'Markdown'
         });
 
@@ -635,6 +648,41 @@ bot.onText(/\/memory/, async (msg) => {
         });
 
         console.log(result);
+    }
+});
+
+bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
+    try {
+        const userId = msg.from?.id;
+        if (!userId) return;
+
+        const key = match?.[1]?.trim();
+
+        if (!key) {
+            const records = await getAllUserMemoryRecords(userId);
+            const keys = Object.keys(records).sort();
+            if (keys.length === 0) {
+                await bot.sendMessage(msg.chat.id, '🧠 Нечего удалять — память пуста.');
+                return;
+            }
+            await bot.sendMessage(
+                msg.chat.id,
+                `🧠 Укажи ключ: \`/forget <ключ>\`\n\nДоступные ключи:\n${keys.map(k => `• \`${k}\``).join('\n')}`,
+                { parse_mode: 'Markdown' }
+            );
+            return;
+        }
+
+        const removed = await deleteUserMemory(userId, key);
+        if (removed) {
+            await bot.sendMessage(msg.chat.id, `🧠 Забыл \`${key}\`.`, { parse_mode: 'Markdown' });
+        } else {
+            await bot.sendMessage(msg.chat.id, `🧠 Ключа \`${key}\` не было в памяти.`, { parse_mode: 'Markdown' });
+        }
+
+    } catch (error) {
+        console.error('Error forgetting memory:', error);
+        await bot.sendMessage(msg.chat.id, 'Ошибка при удалении записи.');
     }
 });
 
@@ -687,6 +735,7 @@ bot.onText(/\/help/, async (msg) => {
 /tasks - показать задачи
 /stats - показать отслеживаемые статистики
 /memory - показать сохраненную информацию
+/forget <ключ> - удалить запись из памяти
 /help - эта справка`);
     }
 });
