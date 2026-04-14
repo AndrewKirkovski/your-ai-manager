@@ -30,6 +30,7 @@ import {
     addImageToCache,
     getTrackedStatNames, getLatestStat, getStatCount,
     getTodayStats,
+    getAllUserMemoryRecords,
 } from "./userStore";
 import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
@@ -87,6 +88,31 @@ initializeMediaParser({
 // Initialize stat tools with bot instance (for sending chart images)
 initStatTools(bot);
 
+function ageLabel(d: Date): string {
+    const ms = Date.now() - d.getTime();
+    if (!Number.isFinite(ms) || isNaN(ms)) return '?';
+    const days = Math.floor(ms / 86_400_000);
+    if (days >= 1) return `${days}d ago`;
+    const hours = Math.floor(ms / 3_600_000);
+    if (hours >= 1) return `${hours}h ago`;
+    const minutes = Math.max(0, Math.floor(ms / 60_000));
+    return `${minutes}m ago`;
+}
+
+function formatMemoryBlock(memory: Record<string, { value: string; firstRecordedAt: Date; updatedAt: Date }>): string {
+    const keys = Object.keys(memory);
+    if (keys.length === 0) return '{}';
+    const lines = keys.map(k => {
+        const rec = memory[k];
+        const sameDay = Math.abs(rec.updatedAt.getTime() - rec.firstRecordedAt.getTime()) < 86_400_000;
+        const stamp = sameDay
+            ? `recorded ${ageLabel(rec.firstRecordedAt)}`
+            : `first recorded ${ageLabel(rec.firstRecordedAt)}, updated ${ageLabel(rec.updatedAt)}`;
+        return `  ${k} [${stamp}]: ${rec.value}`;
+    });
+    return '\n' + lines.join('\n');
+}
+
 async function getCurrentInfo(userId: number): Promise<string> {
     const user = await getUser(userId);
     if (!user) throw new Error('Ошибка: пользователь не найден');
@@ -108,19 +134,21 @@ async function getCurrentInfo(userId: number): Promise<string> {
         // Don't let stat errors break the entire context
     }
 
+    const memoryRecords = await getAllUserMemoryRecords(userId);
+
     const Memory = `
 Goal: ${user.preferences.goal || 'not set'}
 
 Routines/Schedule:
 ${activeRoutines.map(r => `id: ${r.id} cron: ${r.cron} defaultAnnoyance: ${r.defaultAnnoyance} name: ${r.name} timesCompleted: ${r.stats.completed} timesFailed: ${r.stats.failed}`).join('\n') || 'no active routines'}
 
-Pending Tasks: 
+Pending Tasks:
 ${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'no active tasks'}
 
 Tasks that need replanning (AI must update these):
 ${replanningTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'none'}
 
-Memory: ${JSON.stringify(user.memory || {}, null, 2)}
+Memory (stale entries may not reflect current state — treat older facts with appropriate skepticism):${formatMemoryBlock(memoryRecords)}
 
 Today's stats: ${todayStatsStr}
         `
