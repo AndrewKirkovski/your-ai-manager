@@ -269,10 +269,13 @@ const stmts = {
     // Stat Entries
     insertStat: db.prepare('INSERT INTO stat_entries (user_id, name, value, unit, note, timestamp) VALUES (?, ?, ?, ?, ?, ?)'),
     getStatEntries: db.prepare<[number, string, string, string], StatRow>('SELECT * FROM stat_entries WHERE user_id = ? AND name = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC'),
+    getStatById: db.prepare<[number, number], StatRow>('SELECT * FROM stat_entries WHERE user_id = ? AND id = ?'),
     getStatNames: db.prepare<[number], StatNameRow>('SELECT DISTINCT name, unit FROM stat_entries WHERE user_id = ?'),
     getLatestStat: db.prepare<[number, string], StatRow>('SELECT * FROM stat_entries WHERE user_id = ? AND name = ? ORDER BY timestamp DESC, id DESC LIMIT 1'),
     countStatEntries: db.prepare<[number, string], CountRow>('SELECT COUNT(*) as count FROM stat_entries WHERE user_id = ? AND name = ?'),
     getTodayStats: db.prepare<[number, string], TodayStatRow>('SELECT name, SUM(value) as total, COUNT(*) as count, unit FROM stat_entries WHERE user_id = ? AND timestamp >= ? GROUP BY name'),
+    deleteStatById: db.prepare('DELETE FROM stat_entries WHERE user_id = ? AND id = ?'),
+    deleteStatRange: db.prepare('DELETE FROM stat_entries WHERE user_id = ? AND name = ? AND timestamp >= ? AND timestamp <= ?'),
 
     // LuxMed Accounts
     getLuxmedAccount: db.prepare<[number], { user_id: number; account_id: number; username: string; created_at: string }>('SELECT * FROM luxmed_accounts WHERE user_id = ?'),
@@ -617,8 +620,82 @@ export async function getRecentImages(userId: number, limit: number = 10): Promi
 
 // ============== STAT TRACKING ==============
 
-export async function addStatEntry(userId: number, name: string, value: number, unit?: string, note?: string, timestamp?: Date): Promise<void> {
-    stmts.insertStat.run(userId, name.toLowerCase(), value, unit ?? null, note ?? null, (timestamp ?? new Date()).toISOString());
+export async function addStatEntry(userId: number, name: string, value: number, unit?: string, note?: string, timestamp?: Date): Promise<number> {
+    const result = stmts.insertStat.run(userId, name.toLowerCase(), value, unit ?? null, note ?? null, (timestamp ?? new Date()).toISOString());
+    return Number(result.lastInsertRowid);
+}
+
+export type StatEntry = { id: number; name: string; value: number; unit?: string; note?: string; timestamp: Date };
+
+export async function addStatEntriesBatch(
+    userId: number,
+    entries: Array<{ name: string; value: number; unit?: string; note?: string; timestamp?: Date }>
+): Promise<Array<{ id: number; timestamp: string }>> {
+    const inserted: Array<{ id: number; timestamp: string }> = [];
+    const tx = db.transaction(() => {
+        for (const e of entries) {
+            const ts = (e.timestamp ?? new Date()).toISOString();
+            const result = stmts.insertStat.run(
+                userId,
+                e.name.toLowerCase(),
+                e.value,
+                e.unit ?? null,
+                e.note ?? null,
+                ts
+            );
+            inserted.push({ id: Number(result.lastInsertRowid), timestamp: ts });
+        }
+    });
+    tx();
+    return inserted;
+}
+
+export async function getStatEntryById(userId: number, id: number): Promise<StatEntry | undefined> {
+    const row = stmts.getStatById.get(userId, id);
+    if (!row) return undefined;
+    return {
+        id: row.id,
+        name: row.name,
+        value: row.value,
+        unit: row.unit ?? undefined,
+        note: row.note ?? undefined,
+        timestamp: new Date(row.timestamp),
+    };
+}
+
+export async function updateStatEntry(
+    userId: number,
+    id: number,
+    patch: { name?: string; value?: number; unit?: string | null; note?: string | null; timestamp?: Date }
+): Promise<boolean> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (patch.name !== undefined) { sets.push('name = ?'); params.push(patch.name.toLowerCase()); }
+    if (patch.value !== undefined) { sets.push('value = ?'); params.push(patch.value); }
+    if (patch.unit !== undefined) { sets.push('unit = ?'); params.push(patch.unit); }
+    if (patch.note !== undefined) { sets.push('note = ?'); params.push(patch.note); }
+    if (patch.timestamp !== undefined) { sets.push('timestamp = ?'); params.push(patch.timestamp.toISOString()); }
+    if (sets.length === 0) return false;
+    params.push(userId, id);
+    const result = db.prepare(`UPDATE stat_entries SET ${sets.join(', ')} WHERE user_id = ? AND id = ?`).run(...params);
+    return result.changes > 0;
+}
+
+export async function deleteStatEntriesByIds(userId: number, ids: number[]): Promise<number> {
+    let count = 0;
+    const tx = db.transaction(() => {
+        for (const id of ids) {
+            const result = stmts.deleteStatById.run(userId, id);
+            count += result.changes;
+        }
+    });
+    tx();
+    return count;
+}
+
+export async function deleteStatEntriesRange(userId: number, name: string, from: Date, to: Date): Promise<number> {
+    const result = stmts.deleteStatRange.run(userId, name.toLowerCase(), from.toISOString(), to.toISOString());
+    return result.changes;
 }
 
 export async function getStatEntries(userId: number, name: string, from?: Date, to?: Date): Promise<Array<{ id: number; name: string; value: number; unit?: string; note?: string; timestamp: Date }>> {

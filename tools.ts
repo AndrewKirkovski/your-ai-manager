@@ -40,7 +40,7 @@ import {
 } from "./tools.location";
 import { GetWeather } from "./tools.weather";
 import { AnalyzeImage } from "./tools.image";
-import { TrackStat, GetStatHistory, ListTrackedStats, GenerateStatChart } from "./tools.stats";
+import { TrackStat, GetStatHistory, GetStatEntry, UpdateStatEntry, DeleteStatEntry, ListTrackedStats, GenerateStatChart } from "./tools.stats";
 import {
     LuxmedLogin, LuxmedSearchSlots, LuxmedBookSlot, LuxmedCancelBooking,
     LuxmedMyBookings, LuxmedListCities, LuxmedListServices, LuxmedSetPreferences,
@@ -90,6 +90,9 @@ export const tools = {
     // Stat tracking tools
     TrackStat,
     GetStatHistory,
+    GetStatEntry,
+    UpdateStatEntry,
+    DeleteStatEntry,
     ListTrackedStats,
     GenerateStatChart,
     // LuxMed appointment tools
