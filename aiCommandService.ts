@@ -9,28 +9,28 @@
  */
 
 /**
- * Clean AI response by removing any XML-like tags that might slip through.
- * This is a safety net - the AI should use tools, not tags.
+ * Strip internal tags that must never reach the user (legacy command XML,
+ * <thinking>, <system>). Handles both fully closed and unclosed-at-end forms
+ * so partial chunks during streaming don't leak content before the closing tag.
  */
-function cleanAIResponse(text: string): string {
-    // Remove any AI command tags (legacy, shouldn't appear anymore)
-    let cleaned = text.replace(/<(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal)[^>]*>.*?<\/(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal)>/gs, '');
-
-    // Remove self-closing legacy tags
-    cleaned = cleaned.replace(/<(?:set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory)[^>]*\/>/g, '');
-
-    // Remove <thinking> tags (internal thoughts, not for user display)
-    cleaned = cleaned.replace(/<thinking>.*?<\/thinking>/gs, '');
-
-    // Remove <system> tags (injected timestamps, not for user display)
-    cleaned = cleaned.replace(/<system[^>]*>.*?<\/system>/gs, '');
-    // Also remove incomplete/unclosed <system> tags (e.g. from truncated responses)
-    cleaned = cleaned.replace(/<system[^>]*>.*$/gs, '');
-
-    // Clean up excessive whitespace
-    cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
-
+export function stripInternalTags(text: string): string {
+    const LEGACY = 'set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal';
+    let cleaned = text;
+    // Legacy command tags (paired + self-closing)
+    cleaned = cleaned.replace(new RegExp(`<(?:${LEGACY})[^>]*>[\\s\\S]*?<\\/(?:${LEGACY})>`, 'g'), '');
+    cleaned = cleaned.replace(new RegExp(`<(?:${LEGACY})[^>]*\\/>`, 'g'), '');
+    cleaned = cleaned.replace(new RegExp(`<(?:${LEGACY})[^>]*>[\\s\\S]*$`, 'g'), '');
+    // <thinking> — internal chain-of-thought (closed + unclosed)
+    cleaned = cleaned.replace(/<thinking>[\s\S]*?<\/thinking>/g, '');
+    cleaned = cleaned.replace(/<thinking>[\s\S]*$/g, '');
+    // <system> — metadata injected by the bot (closed + unclosed)
+    cleaned = cleaned.replace(/<system[^>]*>[\s\S]*?<\/system>/g, '');
+    cleaned = cleaned.replace(/<system[^>]*>[\s\S]*$/g, '');
     return cleaned;
+}
+
+function cleanAIResponse(text: string): string {
+    return stripInternalTags(text).replace(/\n{3,}/g, '\n\n').trim();
 }
 
 export class AICommandService {

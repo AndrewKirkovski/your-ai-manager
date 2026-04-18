@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import {AICommandService} from './aiCommandService';
+import {AICommandService, stripInternalTags} from './aiCommandService';
 import {addMessageToHistory, getRecentMessageHistory} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
@@ -78,13 +78,15 @@ export class AIService {
             // Function to update Telegram message during streaming
             async function updateTelegramMessage(isFinal = false) {
                 try {
-                    const stripped = aiResponseAccumulated.replace(/<system[^>]*>.*?<\/system>/gs, '').replace(/<system[^>]*>.*$/gs, '').trim();
+                    const stripped = stripInternalTags(aiResponseAccumulated).trim();
                     const contentToSend = isFinal ? stripped : stripped + ' ...';
 
-                    if(!aiResponseAccumulated.length) {
+                    if (!aiResponseAccumulated.length) {
                         console.warn('AI response is empty, not updating Telegram message');
                         return;
                     }
+                    // Early stream may be all <thinking>/<system> — no visible content yet
+                    if (!stripped.length) return;
 
                     if (!messageId) {
                         // Send initial message

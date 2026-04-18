@@ -2,6 +2,20 @@ import TelegramBot from 'node-telegram-bot-api';
 import { marked } from 'marked';
 import sanitizeHtml from 'sanitize-html';
 
+/** Tags whose content must NEVER reach the user (sanitize-html strips tag + children).
+ * htmlparser2 auto-closes unclosed tags at end-of-input, so partial chunks mid-stream
+ * (e.g. "<thinking>foo" with no closer yet) are also fully stripped.
+ * First entries are sanitize-html defaults — passing `nonTextTags` REPLACES the default
+ * list, so we must re-include them to keep script/style content stripping.
+ */
+const INTERNAL_TAGS = [
+    'style', 'script', 'textarea', 'option', 'noscript',
+    'thinking', 'system',
+    'set-routine', 'update-routine', 'delete-routine',
+    'set-task', 'update-task', 'task-complete', 'task-fail',
+    'update-memory', 'goal',
+];
+
 marked.setOptions({ breaks: true, gfm: true });
 
 /**
@@ -65,6 +79,7 @@ export function mdToTelegramHtml(text: string): string {
         allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
             'a', 'code', 'pre', 'blockquote', 'tg-emoji'],
         allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'] },
+        nonTextTags: INTERNAL_TAGS,
         transformTags: {
             'strong': 'b',
             'em': 'i',
@@ -147,6 +162,9 @@ export async function safeSendPlain(
     text: string,
     opts?: SendOpts,
 ): Promise<TelegramBot.Message | null> {
+    // For bot-authored text we can escape directly; if an AI-origin string ever
+    // sneaks in with internal tags, they'd render as visible `&lt;thinking&gt;...`
+    // rather than leak hidden content.
     const escaped = escHtml(text);
     const finalText = replaceUnicodeWithTgEmoji(escaped);
     const finalOpts: SendOpts = { parse_mode: 'HTML', ...opts };
