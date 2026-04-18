@@ -25,7 +25,6 @@ export interface AIStreamOptions {
 
 export interface AIStreamResult {
     message: string;
-    commandResults: string[];
     rawResponse: string;
     toolCalls?: ToolCallInfo[];
 }
@@ -227,8 +226,6 @@ export class AIService {
 
             // Final display tick: mdToTelegramHtml via safeEdit strips <system>/<thinking>/legacy
             // tags through sanitize-html's nonTextTags. No separate cleanup needed.
-            const message = aiResponseAccumulated;
-            const commandResults: string[] = [];
             await updateTelegramMessage(true);
 
             if (toolCalls.length > 0 && enableToolCalls) {
@@ -337,8 +334,7 @@ export class AIService {
             }
 
             return {
-                message,
-                commandResults,
+                message: aiResponseAccumulated,
                 rawResponse: aiResponseAccumulated,
                 toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
             };
@@ -361,7 +357,6 @@ ${error instanceof Error ? error.message : String(error)}
 
             return {
                 message: errorMessage,
-                commandResults: [],
                 rawResponse: errorMessage
             };
         }

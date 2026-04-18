@@ -46,6 +46,18 @@ export function stripInternalMarkers(text: string): string {
         .replace(/<\/thinking\s*>/gi, '');
 }
 
+/** HTML-escape a value for safe interpolation as DISPLAY content into bot-authored
+ * templates routed through `mdToTelegramHtml`. Without this, user/AI-controlled
+ * strings containing an `INTERNAL_TAGS` tag name (e.g. a routine named
+ * `<goal>oops</goal>`) get silently swallowed by sanitize-html's `nonTextTags` —
+ * user sees their content disappear. Escape at render boundaries (command
+ * handlers, luxmed notifications). NOT for AI-facing text where we want the tag
+ * removed entirely — use `stripSystemTags` there. */
+export function escapeHtml(s: string | number | null | undefined): string {
+    if (s == null) return '';
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /**
  * Telegram Premium custom emoji catalog — harvested from the user's own packs.
  * Each entry is a distinct visual; duplicates with the same `char` are DIFFERENT
