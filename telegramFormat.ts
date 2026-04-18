@@ -205,6 +205,10 @@ export function mdToTelegramHtml(text: string): string {
         allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
             'a', 'code', 'pre', 'blockquote', 'tg-emoji'],
         allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'] },
+        // Telegram HTML parse_mode only honors these schemes in <a href>. Tightening
+        // from sanitize-html's default (includes ftp/mailto) avoids spurious plain-
+        // text fallbacks when AI emits a mailto link and Telegram rejects the message.
+        allowedSchemes: ['http', 'https', 'tg', 'tme'],
         nonTextTags: INTERNAL_TAGS,
         transformTags: {
             'strong': 'b',
@@ -268,6 +272,8 @@ export async function safeEdit(
         console.error('[telegramFormat] editMessageText failed:', msg);
         if (finalOpts.parse_mode && msg.includes("can't parse entities")) {
             try {
+                // Same rationale as safeSend: use pre-conversion `text` so users
+                // don't see raw <tg-emoji>/<b> tags when HTML parsing fails.
                 const { parse_mode, ...rest } = finalOpts;
                 await bot.editMessageText(text, rest as EditOpts);
             } catch (retryErr) {
