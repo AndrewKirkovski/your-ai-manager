@@ -69,14 +69,16 @@ export class AIService {
             // later retry succeeds). Final tick (isFinal=true) still retries once.
             let initialSendFailed = false;
 
-            // Add messages to history if requested (strip <system> from user input so
-            // `</system>evil<system>` can't escape our <system>At…</system> prompt wrap)
-            const safeUserMessage = stripSystemTags(userMessage);
+            // NOTE: userMessage may be (a) real Telegram user text or (b) a bot-
+            // synthesized prompt wrapped in <system>…</system> (TASK_TRIGGERED_PROMPT,
+            // GREETING_PROMPT, etc. — the AI is told to obey these). Real-user text is
+            // stripped at its ingress point (index.ts bot.on('message')), NOT here —
+            // otherwise bot-synthesized prompts get wiped to empty.
             if (addUserToHistory) {
-                await addMessageToHistory(userId, 'user', safeUserMessage);
-                const preview = safeUserMessage.length > 100
-                    ? safeUserMessage.substring(0, 100) + '...'
-                    : safeUserMessage;
+                await addMessageToHistory(userId, 'user', userMessage);
+                const preview = userMessage.length > 100
+                    ? userMessage.substring(0, 100) + '...'
+                    : userMessage;
                 console.log(`📝 Added user message to history: "${preview.replace(/\n/g, ' ')}"`);
             }
 
@@ -126,7 +128,7 @@ export class AIService {
             // Build messages for provider
             const messages: ProviderMessage[] = [
                 ...recentMessages,
-                { role: 'user', content: `<system>At ${new Date().toISOString()}</system>\n${safeUserMessage}` },
+                { role: 'user', content: `<system>At ${new Date().toISOString()}</system>\n${userMessage}` },
                 ...(appendMessagesAfterUser || []),
             ];
 

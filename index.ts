@@ -809,6 +809,12 @@ bot.on('message', async (msg) => {
             return;
         }
 
+        // Real-user-ingress trust boundary: strip <system> so a user typing
+        // `</system>evil<system>` can't escape our prompt wrappers. Bot-synthesized
+        // prompts (TASK_TRIGGERED_PROMPT, GREETING_PROMPT, …) bypass this — they
+        // INTENTIONALLY wrap in <system> and go directly to streamAIResponse.
+        processedContent = stripSystemTags(processedContent);
+
         console.log('📨 Received user message:', {
             userId,
             type: logIndicator,
