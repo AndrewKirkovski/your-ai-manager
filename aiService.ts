@@ -65,6 +65,10 @@ export class AIService {
         try {
             let messageId: number | undefined;
             let lastSentContent: string = '';
+            // Guard against retrying the initial send on every throttled tick after
+            // a transient Telegram failure (would surface duplicate messages if a
+            // later retry succeeds). Final tick (isFinal=true) still retries once.
+            let initialSendFailed = false;
 
             // Add messages to history if requested
             if (addUserToHistory) {
@@ -89,18 +93,21 @@ export class AIService {
                     if (!stripped.length) return;
 
                     if (!messageId) {
-                        // Send initial message
+                        if (initialSendFailed && !isFinal) return;
                         const sentMessage = await safeSend(bot, userId, contentToSend);
-                        if (sentMessage) messageId = sentMessage.message_id;
+                        if (sentMessage) {
+                            messageId = sentMessage.message_id;
+                            lastSentContent = aiResponseAccumulated;
+                        } else {
+                            initialSendFailed = true;
+                        }
                     } else {
-                        // Update existing message
                         await safeEdit(bot, contentToSend, {
                             chat_id: userId,
                             message_id: messageId,
                         });
+                        lastSentContent = aiResponseAccumulated;
                     }
-
-                    lastSentContent = aiResponseAccumulated;
                 } catch (error) {
                     console.error('Failed to update message:', error);
                 }

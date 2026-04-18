@@ -177,9 +177,10 @@ export function replaceUnicodeWithTgEmoji(text: string): string {
     const alternation = chars.map(escapeForRegex).join('|');
     const combined = new RegExp(`(<tg-emoji\\s+emoji-id="[^"]*">[\\s\\S]*?<\\/tg-emoji>)|(${alternation})`, 'g');
 
-    return text.replace(combined, (_match, preserved: string | undefined, emoji: string | undefined) => {
+    return text.replace(combined, (match, preserved: string | undefined, emoji: string | undefined) => {
         if (preserved) return preserved;
-        const id = DEFAULT_TG_EMOJI_BY_CHAR.get(emoji!);
+        if (!emoji) return match;
+        const id = DEFAULT_TG_EMOJI_BY_CHAR.get(emoji);
         return `<tg-emoji emoji-id="${id}">${emoji}</tg-emoji>`;
     });
 }
@@ -237,6 +238,8 @@ export async function safeSend(
         console.error('[telegramFormat] sendMessage failed:', msg);
         if (finalOpts.parse_mode && msg.includes("can't parse entities")) {
             try {
+                // Fallback uses the PRE-conversion `text`, not the HTML finalText,
+                // so users don't see raw <tg-emoji>/<b> tags when HTML parsing fails.
                 return await bot.sendMessage(chatId, text);
             } catch (retryErr) {
                 console.error('[telegramFormat] plain-text fallback also failed:',

@@ -542,7 +542,7 @@ bot.onText(/\/routines/, async (msg) => {
         }
 
         const routineText = activeRoutines.map(r => `- ${r.name} (${formatCronHuman(r.cron)}, Annoyance: ${r.annoyance})`).join('\n');
-        await safeSend(bot, msg.chat.id, `🔗 Активные рутины:\n\n${routineText}`);
+        await safeSendPlain(bot, msg.chat.id, `🔗 Активные рутины:\n\n${routineText}`);
 
     } catch (error) {
         console.error('Error showing routines:', error);
@@ -582,7 +582,7 @@ bot.onText(/\/tasks/, async (msg) => {
         }
 
         const taskText = pendingTasks.map(t => `- ${t.name} (Next: ${formatDateHuman(t.pingAt)}, Annoyance: ${t.annoyance})`).join('\n');
-        await safeSend(bot, msg.chat.id, `📋 Активные задачи:\n\n${taskText}`);
+        await safeSendPlain(bot, msg.chat.id, `📋 Активные задачи:\n\n${taskText}`);
 
     } catch (error) {
         console.error('Error showing tasks:', error);
@@ -611,7 +611,7 @@ bot.onText(/\/memory/, async (msg) => {
         const keys = Object.keys(records).sort();
 
         if (keys.length === 0) {
-            await safeSend(bot, msg.chat.id, '🧠 Пока нечего помнить.\n\nУдалить запись: `/forget <ключ>`');
+            await safeSendPlain(bot, msg.chat.id, '🧠 Пока нечего помнить.\n\nУдалить запись: /forget <ключ>');
             return;
         }
 
@@ -621,12 +621,12 @@ bot.onText(/\/memory/, async (msg) => {
             const stamp = sameDay
                 ? `записано ${ageLabel(rec.firstRecordedAt)}`
                 : `впервые ${ageLabel(rec.firstRecordedAt)}, обновлено ${ageLabel(rec.updatedAt)}`;
-            return `• *${k}* _(${stamp})_\n  ${rec.value}`;
+            return `• ${k} (${stamp})\n  ${rec.value}`;
         });
 
         const body = lines.join('\n\n');
-        const footer = '\n\n_Удалить запись:_ `/forget <ключ>`';
-        await safeSend(bot, msg.chat.id, `🧠 Сохранённая информация:\n\n${body}${footer}`);
+        const footer = '\n\nУдалить запись: /forget <ключ>';
+        await safeSendPlain(bot, msg.chat.id, `🧠 Сохранённая информация:\n\n${body}${footer}`);
 
     } catch (error) {
         console.error('Error showing memory:', error);
@@ -660,19 +660,19 @@ bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
                 await bot.sendMessage(msg.chat.id, '🧠 Нечего удалять — память пуста.');
                 return;
             }
-            await safeSend(
+            await safeSendPlain(
                 bot,
                 msg.chat.id,
-                `🧠 Укажи ключ: \`/forget <ключ>\`\n\nДоступные ключи:\n${keys.map(k => `• \`${k}\``).join('\n')}`,
+                `🧠 Укажи ключ: /forget <ключ>\n\nДоступные ключи:\n${keys.map(k => `• ${k}`).join('\n')}`,
             );
             return;
         }
 
         const removed = await deleteUserMemory(userId, key);
         if (removed) {
-            await safeSend(bot, msg.chat.id, `🧠 Забыл \`${key}\`.`);
+            await safeSendPlain(bot, msg.chat.id, `🧠 Забыл: ${key}`);
         } else {
-            await safeSend(bot, msg.chat.id, `🧠 Ключа \`${key}\` не было в памяти.`);
+            await safeSendPlain(bot, msg.chat.id, `🧠 Ключа ${key} не было в памяти.`);
         }
 
     } catch (error) {
@@ -696,10 +696,10 @@ bot.onText(/\/stats/, async (msg) => {
             const latest = await getLatestStat(userId, s.name);
             const count = await getStatCount(userId, s.name);
             const lastVal = latest ? `${latest.value}${s.unit ? ' ' + s.unit : ''}` : '—';
-            return `• **${s.name}** — последнее: ${lastVal}, записей: ${count}`;
+            return `• ${s.name} — последнее: ${lastVal}, записей: ${count}`;
         }));
 
-        await safeSend(bot, msg.chat.id, `📊 Отслеживаемые статистики:\n\n${lines.join('\n')}`);
+        await safeSendPlain(bot, msg.chat.id, `📊 Отслеживаемые статистики:\n\n${lines.join('\n')}`);
     } catch (error) {
         console.error('Error showing stats:', error);
         await bot.sendMessage(msg.chat.id, 'Ошибка при загрузке статистик.');
@@ -743,20 +743,18 @@ bot.on('message', async (msg) => {
         const userId = msg.from?.id;
         if (!userId) return;
 
-        // TEMP emoji-harvest: log custom emoji IDs + sticker metadata so we can populate TG_EMOJI_CATALOG.
-        // Remove once catalog is stable.
-        const text = msg.text ?? msg.caption ?? '';
+        // TEMP emoji-harvest (remove after 2026-05-01): log custom emoji IDs +
+        // sticker metadata to populate TG_EMOJI_CATALOG in telegramFormat.ts.
+        const harvestText = msg.text ?? msg.caption ?? '';
         const ents = [...(msg.entities ?? []), ...(msg.caption_entities ?? [])];
-        const customEmojiEnts = ents.filter((e) => e.type === 'custom_emoji');
-        for (const e of customEmojiEnts) {
-            const ch = text.slice(e.offset, e.offset + e.length);
-            const id = (e as unknown as { custom_emoji_id?: string }).custom_emoji_id;
-            console.log(`[emoji-harvest] entity char="${ch}" id=${id} from userId=${userId}`);
+        for (const e of ents) {
+            if (e.type !== 'custom_emoji') continue;
+            const ch = harvestText.slice(e.offset, e.offset + e.length);
+            console.log(`[emoji-harvest] entity char="${ch}" id=${e.custom_emoji_id} from userId=${userId}`);
         }
         if (msg.sticker) {
             const s = msg.sticker;
-            const customId = (s as unknown as { custom_emoji_id?: string }).custom_emoji_id;
-            console.log(`[emoji-harvest] sticker emoji=${s.emoji ?? ''} set=${s.set_name ?? ''} fileUnique=${s.file_unique_id} customEmojiId=${customId ?? '-'} animated=${s.is_animated} video=${s.is_video}`);
+            console.log(`[emoji-harvest] sticker emoji=${s.emoji ?? ''} set=${s.set_name ?? ''} fileUnique=${s.file_unique_id} customEmojiId=${s.custom_emoji_id ?? '-'} animated=${s.is_animated} video=${s.is_video}`);
         }
 
         // Skip commands - they have their own handlers

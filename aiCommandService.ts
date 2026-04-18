@@ -15,17 +15,29 @@
  */
 export function stripInternalTags(text: string): string {
     const LEGACY = 'set-routine|update-routine|delete-routine|set-task|update-task|task-complete|task-fail|update-memory|goal';
+    const patterns: RegExp[] = [
+        // Legacy command tags: paired + self-closing + unclosed-at-end
+        new RegExp(`<(?:${LEGACY})[^>]*>[\\s\\S]*?<\\/(?:${LEGACY})>`, 'gi'),
+        new RegExp(`<(?:${LEGACY})[^>]*\\/>`, 'gi'),
+        new RegExp(`<(?:${LEGACY})[^>]*>[\\s\\S]*$`, 'gi'),
+        // <thinking> — closed + unclosed + orphan-close (from nested lazy-match leftovers)
+        /<thinking>[\s\S]*?<\/thinking>/gi,
+        /<thinking>[\s\S]*$/gi,
+        /<\/thinking>/gi,
+        // <system> — closed + unclosed + orphan-close
+        /<system[^>]*>[\s\S]*?<\/system>/gi,
+        /<system[^>]*>[\s\S]*$/gi,
+        /<\/system>/gi,
+        new RegExp(`<\\/(?:${LEGACY})>`, 'gi'),
+    ];
+    // Loop until no more matches — handles nested tags (e.g. <thinking>a<thinking>b</thinking>c</thinking>).
+    // Bounded at 8 passes so a pathological input can't hang the streaming tick.
     let cleaned = text;
-    // Legacy command tags (paired + self-closing)
-    cleaned = cleaned.replace(new RegExp(`<(?:${LEGACY})[^>]*>[\\s\\S]*?<\\/(?:${LEGACY})>`, 'g'), '');
-    cleaned = cleaned.replace(new RegExp(`<(?:${LEGACY})[^>]*\\/>`, 'g'), '');
-    cleaned = cleaned.replace(new RegExp(`<(?:${LEGACY})[^>]*>[\\s\\S]*$`, 'g'), '');
-    // <thinking> — internal chain-of-thought (closed + unclosed)
-    cleaned = cleaned.replace(/<thinking>[\s\S]*?<\/thinking>/g, '');
-    cleaned = cleaned.replace(/<thinking>[\s\S]*$/g, '');
-    // <system> — metadata injected by the bot (closed + unclosed)
-    cleaned = cleaned.replace(/<system[^>]*>[\s\S]*?<\/system>/g, '');
-    cleaned = cleaned.replace(/<system[^>]*>[\s\S]*$/g, '');
+    for (let i = 0; i < 8; i++) {
+        const before = cleaned;
+        for (const re of patterns) cleaned = cleaned.replace(re, '');
+        if (cleaned === before) break;
+    }
     return cleaned;
 }
 
