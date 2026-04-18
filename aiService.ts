@@ -1,9 +1,8 @@
 import TelegramBot from 'node-telegram-bot-api';
-import {AICommandService, stripInternalTags} from './aiCommandService';
 import {addMessageToHistory, getRecentMessageHistory} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
-import {safeSend, safeEdit} from './telegramFormat';
+import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers} from './telegramFormat';
 import type {AIProvider, ProviderMessage, ToolCallInfo, ToolDefinition, ThinkingBlockData} from './aiProvider';
 
 export interface AIStreamOptions {
@@ -70,19 +69,21 @@ export class AIService {
             // later retry succeeds). Final tick (isFinal=true) still retries once.
             let initialSendFailed = false;
 
-            // Add messages to history if requested
+            // Add messages to history if requested (strip <system> from user input so
+            // `</system>evil<system>` can't escape our <system>At…</system> prompt wrap)
+            const safeUserMessage = stripSystemTags(userMessage);
             if (addUserToHistory) {
-                await addMessageToHistory(userId, 'user', userMessage);
-                const preview = userMessage.length > 100
-                    ? userMessage.substring(0, 100) + '...'
-                    : userMessage;
+                await addMessageToHistory(userId, 'user', safeUserMessage);
+                const preview = safeUserMessage.length > 100
+                    ? safeUserMessage.substring(0, 100) + '...'
+                    : safeUserMessage;
                 console.log(`📝 Added user message to history: "${preview.replace(/\n/g, ' ')}"`);
             }
 
             // Function to update Telegram message during streaming
             async function updateTelegramMessage(isFinal = false) {
                 try {
-                    const stripped = stripInternalTags(aiResponseAccumulated).trim();
+                    const stripped = stripInternalMarkers(aiResponseAccumulated).trim();
                     const contentToSend = isFinal ? stripped : stripped + ' ...';
 
                     if (!aiResponseAccumulated.length) {
@@ -125,7 +126,7 @@ export class AIService {
             // Build messages for provider
             const messages: ProviderMessage[] = [
                 ...recentMessages,
-                { role: 'user', content: `<system>At ${new Date().toISOString()}</system>\n${userMessage}` },
+                { role: 'user', content: `<system>At ${new Date().toISOString()}</system>\n${safeUserMessage}` },
                 ...(appendMessagesAfterUser || []),
             ];
 
@@ -222,11 +223,10 @@ export class AIService {
 
             historyResponseAccumulated = aiResponseAccumulated;
 
-            // Process AI commands and return clean response
-            const {message, commandResults} = await AICommandService.processAIResponse(userId, aiResponseAccumulated);
-
-            const finalContent = message + (commandResults.length > 0 ? '\n\n' + commandResults.join('\n') : '');
-            aiResponseAccumulated = finalContent;
+            // Final display tick: mdToTelegramHtml via safeEdit strips <system>/<thinking>/legacy
+            // tags through sanitize-html's nonTextTags. No separate cleanup needed.
+            const message = aiResponseAccumulated;
+            const commandResults: string[] = [];
             await updateTelegramMessage(true);
 
             if (toolCalls.length > 0 && enableToolCalls) {
@@ -240,7 +240,7 @@ export class AIService {
                 const newAppendedMessages: ProviderMessage[] = [...(appendMessagesAfterUser || [])];
                 newAppendedMessages.push({
                     role: 'assistant',
-                    content: aiResponseAccumulated,
+                    content: stripSystemTags(aiResponseAccumulated),
                     toolCalls: toolCalls.map(tc => ({
                         id: tc.id,
                         name: tc.name,
@@ -297,7 +297,7 @@ export class AIService {
                             content: JSON.stringify(result),
                         });
 
-                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nOutput: ${historySummary}\n`;
+                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nOutput: ${stripSystemTags(historySummary)}\n`;
                     } catch (error) {
                         const errorMsg = error instanceof Error ? error.message : String(error);
                         console.log(`   ❌ Error: ${errorMsg}\n`);
@@ -308,7 +308,7 @@ export class AIService {
                             content: JSON.stringify({error: errorMsg}),
                         });
 
-                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nError: ${errorMsg}\n`;
+                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nError: ${stripSystemTags(errorMsg)}\n`;
                     }
                 }
 
@@ -326,10 +326,11 @@ export class AIService {
             }
 
             if(addAssistantToHistory) {
-                await addMessageToHistory(userId, 'assistant', historyResponseAccumulated);
-                const preview = historyResponseAccumulated.length > 100
-                    ? historyResponseAccumulated.substring(0, 100) + '...'
-                    : historyResponseAccumulated;
+                const safeAssistantContent = stripSystemTags(historyResponseAccumulated);
+                await addMessageToHistory(userId, 'assistant', safeAssistantContent);
+                const preview = safeAssistantContent.length > 100
+                    ? safeAssistantContent.substring(0, 100) + '...'
+                    : safeAssistantContent;
                 console.log(`📝 Added assistant message to history: "${preview.replace(/\n/g, ' ')}"`);
             }
 
@@ -372,7 +373,9 @@ ${error instanceof Error ? error.message : String(error)}
 
         return recentMessages.map(m => ({
             role: m.role as 'user' | 'assistant',
-            content: `<system>At ${formatDateHuman(m.timestamp)}</system>\n${m.content}`
+            // Defense-in-depth: legacy rows predating the write-time strip may still carry
+            // stray <system> chars from past user inputs. Strip on read too.
+            content: `<system>At ${formatDateHuman(m.timestamp)}</system>\n${stripSystemTags(m.content)}`
         }));
     }
 }

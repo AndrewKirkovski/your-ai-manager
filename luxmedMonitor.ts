@@ -14,7 +14,7 @@ import {
     getActiveLuxmedMonitorings, updateLuxmedMonitoringLastCheck,
     deactivateLuxmedMonitoring, LuxmedMonitoringConfig,
 } from './userStore';
-import { safeSendPlain } from './telegramFormat';
+import { safeSend } from './telegramFormat';
 
 let botInstance: TelegramBot | null = null;
 
@@ -87,7 +87,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
         deactivateLuxmedMonitoring(config.id, config.userId);
         autobookFailureNotified.delete(config.id);
         if (botInstance) {
-            safeSendPlain(botInstance, config.userId,
+            safeSend(botInstance, config.userId,
                 `⏰ LuxMed мониторинг "${config.serviceName}" истёк (период до ${config.dateTo}). Деактивирован.`
             ).catch(() => {});
         }
@@ -133,7 +133,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
 
                 if (botInstance) {
                     const msg = `✅ LuxMed: Записал автоматически!\n\n${formatTermForNotification(best)}\n\nСервис: ${config.serviceName}`;
-                    safeSendPlain(botInstance, config.userId, msg).catch(() => {});
+                    safeSend(botInstance, config.userId, msg).catch(() => {});
                 }
             } catch (err) {
                 const errMsg = err instanceof Error ? err.message : String(err);
@@ -144,7 +144,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
                     autobookFailureNotified.add(config.id);
                     const slotsText = filtered.slice(0, 5).map((t, i) => `${i + 1}. ${formatTermForNotification(t)}`).join('\n');
                     const msg = `⚠️ LuxMed: Нашёл слоты для "${config.serviceName}", но автозапись не удалась (${errMsg}).\n\nДоступные слоты:\n${slotsText}\n\nЗапиши вручную через бот. Мониторинг продолжает попытки автозаписи.`;
-                    safeSendPlain(botInstance, config.userId, msg).catch(() => {});
+                    safeSend(botInstance, config.userId, msg).catch(() => {});
                 }
             }
         } else {
@@ -154,7 +154,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
             if (botInstance) {
                 const slotsText = filtered.slice(0, 5).map((t, i) => `${i + 1}. ${formatTermForNotification(t)}`).join('\n');
                 const msg = `🔔 LuxMed: Нашёл ${filtered.length} слот(ов) для "${config.serviceName}"!\n\n${slotsText}${filtered.length > 5 ? `\n... и ещё ${filtered.length - 5}` : ''}\n\nИспользуй LuxmedSearchSlots чтобы найти и записаться.`;
-                safeSendPlain(botInstance, config.userId, msg).catch(() => {});
+                safeSend(botInstance, config.userId, msg).catch(() => {});
             }
         }
     } catch (err) {
@@ -165,7 +165,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
             deactivateLuxmedMonitoring(config.id, config.userId);
             autobookFailureNotified.delete(config.id);
             if (botInstance) {
-                safeSendPlain(botInstance, config.userId,
+                safeSend(botInstance, config.userId,
                     `❌ LuxMed: Ошибка авторизации. Мониторинг "${config.serviceName}" деактивирован. Обнови логин/пароль.`
                 ).catch(() => {});
             }

@@ -2,6 +2,7 @@ import {getAllUsers, getMessageHistoryWithIds, MessageHistory, compactMessages} 
 import {formatDateHuman} from './dateUtils';
 import {HISTORY_COMPACTION_PROMPT} from './constants';
 import type {AIProvider} from './aiProvider';
+import {stripSystemTags} from './telegramFormat';
 
 /** A run of consecutive assistant messages with their DB IDs */
 type CompactableRun = {
@@ -64,17 +65,22 @@ async function summarizeRun(
     provider: AIProvider,
     model: string,
 ): Promise<string> {
+    // Strip <system> from each message body so a leaked tag in historical content
+    // can't forge a fake system directive in the summarizer's prompt.
     const messagesText = run.messages
-        .map(m => `[${formatDateHuman(m.timestamp)}] ${m.content}`)
+        .map(m => `[${formatDateHuman(m.timestamp)}] ${stripSystemTags(m.content)}`)
         .join('\n\n---\n\n');
 
     const prompt = HISTORY_COMPACTION_PROMPT(dateRange, messagesText);
 
-    return provider.completeChat({
+    const summary = await provider.completeChat({
         model,
         maxTokens: 800,
         messages: [{ role: 'user', content: prompt }],
     });
+    // Strip the summary too — if the summarizer echoes any <system> from input it
+    // would nest inside our own <system>Compacted…</system> wrapper.
+    return stripSystemTags(summary);
 }
 
 /**

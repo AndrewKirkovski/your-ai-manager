@@ -18,6 +18,34 @@ const INTERNAL_TAGS = [
 
 marked.setOptions({ breaks: true, gfm: true });
 
+/** Narrow strip for `<system>` tags only — applied at trust boundaries
+ * (user ingress, history read, compaction I/O, recursion context) to prevent
+ * user- or tool-origin `<system>` content from escaping our `<system>At …</system>`
+ * prompt wrapper. Case-insensitive, attrs-tolerant, handles closed/unclosed/orphan
+ * forms. Bounded loop defends against nested/layered forgeries. */
+export function stripSystemTags(text: string): string {
+    let out = text;
+    for (let i = 0; i < 4; i++) {
+        const before = out;
+        out = out.replace(/<system\b[^>]*>[\s\S]*?<\/system>/gi, '');
+        out = out.replace(/<system\b[^>]*>[\s\S]*$/gi, '');
+        out = out.replace(/<\/system\s*>/gi, '');
+        if (out === before) break;
+    }
+    return out;
+}
+
+/** Streaming-tick visibility gate only. Strips `<system>` AND `<thinking>` so
+ * mid-stream buffers that are currently all-thinking don't emit empty placeholders
+ * every 500 ms. Final display still runs through `mdToTelegramHtml`, which strips
+ * the same tags plus legacy command XML via sanitize-html's `nonTextTags`. */
+export function stripInternalMarkers(text: string): string {
+    return stripSystemTags(text)
+        .replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, '')
+        .replace(/<thinking\b[^>]*>[\s\S]*$/gi, '')
+        .replace(/<\/thinking\s*>/gi, '');
+}
+
 /**
  * Telegram Premium custom emoji catalog — harvested from the user's own packs.
  * Each entry is a distinct visual; duplicates with the same `char` are DIFFERENT
@@ -160,10 +188,6 @@ export function tgEmojiPromptBlock(): string {
     ].join('\n');
 }
 
-function escHtml(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
 /** Wrap mapped unicode emoji in <tg-emoji> tags in a single pass.
  * - Longest-first alternation so ZWJ sequences (e.g. 😵‍💫) match before their base (😵).
  * - Existing <tg-emoji> blocks are preserved verbatim (no double-wrap).
@@ -285,37 +309,3 @@ export async function safeEdit(
     }
 }
 
-/**
- * Send a plain-text message with tg-emoji upgrades — no Markdown parsing.
- * Use for bot-authored literal strings (commands, notifications) where `_` or `*`
- * must NOT be interpreted as emphasis.
- */
-export async function safeSendPlain(
-    bot: TelegramBot,
-    chatId: number | string,
-    text: string,
-    opts?: SendOpts,
-): Promise<TelegramBot.Message | null> {
-    // For bot-authored text we can escape directly; if an AI-origin string ever
-    // sneaks in with internal tags, they'd render as visible `&lt;thinking&gt;...`
-    // rather than leak hidden content.
-    const escaped = escHtml(text);
-    const finalText = replaceUnicodeWithTgEmoji(escaped);
-    const finalOpts: SendOpts = { parse_mode: 'HTML', ...opts };
-    try {
-        return await bot.sendMessage(chatId, finalText, finalOpts);
-    } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error('[telegramFormat] sendMessage (plain) failed:', msg);
-        if (finalOpts.parse_mode && msg.includes("can't parse entities")) {
-            try {
-                return await bot.sendMessage(chatId, text);
-            } catch (retryErr) {
-                console.error('[telegramFormat] plain-text fallback also failed:',
-                    retryErr instanceof Error ? retryErr.message : retryErr);
-                return null;
-            }
-        }
-        return null;
-    }
-}

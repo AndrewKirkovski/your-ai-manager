@@ -35,7 +35,7 @@ import {
 } from "./userStore";
 import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
-import {safeSend, safeSendPlain} from './telegramFormat';
+import {safeSend, stripSystemTags} from './telegramFormat';
 import {runHistoryCompaction} from './historyCompaction';
 import {runStyleScan} from './styleScan';
 import {CronExpressionParser} from 'cron-parser';
@@ -110,7 +110,9 @@ function formatMemoryBlock(memory: Record<string, { value: string; firstRecorded
         const stamp = sameDay
             ? `recorded ${ageLabel(rec.firstRecordedAt)}`
             : `first recorded ${ageLabel(rec.firstRecordedAt)}, updated ${ageLabel(rec.updatedAt)}`;
-        return `  ${k} [${stamp}]: ${rec.value}`;
+        // Keys and values can be AI-written via UpdateMemory tool — strip <system> so
+        // this block can't self-inject fake system messages when spliced into the prompt.
+        return `  ${stripSystemTags(k)} [${stamp}]: ${stripSystemTags(rec.value)}`;
     });
     return '\n' + lines.join('\n');
 }
@@ -130,7 +132,7 @@ async function getCurrentInfo(userId: number): Promise<string> {
     try {
         const todayStats = await getTodayStats(userId);
         if (todayStats.length > 0) {
-            todayStatsStr = todayStats.map(s => `${s.name}: ${s.total}${s.unit ? ' ' + s.unit : ''} (${s.count} entries)`).join(', ');
+            todayStatsStr = todayStats.map(s => `${stripSystemTags(s.name)}: ${s.total}${s.unit ? ' ' + stripSystemTags(s.unit) : ''} (${s.count} entries)`).join(', ');
         }
     } catch (e) {
         // Don't let stat errors break the entire context
@@ -138,17 +140,19 @@ async function getCurrentInfo(userId: number): Promise<string> {
 
     const memoryRecords = await getAllUserMemoryRecords(userId);
 
+    // Goal / routine-name / task-name are AI- or user-writable free text. Strip
+    // <system> before interpolation so they can't forge fake system directives.
     const Memory = `
-Goal: ${user.preferences.goal || 'not set'}
+Goal: ${stripSystemTags(user.preferences.goal || 'not set')}
 
 Routines/Schedule:
-${activeRoutines.map(r => `id: ${r.id} cron: ${r.cron} defaultAnnoyance: ${r.defaultAnnoyance} name: ${r.name} timesCompleted: ${r.stats.completed} timesFailed: ${r.stats.failed}`).join('\n') || 'no active routines'}
+${activeRoutines.map(r => `id: ${r.id} cron: ${r.cron} defaultAnnoyance: ${r.defaultAnnoyance} name: ${stripSystemTags(r.name)} timesCompleted: ${r.stats.completed} timesFailed: ${r.stats.failed}`).join('\n') || 'no active routines'}
 
 Pending Tasks:
-${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'no active tasks'}
+${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${stripSystemTags(t.name)}`).join('\n') || 'no active tasks'}
 
 Tasks that need replanning (AI must update these):
-${replanningTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${t.name}`).join('\n') || 'none'}
+${replanningTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${stripSystemTags(t.name)}`).join('\n') || 'none'}
 
 Memory (stale entries may not reflect current state — treat older facts with appropriate skepticism):${formatMemoryBlock(memoryRecords)}
 
@@ -398,9 +402,9 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
             // Show current goal
             const user = await getUser(userId);
             if (user && user.preferences.goal) {
-                await bot.sendMessage(msg.chat.id, `🎯 Твоя текущая цель: "${user.preferences.goal}"\n\nИспользуй /goal <новая цель> чтобы изменить`);
+                await safeSend(bot, msg.chat.id, `🎯 Твоя текущая цель: "${user.preferences.goal}"\n\nИспользуй /goal <новая цель> чтобы изменить`);
             } else {
-                await bot.sendMessage(msg.chat.id, `🎯 У тебя пока нет установленной цели\n\nИспользуй /goal <твоя цель> чтобы установить`);
+                await safeSend(bot, msg.chat.id, `🎯 У тебя пока нет установленной цели\n\nИспользуй /goal <твоя цель> чтобы установить`);
             }
             return;
         }
@@ -524,7 +528,7 @@ bot.onText(/\/routines/, async (msg) => {
 
         const user = await getUser(userId);
         if (!user) {
-            await bot.sendMessage(msg.chat.id, 'Ошибка: пользователь не найден.');
+            await safeSend(bot, msg.chat.id, 'Ошибка: пользователь не найден.');
             return;
         }
 
@@ -537,12 +541,12 @@ bot.onText(/\/routines/, async (msg) => {
         }));
 
         if (activeRoutines.length === 0) {
-            await bot.sendMessage(msg.chat.id, 'У тебя пока нет активных рутин.');
+            await safeSend(bot, msg.chat.id, 'У тебя пока нет активных рутин.');
             return;
         }
 
         const routineText = activeRoutines.map(r => `- ${r.name} (${formatCronHuman(r.cron)}, Annoyance: ${r.annoyance})`).join('\n');
-        await safeSendPlain(bot, msg.chat.id, `🔗 Активные рутины:\n\n${routineText}`);
+        await safeSend(bot, msg.chat.id, `🔗 Активные рутины:\n\n${routineText}`);
 
     } catch (error) {
         console.error('Error showing routines:', error);
@@ -569,7 +573,7 @@ bot.onText(/\/tasks/, async (msg) => {
 
         const user = await getUser(userId);
         if (!user) {
-            await bot.sendMessage(msg.chat.id, 'Ошибка: пользователь не найден.');
+            await safeSend(bot, msg.chat.id, 'Ошибка: пользователь не найден.');
             return;
         }
 
@@ -577,12 +581,12 @@ bot.onText(/\/tasks/, async (msg) => {
         const pendingTasks = tasks.filter(t => t.status === 'pending');
 
         if (pendingTasks.length === 0) {
-            await bot.sendMessage(msg.chat.id, 'У тебя пока нет активных задач.');
+            await safeSend(bot, msg.chat.id, 'У тебя пока нет активных задач.');
             return;
         }
 
         const taskText = pendingTasks.map(t => `- ${t.name} (Next: ${formatDateHuman(t.pingAt)}, Annoyance: ${t.annoyance})`).join('\n');
-        await safeSendPlain(bot, msg.chat.id, `📋 Активные задачи:\n\n${taskText}`);
+        await safeSend(bot, msg.chat.id, `📋 Активные задачи:\n\n${taskText}`);
 
     } catch (error) {
         console.error('Error showing tasks:', error);
@@ -611,7 +615,7 @@ bot.onText(/\/memory/, async (msg) => {
         const keys = Object.keys(records).sort();
 
         if (keys.length === 0) {
-            await safeSendPlain(bot, msg.chat.id, '🧠 Пока нечего помнить.\n\nУдалить запись: /forget <ключ>');
+            await safeSend(bot, msg.chat.id, '🧠 Пока нечего помнить.\n\nУдалить запись: /forget <ключ>');
             return;
         }
 
@@ -626,7 +630,7 @@ bot.onText(/\/memory/, async (msg) => {
 
         const body = lines.join('\n\n');
         const footer = '\n\nУдалить запись: /forget <ключ>';
-        await safeSendPlain(bot, msg.chat.id, `🧠 Сохранённая информация:\n\n${body}${footer}`);
+        await safeSend(bot, msg.chat.id, `🧠 Сохранённая информация:\n\n${body}${footer}`);
 
     } catch (error) {
         console.error('Error showing memory:', error);
@@ -657,10 +661,10 @@ bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
             const records = await getAllUserMemoryRecords(userId);
             const keys = Object.keys(records).sort();
             if (keys.length === 0) {
-                await bot.sendMessage(msg.chat.id, '🧠 Нечего удалять — память пуста.');
+                await safeSend(bot, msg.chat.id, '🧠 Нечего удалять — память пуста.');
                 return;
             }
-            await safeSendPlain(
+            await safeSend(
                 bot,
                 msg.chat.id,
                 `🧠 Укажи ключ: /forget <ключ>\n\nДоступные ключи:\n${keys.map(k => `• ${k}`).join('\n')}`,
@@ -670,14 +674,14 @@ bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
 
         const removed = await deleteUserMemory(userId, key);
         if (removed) {
-            await safeSendPlain(bot, msg.chat.id, `🧠 Забыл: ${key}`);
+            await safeSend(bot, msg.chat.id, `🧠 Забыл: ${key}`);
         } else {
-            await safeSendPlain(bot, msg.chat.id, `🧠 Ключа ${key} не было в памяти.`);
+            await safeSend(bot, msg.chat.id, `🧠 Ключа ${key} не было в памяти.`);
         }
 
     } catch (error) {
         console.error('Error forgetting memory:', error);
-        await bot.sendMessage(msg.chat.id, 'Ошибка при удалении записи.');
+        await safeSend(bot, msg.chat.id, 'Ошибка при удалении записи.');
     }
 });
 
@@ -688,7 +692,7 @@ bot.onText(/\/stats/, async (msg) => {
 
         const statNames = await getTrackedStatNames(userId);
         if (statNames.length === 0) {
-            await bot.sendMessage(msg.chat.id, 'Пока нет отслеживаемых статистик. Просто скажи мне что-то вроде "выпил 500мл воды" или "настроение 7/10".');
+            await safeSend(bot, msg.chat.id, 'Пока нет отслеживаемых статистик. Просто скажи мне что-то вроде "выпил 500мл воды" или "настроение 7/10".');
             return;
         }
 
@@ -699,10 +703,10 @@ bot.onText(/\/stats/, async (msg) => {
             return `• ${s.name} — последнее: ${lastVal}, записей: ${count}`;
         }));
 
-        await safeSendPlain(bot, msg.chat.id, `📊 Отслеживаемые статистики:\n\n${lines.join('\n')}`);
+        await safeSend(bot, msg.chat.id, `📊 Отслеживаемые статистики:\n\n${lines.join('\n')}`);
     } catch (error) {
         console.error('Error showing stats:', error);
-        await bot.sendMessage(msg.chat.id, 'Ошибка при загрузке статистик.');
+        await safeSend(bot, msg.chat.id, 'Ошибка при загрузке статистик.');
     }
 });
 
@@ -723,7 +727,7 @@ bot.onText(/\/help/, async (msg) => {
         console.log(result);
     } catch (error) {
         console.error('Error showing help:', error);
-        await bot.sendMessage(msg.chat.id, `Доступные команды:
+        await safeSend(bot, msg.chat.id, `Доступные команды:
 /goal - установить цель
 /cleargoal - очистить цель
 /routines - показать активные рутины
@@ -776,7 +780,8 @@ bot.on('message', async (msg) => {
 
             if (parsed.error && !parsed.content) {
                 // Complete failure - notify user
-                await bot.sendMessage(
+                await safeSend(
+                    bot,
                     msg.chat.id,
                     'Could not process this media. Please try sending text instead.'
                 );
