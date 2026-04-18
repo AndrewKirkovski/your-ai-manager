@@ -743,8 +743,8 @@ bot.on('message', async (msg) => {
         const userId = msg.from?.id;
         if (!userId) return;
 
-        // TEMP emoji-harvest: log custom emoji IDs + sticker metadata so we can populate TG_EMOJI map.
-        // Remove once map is populated.
+        // TEMP emoji-harvest: log custom emoji IDs + sticker metadata so we can populate TG_EMOJI_CATALOG.
+        // Remove once catalog is stable.
         const text = msg.text ?? msg.caption ?? '';
         const ents = [...(msg.entities ?? []), ...(msg.caption_entities ?? [])];
         const customEmojiEnts = ents.filter((e) => e.type === 'custom_emoji');

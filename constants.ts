@@ -1,3 +1,5 @@
+import { tgEmojiPromptBlock } from './telegramFormat';
+
 export const CHARACTER_PROMPT = `
 CRITICAL: ONLY OUTPUT YOUR MESSAGE AS IF SPEAKING ALOUD, NEVER SPEAK FOR THE USER
 
@@ -182,6 +184,8 @@ ${MEMORY_PROMPT}
 ${MEDIA_UNDERSTANDING_PROMPT}
 
 ${STAT_TRACKING_PROMPT}
+
+${tgEmojiPromptBlock()}
 
 RULES:
 1. All times Warsaw timezone (Europe/Warsaw), convert to ISO for tools
