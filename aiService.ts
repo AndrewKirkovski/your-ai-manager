@@ -3,6 +3,7 @@ import {AICommandService} from './aiCommandService';
 import {addMessageToHistory, getRecentMessageHistory} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
+import {safeSend, safeEdit} from './telegramFormat';
 import type {AIProvider, ProviderMessage, ToolCallInfo, ToolDefinition, ThinkingBlockData} from './aiProvider';
 
 export interface AIStreamOptions {
@@ -87,16 +88,13 @@ export class AIService {
 
                     if (!messageId) {
                         // Send initial message
-                        const sentMessage = await bot.sendMessage(userId, contentToSend, {
-                            parse_mode: 'Markdown',
-                        });
-                        messageId = sentMessage.message_id;
+                        const sentMessage = await safeSend(bot, userId, contentToSend);
+                        if (sentMessage) messageId = sentMessage.message_id;
                     } else {
                         // Update existing message
-                        await bot.editMessageText(contentToSend, {
+                        await safeEdit(bot, contentToSend, {
                             chat_id: userId,
                             message_id: messageId,
-                            parse_mode: 'Markdown',
                         });
                     }
 
@@ -347,9 +345,7 @@ export class AIService {
 ${error instanceof Error ? error.message : String(error)}
 \`\`\`
             `;
-            await bot.sendMessage(userId, errorMessage, {
-                parse_mode: 'Markdown',
-            });
+            await safeSend(bot, userId, errorMessage);
 
             return {
                 message: errorMessage,

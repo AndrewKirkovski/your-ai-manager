@@ -35,6 +35,7 @@ import {
 } from "./userStore";
 import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
+import {safeSend, safeSendPlain} from './telegramFormat';
 import {runHistoryCompaction} from './historyCompaction';
 import {runStyleScan} from './styleScan';
 import {CronExpressionParser} from 'cron-parser';
@@ -541,9 +542,7 @@ bot.onText(/\/routines/, async (msg) => {
         }
 
         const routineText = activeRoutines.map(r => `- ${r.name} (${formatCronHuman(r.cron)}, Annoyance: ${r.annoyance})`).join('\n');
-        await bot.sendMessage(msg.chat.id, `🔗 Активные рутины:\n\n${routineText}`, {
-            parse_mode: 'Markdown'
-        });
+        await safeSend(bot, msg.chat.id, `🔗 Активные рутины:\n\n${routineText}`);
 
     } catch (error) {
         console.error('Error showing routines:', error);
@@ -583,9 +582,7 @@ bot.onText(/\/tasks/, async (msg) => {
         }
 
         const taskText = pendingTasks.map(t => `- ${t.name} (Next: ${formatDateHuman(t.pingAt)}, Annoyance: ${t.annoyance})`).join('\n');
-        await bot.sendMessage(msg.chat.id, `📋 Активные задачи:\n\n${taskText}`, {
-            parse_mode: 'Markdown'
-        });
+        await safeSend(bot, msg.chat.id, `📋 Активные задачи:\n\n${taskText}`);
 
     } catch (error) {
         console.error('Error showing tasks:', error);
@@ -614,7 +611,7 @@ bot.onText(/\/memory/, async (msg) => {
         const keys = Object.keys(records).sort();
 
         if (keys.length === 0) {
-            await bot.sendMessage(msg.chat.id, '🧠 Пока нечего помнить.\n\nУдалить запись: `/forget <ключ>`', { parse_mode: 'Markdown' });
+            await safeSend(bot, msg.chat.id, '🧠 Пока нечего помнить.\n\nУдалить запись: `/forget <ключ>`');
             return;
         }
 
@@ -629,9 +626,7 @@ bot.onText(/\/memory/, async (msg) => {
 
         const body = lines.join('\n\n');
         const footer = '\n\n_Удалить запись:_ `/forget <ключ>`';
-        await bot.sendMessage(msg.chat.id, `🧠 Сохранённая информация:\n\n${body}${footer}`, {
-            parse_mode: 'Markdown'
-        });
+        await safeSend(bot, msg.chat.id, `🧠 Сохранённая информация:\n\n${body}${footer}`);
 
     } catch (error) {
         console.error('Error showing memory:', error);
@@ -665,19 +660,19 @@ bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
                 await bot.sendMessage(msg.chat.id, '🧠 Нечего удалять — память пуста.');
                 return;
             }
-            await bot.sendMessage(
+            await safeSend(
+                bot,
                 msg.chat.id,
                 `🧠 Укажи ключ: \`/forget <ключ>\`\n\nДоступные ключи:\n${keys.map(k => `• \`${k}\``).join('\n')}`,
-                { parse_mode: 'Markdown' }
             );
             return;
         }
 
         const removed = await deleteUserMemory(userId, key);
         if (removed) {
-            await bot.sendMessage(msg.chat.id, `🧠 Забыл \`${key}\`.`, { parse_mode: 'Markdown' });
+            await safeSend(bot, msg.chat.id, `🧠 Забыл \`${key}\`.`);
         } else {
-            await bot.sendMessage(msg.chat.id, `🧠 Ключа \`${key}\` не было в памяти.`, { parse_mode: 'Markdown' });
+            await safeSend(bot, msg.chat.id, `🧠 Ключа \`${key}\` не было в памяти.`);
         }
 
     } catch (error) {
@@ -704,7 +699,7 @@ bot.onText(/\/stats/, async (msg) => {
             return `• **${s.name}** — последнее: ${lastVal}, записей: ${count}`;
         }));
 
-        await bot.sendMessage(msg.chat.id, `📊 Отслеживаемые статистики:\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+        await safeSend(bot, msg.chat.id, `📊 Отслеживаемые статистики:\n\n${lines.join('\n')}`);
     } catch (error) {
         console.error('Error showing stats:', error);
         await bot.sendMessage(msg.chat.id, 'Ошибка при загрузке статистик.');
@@ -747,6 +742,22 @@ bot.on('message', async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
+
+        // TEMP emoji-harvest: log custom emoji IDs + sticker metadata so we can populate TG_EMOJI map.
+        // Remove once map is populated.
+        const text = msg.text ?? msg.caption ?? '';
+        const ents = [...(msg.entities ?? []), ...(msg.caption_entities ?? [])];
+        const customEmojiEnts = ents.filter((e) => e.type === 'custom_emoji');
+        for (const e of customEmojiEnts) {
+            const ch = text.slice(e.offset, e.offset + e.length);
+            const id = (e as unknown as { custom_emoji_id?: string }).custom_emoji_id;
+            console.log(`[emoji-harvest] entity char="${ch}" id=${id} from userId=${userId}`);
+        }
+        if (msg.sticker) {
+            const s = msg.sticker;
+            const customId = (s as unknown as { custom_emoji_id?: string }).custom_emoji_id;
+            console.log(`[emoji-harvest] sticker emoji=${s.emoji ?? ''} set=${s.set_name ?? ''} fileUnique=${s.file_unique_id} customEmojiId=${customId ?? '-'} animated=${s.is_animated} video=${s.is_video}`);
+        }
 
         // Skip commands - they have their own handlers
         if (msg.text?.startsWith('/')) return;
