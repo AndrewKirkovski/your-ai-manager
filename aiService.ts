@@ -29,6 +29,22 @@ export interface AIStreamResult {
     toolCalls?: ToolCallInfo[];
 }
 
+/** Recursively strip <system> from all string leaves in a tool-result value.
+ * External data (web search snippets, LuxMed doctor/clinic names, geocoded
+ * addresses) reaches the next-turn provider message via tool_result content;
+ * without this, a `</system>` in any of those fields could escape our
+ * <system>At…</system> wrapper in the following turn. */
+function deepStripSystemTagsInResult(value: unknown): unknown {
+    if (typeof value === 'string') return stripSystemTags(value);
+    if (Array.isArray(value)) return value.map(deepStripSystemTagsInResult);
+    if (value && typeof value === 'object') {
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value)) out[k] = deepStripSystemTagsInResult(v);
+        return out;
+    }
+    return value;
+}
+
 export class AIService {
     /**
      * Unified function to handle AI streaming responses with tool calling support
@@ -293,7 +309,7 @@ export class AIService {
                         newAppendedMessages.push({
                             role: 'tool_result',
                             toolCallId: toolCall.id,
-                            content: JSON.stringify(result),
+                            content: JSON.stringify(deepStripSystemTagsInResult(result)),
                         });
 
                         historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nOutput: ${stripSystemTags(historySummary)}\n`;

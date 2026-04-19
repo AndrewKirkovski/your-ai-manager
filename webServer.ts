@@ -2,12 +2,44 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount } from './userStore';
+import { textify, stripSystemTags } from './telegramFormat';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
+
+// Auth gate. Set WEB_AUTH_TOKEN in env — clients must send `Authorization: Bearer <token>`
+// or include `?token=<token>` in the query. Without WEB_AUTH_TOKEN set, requests from
+// non-loopback IPs are rejected (keeps local dev easy while blocking LAN access on Docker).
+// The LuxMed webhook `/api/luxmed/monitoring-callback` is exempt (own shared-secret path
+// TBD; for now it's unauthenticated since it's Docker-network-only via service DNS).
+const AUTH_TOKEN = process.env.WEB_AUTH_TOKEN || '';
+if (!AUTH_TOKEN) {
+    console.warn('⚠️  WEB_AUTH_TOKEN not set — /api/* is loopback-only. LAN access will be rejected.');
+}
+app.use((req, res, next) => {
+    // Static files and the LuxMed webhook bypass auth.
+    if (!req.path.startsWith('/api/') || req.path === '/api/luxmed/monitoring-callback') {
+        return next();
+    }
+    if (AUTH_TOKEN) {
+        const header = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+        const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
+        if (header !== AUTH_TOKEN && queryToken !== AUTH_TOKEN) {
+            return res.status(401).json({ error: 'Unauthorized' });
+        }
+        return next();
+    }
+    // No token configured — allow loopback only.
+    const ip = req.ip || req.socket.remoteAddress || '';
+    const loopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+    if (!loopback) {
+        return res.status(401).json({ error: 'Unauthorized — set WEB_AUTH_TOKEN for non-loopback access' });
+    }
+    next();
+});
 
 // Express 5 types params as string | string[] — extract first string safely
 function param(req: Request, name: string): string {
@@ -73,7 +105,9 @@ app.patch('/api/users/:id/tasks/:taskId', async (req: Request, res: Response) =>
         const updates = req.body;
 
         await updateUserTask(userId, taskId, (task) => {
-            if (updates.name !== undefined) task.name = updates.name;
+            // Symmetric with tool-call path (tools.tasks.ts:UpdateTask) — admin edits
+            // must textify user-controlled name to match what the AI would write.
+            if (updates.name !== undefined) task.name = textify(updates.name);
             if (updates.status !== undefined) task.status = updates.status;
             if (updates.annoyance !== undefined) task.annoyance = updates.annoyance;
             if (updates.pingAt !== undefined) task.pingAt = new Date(updates.pingAt);
@@ -94,7 +128,8 @@ app.patch('/api/users/:id/memory/:key', async (req: Request, res: Response) => {
         const key = param(req, 'key');
         const { value } = req.body;
 
-        await updateUserMemory(userId, key, value);
+        // Symmetric with tool-call path (tools.memory.ts:UpdateMemory).
+        await updateUserMemory(userId, textify(key), textify(value));
         res.json({ success: true });
     } catch (error) {
         console.error('Error updating memory:', error);
@@ -109,7 +144,9 @@ app.patch('/api/users/:id/messages/:messageId', async (req: Request, res: Respon
         const messageId = parseInt(param(req, 'messageId'));
         const { content } = req.body;
 
-        const updated = updateMessageById(userId, messageId, content);
+        // Strip <system> from admin-edited message content — same rule as the
+        // getRecentMessages read-time wrap defense.
+        const updated = updateMessageById(userId, messageId, stripSystemTags(content ?? ''));
         if (!updated) {
             return res.status(404).json({ error: 'Message not found' });
         }
@@ -139,6 +176,9 @@ app.post('/api/luxmed/monitoring-callback', (req: Request, res: Response) => {
 });
 
 const PORT = process.env.WEB_PORT || 3000;
+// Bind 0.0.0.0 so Docker port publish works + the LuxMed sidecar webhook path
+// is reachable via `http://bot:3000/...`. Protection comes from the auth gate
+// above — not from the bind address.
 app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`🌐 Web UI available at http://localhost:${PORT}`);
 });

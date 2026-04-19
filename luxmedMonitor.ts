@@ -176,21 +176,33 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
     }
 }
 
+// Overlap guard: N monitorings × ~32s upper bound (30s sidecar timeout + 2s
+// delay) can exceed the 10-min cron interval. Skip overlapping ticks.
+let cycleRunning = false;
 export async function runLuxmedMonitoringCycle(): Promise<void> {
-    const monitorings = getActiveLuxmedMonitorings();
-    if (monitorings.length === 0) return;
+    if (cycleRunning) {
+        console.warn('[LuxMed Monitor] Previous cycle still running, skipping this tick');
+        return;
+    }
+    cycleRunning = true;
+    try {
+        const monitorings = getActiveLuxmedMonitorings();
+        if (monitorings.length === 0) return;
 
-    console.log(`[LuxMed Monitor] Checking ${monitorings.length} active monitoring(s)...`);
+        console.log(`[LuxMed Monitor] Checking ${monitorings.length} active monitoring(s)...`);
 
-    // Clear english doctor cache each cycle (refreshes every 10 min)
-    englishDoctorCache.clear();
+        // Clear english doctor cache each cycle (refreshes every 10 min)
+        englishDoctorCache.clear();
 
-    // Process sequentially to avoid rate limiting
-    for (const config of monitorings) {
-        await processMonitoring(config);
-        // Small delay between checks to be gentle on the API
-        if (monitorings.length > 1) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
+        // Process sequentially to avoid rate limiting
+        for (const config of monitorings) {
+            await processMonitoring(config);
+            // Small delay between checks to be gentle on the API
+            if (monitorings.length > 1) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
         }
+    } finally {
+        cycleRunning = false;
     }
 }

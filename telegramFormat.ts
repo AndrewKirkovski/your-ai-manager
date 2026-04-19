@@ -276,6 +276,27 @@ export function mdToTelegramHtml(text: string): string {
 type SendOpts = TelegramBot.SendMessageOptions;
 type EditOpts = TelegramBot.EditMessageTextOptions;
 
+/** Telegram hard-limits a single sendMessage to 4096 chars. Markdown → HTML
+ * expansion (`<b>`, entities like `&amp;`) makes the rendered text longer than
+ * the raw AI output, so we can't trust AI maxTokens alone. Split on whitespace
+ * (prefer paragraph boundaries) when needed. Returns the last-sent Message. */
+const TELEGRAM_MAX = 4000; // conservative; leaves room for trailing ` ...`
+function splitForTelegram(text: string, limit = TELEGRAM_MAX): string[] {
+    if (text.length <= limit) return [text];
+    const chunks: string[] = [];
+    let remaining = text;
+    while (remaining.length > limit) {
+        let splitAt = remaining.lastIndexOf('\n\n', limit);
+        if (splitAt <= 0) splitAt = remaining.lastIndexOf('\n', limit);
+        if (splitAt <= 0) splitAt = remaining.lastIndexOf(' ', limit);
+        if (splitAt <= 0) splitAt = limit;
+        chunks.push(remaining.slice(0, splitAt).trim());
+        remaining = remaining.slice(splitAt).trim();
+    }
+    if (remaining) chunks.push(remaining);
+    return chunks;
+}
+
 /** Send a message with HTML parse_mode, falling back to plain text on parse failure. */
 export async function safeSend(
     bot: TelegramBot,
@@ -285,6 +306,24 @@ export async function safeSend(
 ): Promise<TelegramBot.Message | null> {
     const finalText = (!opts || !('parse_mode' in opts)) ? mdToTelegramHtml(text) : text;
     const finalOpts: SendOpts = { parse_mode: 'HTML', ...opts };
+    // Split at 4096-char boundary. Each chunk goes through the same fallback
+    // path. Return the LAST chunk's Message so callers can track message_id.
+    if (finalText.length > TELEGRAM_MAX) {
+        const chunks = splitForTelegram(finalText);
+        let last: TelegramBot.Message | null = null;
+        for (const chunk of chunks) {
+            try {
+                last = await bot.sendMessage(chatId, chunk, finalOpts);
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                console.error('[telegramFormat] chunked sendMessage failed:', msg);
+                if (finalOpts.parse_mode && msg.includes("can't parse entities")) {
+                    try { last = await bot.sendMessage(chatId, chunk); } catch { /* best effort */ }
+                }
+            }
+        }
+        return last;
+    }
     try {
         return await bot.sendMessage(chatId, finalText, finalOpts);
     } catch (err) {

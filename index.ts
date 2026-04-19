@@ -35,7 +35,7 @@ import {
 } from "./userStore";
 import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
-import {safeSend, stripSystemTags} from './telegramFormat';
+import {safeSend, stripSystemTags, textify} from './telegramFormat';
 import {runHistoryCompaction} from './historyCompaction';
 import {runStyleScan} from './styleScan';
 import {CronExpressionParser} from 'cron-parser';
@@ -47,6 +47,42 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN!;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
 const OPEN_AI_ENDPOINT = process.env.OPEN_AI_ENDPOINT;
 const OPEN_AI_MODEL = process.env.OPENAI_MODEL || 'gpt-4-1106-preview';
+
+// Owner-allowlist so random Telegram users can't DM the bot and consume the
+// owner's API quota. Comma-separated list of Telegram numeric user IDs.
+// If unset, ALL users are allowed (legacy/dev default — log a warning).
+const ALLOWED_USER_IDS = new Set(
+    (process.env.ALLOWED_USER_IDS || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(Number)
+        .filter(n => Number.isFinite(n))
+);
+if (ALLOWED_USER_IDS.size === 0) {
+    console.warn('⚠️  ALLOWED_USER_IDS not set — any Telegram user can use the bot.');
+}
+function isAllowedUser(userId: number | undefined): boolean {
+    if (userId == null) return false;
+    if (ALLOWED_USER_IDS.size === 0) return true; // legacy: allow all
+    return ALLOWED_USER_IDS.has(userId);
+}
+
+// Per-user serialization. Without this, double-tap voice messages or rapid text
+// bursts spawn parallel streams that race on history reads/writes (each sees
+// stale context and both call addMessageToHistory out of order). Queue per-user
+// so the second message waits for the first response to finish.
+const userQueues = new Map<number, Promise<void>>();
+function enqueuePerUser(userId: number, work: () => Promise<void>): Promise<void> {
+    const prev = userQueues.get(userId) ?? Promise.resolve();
+    const next = prev.catch(() => { /* swallow prior error so chain continues */ }).then(work);
+    userQueues.set(userId, next);
+    // Cleanup map entry when chain settles so it doesn't leak.
+    next.finally(() => {
+        if (userQueues.get(userId) === next) userQueues.delete(userId);
+    });
+    return next;
+}
 
 // AI provider selection
 const AI_PROVIDER_TYPE = (process.env.AI_PROVIDER || 'openai') as 'openai' | 'anthropic';
@@ -233,8 +269,17 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
     }
 }
 
-// Check routines and tasks every minute
+// Check routines and tasks every minute. `isRunning` guard prevents overlap
+// if a slow AI call from a previous tick hasn't finished yet (otherwise two
+// ticks can stack and double-fire reminders).
+let routineTickRunning = false;
 cron.schedule('* * * * *', async () => {
+    if (routineTickRunning) {
+        console.warn('⏰ Previous routine tick still running, skipping this cycle');
+        return;
+    }
+    routineTickRunning = true;
+    try {
     const now = getCurrentTime();
     const users = await getAllUsers();
 
@@ -265,10 +310,11 @@ cron.schedule('* * * * *', async () => {
                 if (timeSinceLastFire <= 60000) { // Within 1 minute
                     console.log('🔔 Firing routine to create task:', routine);
 
-                    // Create new task instance from routine
+                    // Create new task instance from routine. Re-textify name in case
+                    // the routine was created before textify-at-write landed.
                     const newTask: Task = {
                         id: generateShortId(),
-                        name: routine.name,
+                        name: textify(routine.name),
                         routineId: routine.id,
                         requiresAction: routine.requiresAction,
                         status: 'pending',
@@ -356,6 +402,14 @@ cron.schedule('* * * * *', async () => {
             }
         }
     }
+    } catch (error) {
+        // Outer try/catch around getAllUsers + iteration. Without this, a DB
+        // error would reject the async cron callback (node-cron swallows it
+        // but the unhandled rejection handler would see it).
+        console.error('❌ Routine tick fatal error:', error instanceof Error ? error.message : String(error));
+    } finally {
+        routineTickRunning = false;
+    }
 });
 
 // Compact history once per hour
@@ -390,6 +444,7 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
+        if (!isAllowedUser(userId)) return;
 
         const newGoal = match?.[1]?.trim();
 
@@ -461,6 +516,7 @@ bot.onText(/\/cleargoal/, async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
+        if (!isAllowedUser(userId)) return;
 
         let user = await getUser(userId);
         if (!user) {
@@ -520,6 +576,7 @@ bot.onText(/\/routines/, async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
+        if (!isAllowedUser(userId)) return;
 
         const user = await getUser(userId);
         if (!user) {
@@ -565,6 +622,7 @@ bot.onText(/\/tasks/, async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
+        if (!isAllowedUser(userId)) return;
 
         const user = await getUser(userId);
         if (!user) {
@@ -605,6 +663,7 @@ bot.onText(/\/memory/, async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
+        if (!isAllowedUser(userId)) return;
 
         const records = await getAllUserMemoryRecords(userId);
         const keys = Object.keys(records).sort();
@@ -649,6 +708,7 @@ bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
+        if (!isAllowedUser(userId)) return;
 
         const key = match?.[1]?.trim();
 
@@ -684,6 +744,7 @@ bot.onText(/\/stats/, async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
+        if (!isAllowedUser(userId)) return;
 
         const statNames = await getTrackedStatNames(userId);
         if (statNames.length === 0) {
@@ -738,10 +799,17 @@ bot.onText(/\/help/, async (msg) => {
 
 // Handle regular messages (now with AI command processing AND media support)
 bot.on('message', async (msg) => {
-    try {
-        const userId = msg.from?.id;
-        if (!userId) return;
+    const userId = msg.from?.id;
+    if (!userId) return;
+    if (!isAllowedUser(userId)) {
+        console.warn(`[auth] Rejected message from non-allowlisted userId=${userId}`);
+        return;
+    }
 
+    // Serialize per user — rapid bursts otherwise spawn parallel streams
+    // that race on history reads/writes.
+    await enqueuePerUser(userId, async () => {
+    try {
         // TEMP emoji-harvest (remove after 2026-05-01): log custom emoji IDs +
         // sticker metadata to populate TG_EMOJI_CATALOG in telegramFormat.ts.
         const harvestText = msg.text ?? msg.caption ?? '';
@@ -894,9 +962,26 @@ bot.on('message', async (msg) => {
 
         console.log(result);
     }
+    });
 });
 
 // Handle bot errors
 bot.on('error', (error) => {
     console.error('Bot error:', error);
+});
+
+// Polling errors are the most common runtime failure (network hiccup, 429).
+// Without an explicit listener node-telegram-bot-api surfaces warnings and
+// some Node versions treat it as unhandled.
+bot.on('polling_error', (error) => {
+    console.error('Bot polling_error:', error instanceof Error ? error.message : error);
+});
+
+// Last-resort handlers — a floating promise rejection from any tool, cron,
+// or stream callback should be logged and swallowed, not take down the bot.
+process.on('unhandledRejection', (reason) => {
+    console.error('[unhandledRejection]', reason instanceof Error ? reason.stack : reason);
+});
+process.on('uncaughtException', (error) => {
+    console.error('[uncaughtException]', error instanceof Error ? error.stack : error);
 });

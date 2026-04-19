@@ -536,14 +536,21 @@ export async function removeUserTask(userId: number, taskId: string): Promise<vo
 }
 
 // ============== MEMORY HELPERS ==============
+// Keys are normalized to lowercase at storage/lookup boundary so AI-supplied
+// keys like "Foo" and "foo" map to the same row. Prior: case-sensitive PK
+// caused silent duplicate rows and getUserMemory('Foo') missing 'foo'.
+
+function normalizeMemoryKey(key: string): string {
+    return key.toLowerCase();
+}
 
 export async function updateUserMemory(userId: number, key: string, value: string): Promise<void> {
     const now = new Date().toISOString();
-    stmts.upsertMemory.run(userId, key, value, now, now);
+    stmts.upsertMemory.run(userId, normalizeMemoryKey(key), value, now, now);
 }
 
 export async function getUserMemory(userId: number, key: string): Promise<string | undefined> {
-    const row = stmts.getMemoryByKey.get(userId, key);
+    const row = stmts.getMemoryByKey.get(userId, normalizeMemoryKey(key));
     return row?.value;
 }
 
@@ -557,7 +564,7 @@ export async function getAllUserMemory(userId: number): Promise<Record<string, s
 }
 
 export async function getUserMemoryRecord(userId: number, key: string): Promise<MemoryRecord | undefined> {
-    const row = stmts.getMemoryByKey.get(userId, key);
+    const row = stmts.getMemoryByKey.get(userId, normalizeMemoryKey(key));
     if (!row) return undefined;
     return {
         value: row.value,
@@ -580,7 +587,7 @@ export async function getAllUserMemoryRecords(userId: number): Promise<Record<st
 }
 
 export async function deleteUserMemory(userId: number, key: string): Promise<boolean> {
-    const result = stmts.deleteMemory.run(userId, key);
+    const result = stmts.deleteMemory.run(userId, normalizeMemoryKey(key));
     return result.changes > 0;
 }
 
@@ -907,13 +914,20 @@ export function deleteUserAddress(userId: number, label: string): void {
 }
 
 // ============== LUXMED CLINICS CACHE ==============
+// Names normalized to lowercase so "LUXMED Al. Jana Pawła II" and "Luxmed Al.
+// Jana Pawła II" map to the same row (UNIQUE(name) was otherwise sensitive
+// to casing drift from the sidecar).
+
+function normalizeClinicName(name: string): string {
+    return name.toLowerCase().trim();
+}
 
 export function saveLuxmedClinic(name: string, address: string | null, lat: number | null, lng: number | null, cityId: number): void {
-    stmts.upsertClinic.run(name, address, lat, lng, cityId, new Date().toISOString());
+    stmts.upsertClinic.run(normalizeClinicName(name), address, lat, lng, cityId, new Date().toISOString());
 }
 
 export function getLuxmedClinicByName(name: string): { id: number; name: string; lat: number; lng: number } | null {
-    const row = stmts.getClinicByName.get(name);
+    const row = stmts.getClinicByName.get(normalizeClinicName(name));
     return row && row.lat != null && row.lng != null ? { id: row.id, name: row.name, lat: row.lat, lng: row.lng } : null;
 }
 
