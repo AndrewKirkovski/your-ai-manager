@@ -339,7 +339,7 @@ export const LuxmedSetPreferences: Tool = {
     execute: async (args: { userId: number } & Partial<LuxmedPreferences> & { default_city_id?: number; default_city_name?: string; preferred_time_from?: string; preferred_time_to?: string; home_lat?: number; home_lng?: number; max_transit_minutes?: number }) => {
         const prefs: LuxmedPreferences = {
             defaultCityId: args.default_city_id,
-            defaultCityName: args.default_city_name,
+            defaultCityName: textify(args.default_city_name),
             preferredTimeFrom: args.preferred_time_from,
             preferredTimeTo: args.preferred_time_to,
             homeLat: args.home_lat,

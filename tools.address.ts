@@ -1,6 +1,7 @@
 import { Tool } from './tool.types';
 import { geocode, isGoogleMapsConfigured } from './googleMapsService';
 import { saveUserAddress, getUserAddresses, deleteUserAddress } from './userStore';
+import { textify } from './telegramFormat';
 
 export const SaveAddress: Tool = {
     name: 'SaveAddress',
@@ -16,13 +17,15 @@ export const SaveAddress: Tool = {
         required: ['label'],
     },
     execute: async (args: { userId: number; label: string; address?: string; lat?: number; lng?: number }) => {
+        const label = textify(args.label);
+        const rawAddress = textify(args.address);
         if (args.lat != null && args.lng != null) {
-            const address = args.address || `${args.lat.toFixed(4)}, ${args.lng.toFixed(4)}`;
-            saveUserAddress(args.userId, args.label, address, args.lat, args.lng);
-            return { success: true, message: `Address "${args.label}" saved: ${address}` };
+            const address = rawAddress || `${args.lat.toFixed(4)}, ${args.lng.toFixed(4)}`;
+            saveUserAddress(args.userId, label, address, args.lat, args.lng);
+            return { success: true, message: `Address "${label}" saved: ${address}` };
         }
 
-        if (!args.address) {
+        if (!rawAddress) {
             return { success: false, message: 'Provide either an address string or lat/lng coordinates.' };
         }
 
@@ -30,14 +33,14 @@ export const SaveAddress: Tool = {
             return { success: false, message: 'Google Maps API key not configured — cannot geocode address.' };
         }
 
-        const place = await geocode(args.address);
+        const place = await geocode(rawAddress);
         if (!place) {
-            return { success: false, message: `Could not find location: "${args.address}". Try a more specific address.` };
+            return { success: false, message: `Could not find location: "${rawAddress}". Try a more specific address.` };
         }
 
-        saveUserAddress(args.userId, args.label, place.formattedAddress, place.lat, place.lng);
-        console.log(`[Address] Saved "${args.label}" for user ${args.userId}: ${place.formattedAddress} (${place.lat}, ${place.lng})`);
-        return { success: true, message: `Address "${args.label}" saved: ${place.formattedAddress}` };
+        saveUserAddress(args.userId, label, place.formattedAddress, place.lat, place.lng);
+        console.log(`[Address] Saved "${label}" for user ${args.userId}: ${place.formattedAddress} (${place.lat}, ${place.lng})`);
+        return { success: true, message: `Address "${label}" saved: ${place.formattedAddress}` };
     },
 };
 
@@ -74,7 +77,10 @@ export const DeleteAddress: Tool = {
         required: ['label'],
     },
     execute: async (args: { userId: number; label: string }) => {
-        deleteUserAddress(args.userId, args.label);
-        return { success: true, message: `Address "${args.label}" deleted.` };
+        // Same lookup-symmetry concern as memory: saved label is textified, so
+        // lookup key must be too — otherwise markup in the arg would miss.
+        const label = textify(args.label);
+        deleteUserAddress(args.userId, label);
+        return { success: true, message: `Address "${label}" deleted.` };
     },
 };

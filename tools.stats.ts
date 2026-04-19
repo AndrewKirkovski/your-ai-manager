@@ -201,12 +201,13 @@ export const GetStatHistory: Tool = {
         required: ['name']
     },
     execute: async (args: { userId: number; name: string; period?: string; from?: string; to?: string; limit?: number }) => {
+        const name = textify(args.name);
         const period = args.period || 'week';
         const { from, to } = getPeriodRange(period, args.from, args.to);
-        const entries = await getStatEntries(args.userId, args.name, from, to);
+        const entries = await getStatEntries(args.userId, name, from, to);
 
         if (entries.length === 0) {
-            return { success: true, entries: [], count: 0, message: `No "${args.name}" entries found for period "${period}".` };
+            return { success: true, entries: [], count: 0, message: `No "${name}" entries found for period "${period}".` };
         }
 
         const values = entries.map(e => e.value);
@@ -217,7 +218,7 @@ export const GetStatHistory: Tool = {
 
         return {
             success: true,
-            stat: args.name.toLowerCase(),
+            stat: name.toLowerCase(),
             period,
             count: entries.length,
             shown: shown.length,
@@ -440,18 +441,19 @@ export const DeleteStatEntry: Tool = {
         }
 
         if (args.name && (args.period || args.from)) {
+            const name = textify(args.name);
             if (args.period === 'all' && !args.confirm) {
                 return {
                     success: false,
-                    message: `DeleteStatEntry: period="all" wipes every "${args.name}" entry ever recorded. Refusing without confirm=true. Ask the user to confirm explicitly, then retry with confirm=true.`,
+                    message: `DeleteStatEntry: period="all" wipes every "${name}" entry ever recorded. Refusing without confirm=true. Ask the user to confirm explicitly, then retry with confirm=true.`,
                 };
             }
             const { from, to } = getPeriodRange(args.period || 'custom', args.from, args.to);
-            const deleted = await deleteStatEntriesRange(args.userId, args.name, from, to);
+            const deleted = await deleteStatEntriesRange(args.userId, name, from, to);
             return {
                 success: true,
                 mode: 'range',
-                name: args.name.toLowerCase(),
+                name: name.toLowerCase(),
                 from: from.toISOString(),
                 to: to.toISOString(),
                 deletedCount: deleted,
@@ -520,14 +522,15 @@ export const GenerateStatChart: Tool = {
             return { success: false, message: 'Chart generation not available (bot not initialized).' };
         }
 
+        const name = textify(args.name);
         const period = args.period || 'all';
         const chartType = (args.chart_type || 'line') as 'line' | 'bar';
         const { from, to } = getPeriodRange(period, args.from, args.to);
-        const entries = await getStatEntries(args.userId, args.name, from, to);
+        const entries = await getStatEntries(args.userId, name, from, to);
 
         if (entries.length === 0) {
             const rangeDesc = period === 'custom' ? `${args.from} — ${args.to || 'now'}` : period;
-            return { success: false, message: `No "${args.name}" data found for ${rangeDesc}.` };
+            return { success: false, message: `No "${name}" data found for ${rangeDesc}.` };
         }
 
         const bucketUnit = (args.bucket || 'day') as 'day' | 'week' | 'month';
@@ -563,7 +566,7 @@ export const GenerateStatChart: Tool = {
 
         const unit = entries[0].unit;
         const bucketLabel = bucketUnit !== 'day' ? ` (${bucketUnit}ly ${agg})` : '';
-        const title = `${args.name}${unit ? ` (${unit})` : ''}${bucketLabel} — ${period}`;
+        const title = `${name}${unit ? ` (${unit})` : ''}${bucketLabel} — ${period}`;
 
         const chartUrl = await generateChartUrl({
             type: chartType,

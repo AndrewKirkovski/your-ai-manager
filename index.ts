@@ -787,9 +787,14 @@ bot.on('message', async (msg) => {
             processedContent = mediaParser.formatForAI(parsed);
             logIndicator = mediaParser.getMediaIndicator(parsed);
 
-            // Cache photo for re-analysis via AnalyzeImage tool
+            // Cache photo for re-analysis via AnalyzeImage tool. Strip <system> at the
+            // write boundary so a user-supplied caption or vision-model description
+            // containing our prompt marker can't escape the wrapper when AnalyzeImage
+            // later surfaces this data back through tool results.
             if (parsed.type === 'photo' && parsed.metadata?.fileId) {
-                await addImageToCache(userId, parsed.metadata.fileId, msg.caption, parsed.content);
+                await addImageToCache(userId, parsed.metadata.fileId,
+                    msg.caption != null ? stripSystemTags(msg.caption) : undefined,
+                    stripSystemTags(parsed.content));
             }
 
             // Include any caption with photos/stickers

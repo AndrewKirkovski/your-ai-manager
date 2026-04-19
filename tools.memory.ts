@@ -46,11 +46,14 @@ export const GetMemory: Tool = {
         required: ['key']
     },
     execute: async (args: { userId: number; key: string }) => {
-        const value = await getUserMemory(args.userId, args.key);
+        // Lookup key must match the textified form used at write time, else we'd
+        // miss entries stored with markup that got normalized.
+        const key = textify(args.key);
+        const value = await getUserMemory(args.userId, key);
         if (value === undefined) {
-            return { found: false, message: `No memory found for key "${args.key}"` };
+            return { found: false, message: `No memory found for key "${key}"` };
         }
-        return { found: true, key: args.key, value };
+        return { found: true, key, value };
     }
 };
 
@@ -85,10 +88,11 @@ export const DeleteMemory: Tool = {
         required: ['key']
     },
     execute: async (args: { userId: number; key: string }) => {
-        const deleted = await deleteUserMemory(args.userId, args.key);
+        const key = textify(args.key);
+        const deleted = await deleteUserMemory(args.userId, key);
         if (deleted) {
-            return { success: true, message: `Memory "${args.key}" deleted` };
+            return { success: true, message: `Memory "${key}" deleted` };
         }
-        return { success: false, message: `Memory "${args.key}" not found` };
+        return { success: false, message: `Memory "${key}" not found` };
     }
 };
