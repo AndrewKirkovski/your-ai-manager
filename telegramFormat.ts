@@ -344,13 +344,26 @@ export async function safeSend(
     }
 }
 
-/** Edit a message with HTML parse_mode, falling back to plain text on parse failure. */
+/** Edit a message with HTML parse_mode, falling back to plain text on parse failure.
+ * `editMessageText` has Telegram's same 4096-char cap but unlike sendMessage we
+ * can't split across multiple messages (one message_id per edit). Truncate
+ * overflow with an ellipsis tail. Callers that need the full text (e.g. the
+ * final streaming tick) should detect `overflow` and follow up via safeSend. */
+export function exceedsTelegramLimit(text: string): boolean {
+    return text.length > TELEGRAM_MAX;
+}
 export async function safeEdit(
     bot: TelegramBot,
     text: string,
     opts: EditOpts,
 ): Promise<void> {
-    const finalText = (!('parse_mode' in opts)) ? mdToTelegramHtml(text) : text;
+    let finalText = (!('parse_mode' in opts)) ? mdToTelegramHtml(text) : text;
+    if (finalText.length > TELEGRAM_MAX) {
+        // Truncate HTML-safe: slice at TELEGRAM_MAX-10 chars and append ellipsis.
+        // Mid-HTML-tag truncation is handled by Telegram's parser — it rejects
+        // malformed tags, at which point the plain-text fallback kicks in.
+        finalText = finalText.slice(0, TELEGRAM_MAX - 10) + '\n…';
+    }
     const finalOpts: EditOpts = { parse_mode: 'HTML', ...opts };
     try {
         await bot.editMessageText(finalText, finalOpts);

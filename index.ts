@@ -84,6 +84,22 @@ function enqueuePerUser(userId: number, work: () => Promise<void>): Promise<void
     return next;
 }
 
+// Wrapper for bot.onText handlers: auth gate + per-user serialization.
+// Command handlers that call AI (/goal, /cleargoal, /help) race with the
+// bot.on('message') catch-all on shared history; pure-read handlers
+// (/tasks, /routines, etc.) don't corrupt data but still benefit from
+// not interleaving display with an AI reply.
+type TextHandler = (msg: TelegramBot.Message, match: RegExpExecArray | null) => Promise<void>;
+function serialTextHandler(handler: TextHandler): (msg: TelegramBot.Message, match: RegExpExecArray | null) => void {
+    return (msg, match) => {
+        const userId = msg.from?.id;
+        if (!userId) return;
+        if (!isAllowedUser(userId)) return;
+        // Fire-and-forget; node-telegram-bot-api doesn't await handler returns.
+        void enqueuePerUser(userId, () => handler(msg, match));
+    };
+}
+
 // AI provider selection
 const AI_PROVIDER_TYPE = (process.env.AI_PROVIDER || 'openai') as 'openai' | 'anthropic';
 
@@ -440,7 +456,7 @@ cron.schedule('*/10 * * * *', async () => {
 });
 
 // Handle commands
-bot.onText(/\/goal(.*)/, async (msg, match) => {
+bot.onText(/\/goal(.*)/, serialTextHandler(async (msg, match) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
@@ -510,9 +526,9 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
 
         console.log(result);
     }
-});
+}));
 
-bot.onText(/\/cleargoal/, async (msg) => {
+bot.onText(/\/cleargoal/, serialTextHandler(async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
@@ -570,9 +586,9 @@ bot.onText(/\/cleargoal/, async (msg) => {
 
         console.log(result);
     }
-});
+}));
 
-bot.onText(/\/routines/, async (msg) => {
+bot.onText(/\/routines/, serialTextHandler(async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
@@ -616,9 +632,9 @@ bot.onText(/\/routines/, async (msg) => {
 
         console.log(result);
     }
-});
+}));
 
-bot.onText(/\/tasks/, async (msg) => {
+bot.onText(/\/tasks/, serialTextHandler(async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
@@ -657,9 +673,9 @@ bot.onText(/\/tasks/, async (msg) => {
 
         console.log(result);
     }
-});
+}));
 
-bot.onText(/\/memory/, async (msg) => {
+bot.onText(/\/memory/, serialTextHandler(async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
@@ -702,9 +718,9 @@ bot.onText(/\/memory/, async (msg) => {
 
         console.log(result);
     }
-});
+}));
 
-bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
+bot.onText(/\/forget(?:\s+(.+))?/, serialTextHandler(async (msg, match) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
@@ -738,9 +754,9 @@ bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
         console.error('Error forgetting memory:', error);
         await safeSend(bot, msg.chat.id, 'Ошибка при удалении записи.');
     }
-});
+}));
 
-bot.onText(/\/stats/, async (msg) => {
+bot.onText(/\/stats/, serialTextHandler(async (msg) => {
     try {
         const userId = msg.from?.id;
         if (!userId) return;
@@ -764,9 +780,9 @@ bot.onText(/\/stats/, async (msg) => {
         console.error('Error showing stats:', error);
         await safeSend(bot, msg.chat.id, 'Ошибка при загрузке статистик.');
     }
-});
+}));
 
-bot.onText(/\/help/, async (msg) => {
+bot.onText(/\/help/, serialTextHandler(async (msg) => {
     try {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
@@ -793,7 +809,7 @@ bot.onText(/\/help/, async (msg) => {
 /forget <ключ> - удалить запись из памяти
 /help - эта справка`);
     }
-});
+}));
 
 
 

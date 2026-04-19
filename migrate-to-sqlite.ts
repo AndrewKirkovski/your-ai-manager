@@ -116,9 +116,10 @@ const migrate = db.transaction(() => {
             totalTasks++;
         }
 
-        // Insert memory
+        // Insert memory — lowercase keys to match runtime normalization in
+        // userStore.updateUserMemory / getUserMemory.
         for (const [key, value] of Object.entries(user.memory ?? {})) {
-            insertMemory.run(user.userId, key, String(value));
+            insertMemory.run(user.userId, key.toLowerCase(), String(value));
             totalMemory++;
         }
 

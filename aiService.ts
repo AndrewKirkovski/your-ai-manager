@@ -2,7 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import {addMessageToHistory, getRecentMessageHistory} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
-import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers} from './telegramFormat';
+import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers, exceedsTelegramLimit} from './telegramFormat';
 import type {AIProvider, ProviderMessage, ToolCallInfo, ToolDefinition, ThinkingBlockData} from './aiProvider';
 
 export interface AIStreamOptions {
@@ -120,10 +120,24 @@ export class AIService {
                             initialSendFailed = true;
                         }
                     } else {
-                        await safeEdit(bot, contentToSend, {
-                            chat_id: userId,
-                            message_id: messageId,
-                        });
+                        // On the FINAL tick, full content may exceed Telegram's 4096 limit.
+                        // safeEdit can only truncate (one message_id). Edit the first
+                        // chunk into the existing message, then deliver the remainder
+                        // as follow-up messages via safeSend (which splits further).
+                        if (isFinal && exceedsTelegramLimit(contentToSend)) {
+                            const firstChunk = contentToSend.slice(0, 3900);
+                            const rest = contentToSend.slice(3900);
+                            await safeEdit(bot, firstChunk, {
+                                chat_id: userId,
+                                message_id: messageId,
+                            });
+                            await safeSend(bot, userId, rest);
+                        } else {
+                            await safeEdit(bot, contentToSend, {
+                                chat_id: userId,
+                                message_id: messageId,
+                            });
+                        }
                         lastSentContent = aiResponseAccumulated;
                     }
                 } catch (error) {

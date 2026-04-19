@@ -32,4 +32,74 @@ db.exec(INDEXES_SQL);
     }
 }
 
+// --- One-shot case-normalization for existing rows ---
+// userStore.normalizeMemoryKey / normalizeClinicName now lowercase on every
+// write+read. Legacy rows written before that change keep their original case,
+// so lowercase lookups miss them. Migrate once at startup; handle key conflicts
+// (e.g. 'Foo' + 'foo' both exist) by keeping the more-recent row.
+{
+    type MemRow = { user_id: number; key: string; value: string; first_recorded_at: string; updated_at: string };
+    const mixed = db.prepare(
+        `SELECT user_id, key, value, first_recorded_at, updated_at FROM memory WHERE key != lower(key)`
+    ).all() as MemRow[];
+    if (mixed.length > 0) {
+        console.log(`[migrate] Normalizing ${mixed.length} mixed-case memory keys to lowercase`);
+        const getLower = db.prepare(`SELECT updated_at FROM memory WHERE user_id = ? AND key = ?`);
+        const del = db.prepare(`DELETE FROM memory WHERE user_id = ? AND key = ?`);
+        const update = db.prepare(`UPDATE memory SET key = ? WHERE user_id = ? AND key = ?`);
+        const migrate = db.transaction((rows: MemRow[]) => {
+            for (const r of rows) {
+                const lower = r.key.toLowerCase();
+                const existing = getLower.get(r.user_id, lower) as { updated_at: string } | undefined;
+                if (!existing) {
+                    update.run(lower, r.user_id, r.key);
+                } else if (new Date(r.updated_at) > new Date(existing.updated_at)) {
+                    del.run(r.user_id, lower);
+                    update.run(lower, r.user_id, r.key);
+                } else {
+                    del.run(r.user_id, r.key);
+                }
+            }
+        });
+        migrate(mixed);
+    }
+}
+
+{
+    type ClinicRow = { id: number; name: string; lat: number | null; lng: number | null; geocoded_at: string | null };
+    const mixedClinics = db.prepare(
+        `SELECT id, name, lat, lng, geocoded_at FROM luxmed_clinics WHERE name != lower(name)`
+    ).all() as ClinicRow[];
+    if (mixedClinics.length > 0) {
+        console.log(`[migrate] Normalizing ${mixedClinics.length} mixed-case clinic names`);
+        // Conflict resolution: prefer row with geocoded coords; else the more-recent `geocoded_at`.
+        const findByName = db.prepare(`SELECT id, lat, lng, geocoded_at FROM luxmed_clinics WHERE name = ?`);
+        const del = db.prepare(`DELETE FROM luxmed_clinics WHERE id = ?`);
+        const update = db.prepare(`UPDATE luxmed_clinics SET name = ? WHERE id = ?`);
+        const migrate = db.transaction((rows: ClinicRow[]) => {
+            for (const r of rows) {
+                const lower = r.name.toLowerCase().trim();
+                const existing = findByName.get(lower) as { id: number; lat: number | null; lng: number | null; geocoded_at: string | null } | undefined;
+                if (!existing) {
+                    update.run(lower, r.id);
+                    continue;
+                }
+                const rHasCoords = r.lat != null && r.lng != null;
+                const eHasCoords = existing.lat != null && existing.lng != null;
+                const rNewer = (r.geocoded_at || '') > (existing.geocoded_at || '');
+                const keepIncoming =
+                    (rHasCoords && !eHasCoords) ||
+                    (rHasCoords && eHasCoords && rNewer);
+                if (keepIncoming) {
+                    del.run(existing.id);
+                    update.run(lower, r.id);
+                } else {
+                    del.run(r.id);
+                }
+            }
+        });
+        migrate(mixedClinics);
+    }
+}
+
 export default db;
