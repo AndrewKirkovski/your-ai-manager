@@ -90,7 +90,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
         autobookFailureNotified.delete(config.id);
         if (botInstance) {
             safeSend(botInstance, config.userId,
-                `⏰ LuxMed мониторинг "${escapeHtml(config.serviceName)}" истёк (период до ${escapeHtml(config.dateTo)}). Деактивирован.`
+                `⏰ LuxMed мониторинг "${config.serviceName}" истёк (период до ${config.dateTo}). Деактивирован.`
             ).catch(() => {});
         }
         return;
@@ -134,7 +134,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
                 autobookFailureNotified.delete(config.id);
 
                 if (botInstance) {
-                    const msg = `✅ LuxMed: Записал автоматически!\n\n${formatTermForNotification(best)}\n\nСервис: ${escapeHtml(config.serviceName)}`;
+                    const msg = `✅ LuxMed: Записал автоматически!\n\n${formatTermForNotification(best)}\n\nСервис: ${config.serviceName}`;
                     safeSend(botInstance, config.userId, msg).catch(() => {});
                 }
             } catch (err) {
@@ -145,7 +145,8 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
                 if (botInstance && !autobookFailureNotified.has(config.id)) {
                     autobookFailureNotified.add(config.id);
                     const slotsText = filtered.slice(0, 5).map((t, i) => `${i + 1}. ${formatTermForNotification(t)}`).join('\n');
-                    const msg = `⚠️ LuxMed: Нашёл слоты для "${escapeHtml(config.serviceName)}", но автозапись не удалась (${escapeHtml(errMsg)}).\n\nДоступные слоты:\n${slotsText}\n\nЗапиши вручную через бот. Мониторинг продолжает попытки автозаписи.`;
+                    // errMsg is a raw JS error string (external source), escape to avoid breaking HTML parse.
+                    const msg = `⚠️ LuxMed: Нашёл слоты для "${config.serviceName}", но автозапись не удалась (${escapeHtml(errMsg)}).\n\nДоступные слоты:\n${slotsText}\n\nЗапиши вручную через бот. Мониторинг продолжает попытки автозаписи.`;
                     safeSend(botInstance, config.userId, msg).catch(() => {});
                 }
             }
@@ -155,7 +156,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
             autobookFailureNotified.delete(config.id);
             if (botInstance) {
                 const slotsText = filtered.slice(0, 5).map((t, i) => `${i + 1}. ${formatTermForNotification(t)}`).join('\n');
-                const msg = `🔔 LuxMed: Нашёл ${filtered.length} слот(ов) для "${escapeHtml(config.serviceName)}"!\n\n${slotsText}${filtered.length > 5 ? `\n... и ещё ${filtered.length - 5}` : ''}\n\nИспользуй LuxmedSearchSlots чтобы найти и записаться.`;
+                const msg = `🔔 LuxMed: Нашёл ${filtered.length} слот(ов) для "${config.serviceName}"!\n\n${slotsText}${filtered.length > 5 ? `\n... и ещё ${filtered.length - 5}` : ''}\n\nИспользуй LuxmedSearchSlots чтобы найти и записаться.`;
                 safeSend(botInstance, config.userId, msg).catch(() => {});
             }
         }
@@ -168,7 +169,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
             autobookFailureNotified.delete(config.id);
             if (botInstance) {
                 safeSend(botInstance, config.userId,
-                    `❌ LuxMed: Ошибка авторизации. Мониторинг "${escapeHtml(config.serviceName)}" деактивирован. Обнови логин/пароль.`
+                    `❌ LuxMed: Ошибка авторизации. Мониторинг "${config.serviceName}" деактивирован. Обнови логин/пароль.`
                 ).catch(() => {});
             }
         }

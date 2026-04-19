@@ -1,4 +1,5 @@
 import {Tool} from "./tool.types";
+import {textify} from "./telegramFormat";
 import {
     updateUserMemory,
     getUserMemory,
@@ -24,8 +25,10 @@ export const UpdateMemory: Tool = {
         required: ['key', 'value']
     },
     execute: async (args: { userId: number; key: string; value: string }) => {
-        await updateUserMemory(args.userId, args.key, args.value);
-        return { success: true, message: `Memory "${args.key}" updated to "${args.value}"` };
+        const key = textify(args.key);
+        const value = textify(args.value);
+        await updateUserMemory(args.userId, key, value);
+        return { success: true, message: `Memory "${key}" updated to "${value}"` };
     }
 };
 

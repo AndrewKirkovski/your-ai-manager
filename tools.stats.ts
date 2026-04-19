@@ -12,6 +12,7 @@ import {
     deleteStatEntriesRange,
 } from "./userStore";
 import {generateChartUrl} from "./chartService";
+import {textify} from "./telegramFormat";
 import TelegramBot from "node-telegram-bot-api";
 import {DateTime} from 'luxon';
 
@@ -122,10 +123,10 @@ export const TrackStat: Tool = {
     execute: async (args: { userId: number; name?: string; value?: number; unit?: string; note?: string; timestamp?: string; entries?: TrackStatEntry[] }) => {
         if (args.entries && args.entries.length > 0) {
             const normalized = args.entries.map(e => ({
-                name: e.name,
+                name: textify(e.name),
                 value: e.value,
-                unit: e.unit,
-                note: e.note,
+                unit: textify(e.unit),
+                note: textify(e.note),
                 timestamp: e.timestamp ? new Date(e.timestamp) : undefined,
             }));
             const inserted = await addStatEntriesBatch(args.userId, normalized);
@@ -148,20 +149,23 @@ export const TrackStat: Tool = {
             return { success: false, message: 'TrackStat requires either "entries" array or top-level name+value.' };
         }
 
+        const name = textify(args.name);
+        const unit = textify(args.unit);
+        const note = textify(args.note);
         const ts = args.timestamp ? new Date(args.timestamp) : undefined;
-        const id = await addStatEntry(args.userId, args.name, args.value, args.unit, args.note, ts);
+        const id = await addStatEntry(args.userId, name, args.value, unit, note, ts);
 
         return {
             success: true,
             recorded: {
                 id,
-                name: args.name.toLowerCase(),
+                name: name.toLowerCase(),
                 value: args.value,
-                unit: args.unit,
-                note: args.note,
+                unit: unit,
+                note: note,
                 timestamp: (ts ?? new Date()).toISOString(),
             },
-            message: `Recorded ${args.name}: ${args.value}${args.unit ? ' ' + args.unit : ''}`
+            message: `Recorded ${name}: ${args.value}${unit ? ' ' + unit : ''}`
         };
     }
 };
@@ -296,9 +300,9 @@ type UpdateStatPatch = { name?: string; value?: number; unit?: string; note?: st
 
 async function applyStatPatch(userId: number, id: number, patch: UpdateStatPatch): Promise<boolean> {
     // Empty string clears unit/note. Empty string is not valid for name (ignored).
-    const name = patch.name !== undefined && patch.name !== '' ? patch.name : undefined;
-    const unit = patch.unit === '' ? null : patch.unit;
-    const note = patch.note === '' ? null : patch.note;
+    const name = patch.name !== undefined && patch.name !== '' ? textify(patch.name) : undefined;
+    const unit = patch.unit === '' ? null : textify(patch.unit);
+    const note = patch.note === '' ? null : textify(patch.note);
     return updateStatEntry(userId, id, {
         name,
         value: patch.value,

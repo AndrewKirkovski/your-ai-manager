@@ -1,4 +1,5 @@
 import { Tool } from './tool.types';
+import { textify } from './telegramFormat';
 import {
     luxmedLogin, luxmedGetCities, luxmedGetServices,
     luxmedSearchSlots, luxmedBookSlot, luxmedCancelVisit, luxmedGetReserved,
@@ -383,15 +384,18 @@ export const LuxmedMonitorSlot: Tool = {
         const clinicIds = args.clinic_ids ? args.clinic_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
         const doctorIds = args.doctor_ids ? args.doctor_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
 
-        console.log(`[LuxMed] Creating monitoring: ${args.service_name}, city=${cityId}, time=${args.time_from}-${args.time_to}, clinics=${clinicIds?.join(',') ?? 'any'}, doctors=${doctorIds?.join(',') ?? 'any'}, english=${args.english_only === 'true'}, autobook=${args.autobook !== 'false'}`);
+        const serviceName = textify(args.service_name);
+        const cityName = textify(args.city_name) || prefs.defaultCityName || 'Unknown';
+
+        console.log(`[LuxMed] Creating monitoring: ${serviceName}, city=${cityId}, time=${args.time_from}-${args.time_to}, clinics=${clinicIds?.join(',') ?? 'any'}, doctors=${doctorIds?.join(',') ?? 'any'}, english=${args.english_only === 'true'}, autobook=${args.autobook !== 'false'}`);
         const monitoring = createLuxmedMonitoring({
             id: generateShortId(),
             userId: args.userId,
             accountId,
             serviceId: args.service_id,
-            serviceName: args.service_name,
+            serviceName,
             cityId,
-            cityName: args.city_name || prefs.defaultCityName || 'Unknown',
+            cityName,
             clinicIds,
             doctorIds,
             englishOnly: args.english_only === 'true',
@@ -411,7 +415,7 @@ export const LuxmedMonitorSlot: Tool = {
 
         return {
             success: true,
-            message: `Monitoring started (${monitoring.id}): ${args.service_name}, ${args.time_from}-${args.time_to}, auto-book: ${args.autobook !== 'false' ? 'yes' : 'no'}.${filterStr} Checking every 10 min.`,
+            message: `Monitoring started (${monitoring.id}): ${serviceName}, ${args.time_from}-${args.time_to}, auto-book: ${args.autobook !== 'false' ? 'yes' : 'no'}.${filterStr} Checking every 10 min.`,
         };
     },
 };

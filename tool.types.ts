@@ -33,3 +33,4 @@ export interface ToolResult {
     role: 'tool';
     content: string;
 }
+

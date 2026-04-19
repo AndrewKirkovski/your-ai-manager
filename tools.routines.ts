@@ -1,4 +1,5 @@
 import {Tool} from "./tool.types";
+import {textify} from "./telegramFormat";
 import {
     addUserRoutine,
     generateShortId,
@@ -56,7 +57,7 @@ export const AddRoutine: Tool = {
 
         const newRoutine: Routine = {
             id: generateShortId(),
-            name: args.name,
+            name: textify(args.name),
             cron: args.cron,
             defaultAnnoyance: (args.default_annoyance as 'low' | 'med' | 'high') || 'low',
             requiresAction: args.requires_action ?? true,
@@ -134,7 +135,7 @@ export const UpdateRoutine: Tool = {
 
         // Update the routine
         await updateUserRoutine(userId, routineId, (routine) => {
-            if (args.name !== undefined) routine.name = args.name;
+            if (args.name !== undefined) routine.name = textify(args.name);
             if (args.cron !== undefined) routine.cron = args.cron;
             if (args.default_annoyance !== undefined) routine.defaultAnnoyance = args.default_annoyance as 'low' | 'med' | 'high';
             if (args.requires_action !== undefined) routine.requiresAction = args.requires_action;

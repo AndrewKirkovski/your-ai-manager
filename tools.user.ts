@@ -1,5 +1,6 @@
 import {Tool} from "./tool.types";
 import {setUserGoal, getUserGoal, clearUserGoal} from "./userStore";
+import {textify} from "./telegramFormat";
 
 export const SetGoal: Tool = {
     name: 'SetGoal',
@@ -15,8 +16,9 @@ export const SetGoal: Tool = {
         required: ['goal']
     },
     execute: async (args: { userId: number; goal: string }) => {
-        await setUserGoal(args.userId, args.goal);
-        return { success: true, message: `Goal set to: "${args.goal}"` };
+        const goal = textify(args.goal);
+        await setUserGoal(args.userId, goal);
+        return { success: true, message: `Goal set to: "${goal}"` };
     }
 };
 

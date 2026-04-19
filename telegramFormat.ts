@@ -18,41 +18,55 @@ const INTERNAL_TAGS = [
 
 marked.setOptions({ breaks: true, gfm: true });
 
-/** Narrow strip for `<system>` tags only — applied at trust boundaries
- * (user ingress, history read, compaction I/O, recursion context) to prevent
- * user- or tool-origin `<system>` content from escaping our `<system>At …</system>`
- * prompt wrapper. Case-insensitive, attrs-tolerant, handles closed/unclosed/orphan
- * forms. Bounded loop defends against nested/layered forgeries. */
+/** Drop `<system>` tags + their content (including nested, unclosed, orphan-close,
+ * and case variants) while preserving all other markup and text. Applied at trust
+ * boundaries (user ingress at bot.on('message'), history read, compaction I/O,
+ * recursion context, tool-result interpolation) so user- or tool-origin `<system>`
+ * content can't escape our `<system>At …</system>` prompt wrapper.
+ *
+ * Uses sanitize-html (htmlparser2) — handles nesting, case, partial tags, and
+ * entity decoding correctly. Side-effect: `&` in output is serialized as `&amp;`
+ * (sanitize-html always outputs HTML-safe). Idempotent on subsequent passes.
+ * Matches the behavior already applied on the display path via mdToTelegramHtml. */
 export function stripSystemTags(text: string): string {
-    let out = text;
-    for (let i = 0; i < 4; i++) {
-        const before = out;
-        out = out.replace(/<system\b[^>]*>[\s\S]*?<\/system>/gi, '');
-        out = out.replace(/<system\b[^>]*>[\s\S]*$/gi, '');
-        out = out.replace(/<\/system\s*>/gi, '');
-        if (out === before) break;
-    }
-    return out;
+    return sanitizeHtml(text, {
+        allowedTags: false as unknown as undefined,
+        allowedAttributes: false as unknown as undefined,
+        exclusiveFilter: (frame) => frame.tag === 'system',
+        allowVulnerableTags: true,
+    });
 }
 
-/** Streaming-tick visibility gate only. Strips `<system>` AND `<thinking>` so
- * mid-stream buffers that are currently all-thinking don't emit empty placeholders
- * every 500 ms. Final display still runs through `mdToTelegramHtml`, which strips
- * the same tags plus legacy command XML via sanitize-html's `nonTextTags`. */
+/** Streaming-tick visibility gate. Strips `<system>` AND `<thinking>` (tag +
+ * content) so mid-stream buffers currently all inside a thinking block don't
+ * emit empty `...` placeholders. Final display still runs through
+ * `mdToTelegramHtml`, which also strips both via sanitize-html's `nonTextTags`. */
 export function stripInternalMarkers(text: string): string {
-    return stripSystemTags(text)
-        .replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking>/gi, '')
-        .replace(/<thinking\b[^>]*>[\s\S]*$/gi, '')
-        .replace(/<\/thinking\s*>/gi, '');
+    return sanitizeHtml(text, {
+        allowedTags: false as unknown as undefined,
+        allowedAttributes: false as unknown as undefined,
+        exclusiveFilter: (frame) => frame.tag === 'system' || frame.tag === 'thinking',
+        allowVulnerableTags: true,
+    });
 }
 
-/** HTML-escape a value for safe interpolation as DISPLAY content into bot-authored
- * templates routed through `mdToTelegramHtml`. Without this, user/AI-controlled
- * strings containing an `INTERNAL_TAGS` tag name (e.g. a routine named
- * `<goal>oops</goal>`) get silently swallowed by sanitize-html's `nonTextTags` —
- * user sees their content disappear. Escape at render boundaries (command
- * handlers, luxmed notifications). NOT for AI-facing text where we want the tag
- * removed entirely — use `stripSystemTags` there. */
+/** Normalize a name/key/value to simple text. Task/routine/memory/stat names are
+ * plain labels — no markup. Used at tool-write boundaries so AI-created names
+ * containing markup (`<goal>foo</goal>`) don't survive to display or prompt
+ * interpolation. Keeps text content, drops tags. Side-effect: `&` is serialized
+ * as `&amp;` (sanitize-html output). */
+export function textify(value: string): string;
+export function textify(value: string | undefined): string | undefined;
+export function textify(value: string | undefined | null): string | undefined {
+    if (value == null) return value ?? undefined;
+    return sanitizeHtml(value, { allowedTags: [], allowedAttributes: {} });
+}
+
+/** HTML-entity escape for raw `<`, `>`, `&` in bot-authored display templates.
+ * Exported as a utility; most display paths don't need it because the values
+ * going through them are already textified at write time. Kept for future
+ * callers that need to interpolate genuinely untrusted external data without
+ * going through the full marked+sanitize-html pipeline. */
 export function escapeHtml(s: string | number | null | undefined): string {
     if (s == null) return '';
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

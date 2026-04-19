@@ -1,5 +1,6 @@
 // Define the GetTaskById tool
 import {Tool} from "./tool.types";
+import {textify} from "./telegramFormat";
 import {
     addUserTask,
     generateShortId,
@@ -127,10 +128,11 @@ export const AddTask: Tool = {
         if (args.annoyance && !['low', 'med', 'high'].includes(args.annoyance)) {
             throw new Error(`Invalid annoyance level: ${args.annoyance}. Must be one of: low, med, high`);
         }
+        const cleanName = textify(args.name);
 
         const newTask: Task = {
             id: generateShortId(),
-            name: args.name,
+            name: cleanName,
             routineId: args.routine_id,
             dueAt: args.due_at ? new Date(args.due_at) : undefined,
             pingAt: new Date(args.ping_at),
@@ -257,7 +259,7 @@ export const UpdateTask: Tool = {
 
         // Update the task
         await updateUserTask(userId, taskId, (task) => {
-            if (args.name !== undefined) task.name = args.name;
+            if (args.name !== undefined) task.name = textify(args.name);
             if (args.status !== undefined) task.status = args.status as TaskStatus;
             if (args.annoyance !== undefined) task.annoyance = args.annoyance as 'low' | 'med' | 'high';
             if (args.due_at !== undefined) {

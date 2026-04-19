@@ -35,7 +35,7 @@ import {
 } from "./userStore";
 import {addUserTask, generateShortId} from './userStore';
 import {AIService} from './aiService';
-import {safeSend, stripSystemTags, escapeHtml} from './telegramFormat';
+import {safeSend, stripSystemTags} from './telegramFormat';
 import {runHistoryCompaction} from './historyCompaction';
 import {runStyleScan} from './styleScan';
 import {CronExpressionParser} from 'cron-parser';
@@ -397,7 +397,7 @@ bot.onText(/\/goal(.*)/, async (msg, match) => {
             // Show current goal
             const user = await getUser(userId);
             if (user && user.preferences.goal) {
-                await safeSend(bot, msg.chat.id, `🎯 Твоя текущая цель: "${escapeHtml(user.preferences.goal)}"\n\nИспользуй /goal &lt;новая цель&gt; чтобы изменить`);
+                await safeSend(bot, msg.chat.id, `🎯 Твоя текущая цель: "${user.preferences.goal}"\n\nИспользуй /goal &lt;новая цель&gt; чтобы изменить`);
             } else {
                 await safeSend(bot, msg.chat.id, `🎯 У тебя пока нет установленной цели\n\nИспользуй /goal &lt;твоя цель&gt; чтобы установить`);
             }
@@ -540,7 +540,7 @@ bot.onText(/\/routines/, async (msg) => {
             return;
         }
 
-        const routineText = activeRoutines.map(r => `- ${escapeHtml(r.name)} (${escapeHtml(formatCronHuman(r.cron))}, Annoyance: ${escapeHtml(r.annoyance)})`).join('\n');
+        const routineText = activeRoutines.map(r => `- ${r.name} (${formatCronHuman(r.cron)}, Annoyance: ${r.annoyance})`).join('\n');
         await safeSend(bot, msg.chat.id, `🔗 Активные рутины:\n\n${routineText}`);
 
     } catch (error) {
@@ -580,7 +580,7 @@ bot.onText(/\/tasks/, async (msg) => {
             return;
         }
 
-        const taskText = pendingTasks.map(t => `- ${escapeHtml(t.name)} (Next: ${escapeHtml(formatDateHuman(t.pingAt))}, Annoyance: ${escapeHtml(t.annoyance)})`).join('\n');
+        const taskText = pendingTasks.map(t => `- ${t.name} (Next: ${formatDateHuman(t.pingAt)}, Annoyance: ${t.annoyance})`).join('\n');
         await safeSend(bot, msg.chat.id, `📋 Активные задачи:\n\n${taskText}`);
 
     } catch (error) {
@@ -620,7 +620,7 @@ bot.onText(/\/memory/, async (msg) => {
             const stamp = sameDay
                 ? `записано ${ageLabel(rec.firstRecordedAt)}`
                 : `впервые ${ageLabel(rec.firstRecordedAt)}, обновлено ${ageLabel(rec.updatedAt)}`;
-            return `• ${escapeHtml(k)} (${stamp})\n  ${escapeHtml(rec.value)}`;
+            return `• ${k} (${stamp})\n  ${rec.value}`;
         });
 
         const body = lines.join('\n\n');
@@ -662,16 +662,16 @@ bot.onText(/\/forget(?:\s+(.+))?/, async (msg, match) => {
             await safeSend(
                 bot,
                 msg.chat.id,
-                `🧠 Укажи ключ: /forget &lt;ключ&gt;\n\nДоступные ключи:\n${keys.map(k => `• ${escapeHtml(k)}`).join('\n')}`,
+                `🧠 Укажи ключ: /forget &lt;ключ&gt;\n\nДоступные ключи:\n${keys.map(k => `• ${k}`).join('\n')}`,
             );
             return;
         }
 
         const removed = await deleteUserMemory(userId, key);
         if (removed) {
-            await safeSend(bot, msg.chat.id, `🧠 Забыл: ${escapeHtml(key)}`);
+            await safeSend(bot, msg.chat.id, `🧠 Забыл: ${key}`);
         } else {
-            await safeSend(bot, msg.chat.id, `🧠 Ключа ${escapeHtml(key)} не было в памяти.`);
+            await safeSend(bot, msg.chat.id, `🧠 Ключа ${key} не было в памяти.`);
         }
 
     } catch (error) {
@@ -694,8 +694,8 @@ bot.onText(/\/stats/, async (msg) => {
         const lines = await Promise.all(statNames.map(async (s) => {
             const latest = await getLatestStat(userId, s.name);
             const count = await getStatCount(userId, s.name);
-            const lastVal = latest ? `${escapeHtml(latest.value)}${s.unit ? ' ' + escapeHtml(s.unit) : ''}` : '—';
-            return `• ${escapeHtml(s.name)} — последнее: ${lastVal}, записей: ${count}`;
+            const lastVal = latest ? `${latest.value}${s.unit ? ' ' + s.unit : ''}` : '—';
+            return `• ${s.name} — последнее: ${lastVal}, записей: ${count}`;
         }));
 
         await safeSend(bot, msg.chat.id, `📊 Отслеживаемые статистики:\n\n${lines.join('\n')}`);
