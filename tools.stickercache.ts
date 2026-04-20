@@ -22,9 +22,17 @@ export function initStickerCacheTools(bot: TelegramBot, client: OpenAI, model?: 
 }
 
 /** Ask the cheap lookup model to pick the cache_key whose description best matches `vibe_query`.
- * Returns the chosen entry, or candidates[0] on any error so the caller still sends *something*. */
-async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEntry[]): Promise<StickerCacheEntry> {
-    if (candidates.length <= 1 || !lookupClient) return candidates[0];
+ * Single-candidate fast-path: returns the only candidate (SQL already substring-matched, safe to send).
+ * Multi-candidate path: Haiku ranks; on ANY failure (no client / API error / unparseable response /
+ * model says "0" or "none") returns null so the caller falls back to a text reply rather than
+ * sending a random sticker. */
+async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEntry[]): Promise<StickerCacheEntry | null> {
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return candidates[0];
+    if (!lookupClient) {
+        console.warn('[stickerPicker] no lookup client configured; returning null (multi-candidate, ambiguous)');
+        return null;
+    }
 
     const numbered = candidates.map((c, i) => {
         const emojis = c.emojis.length > 0 ? ` [${c.emojis.join(' ')}]` : '';
@@ -35,8 +43,8 @@ async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEnt
     const prompt =
         `Pick the single best sticker for vibe "${vibe_query}" from this numbered list. ` +
         `Match by visual content / emotion / character — not just keyword overlap. ` +
-        `If nothing fits well, still pick the closest. ` +
-        `Reply with ONLY the integer index (1-${candidates.length}), no other text.\n\n${numbered}`;
+        `If NOTHING in the list is a reasonable fit for the vibe, reply with 0 (caller will send a text reply instead). ` +
+        `Otherwise reply with ONLY the integer index (1-${candidates.length}), no other text.\n\n${numbered}`;
 
     try {
         const resp = await lookupClient.chat.completions.create({
@@ -49,10 +57,11 @@ async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEnt
         if (Number.isFinite(idx) && idx >= 1 && idx <= candidates.length) {
             return candidates[idx - 1];
         }
+        console.warn(`[stickerPicker] model rejected all candidates or returned invalid index "${raw}"; returning null`);
     } catch (err) {
-        console.warn('[stickerPicker] lookup model failed, falling back to first candidate:', err instanceof Error ? err.message : err);
+        console.warn('[stickerPicker] lookup model failed; returning null:', err instanceof Error ? err.message : err);
     }
-    return candidates[0];
+    return null;
 }
 
 const KIND_VALUES: StickerCacheKind[] = ['sticker', 'animated_sticker', 'video_sticker', 'custom_emoji'];
@@ -264,6 +273,15 @@ export const SendStickerToUser: Tool = {
         }
 
         const pick = await pickStickerByVibe(query, candidates);
+        if (!pick) {
+            return {
+                success: false,
+                no_match: true,
+                vibe_query: query,
+                considered: candidates.length,
+                message: `Lookup model couldn't find a good sticker match for "${query}" among ${candidates.length} candidates. Reply with text instead.`,
+            };
+        }
 
         const user = await getUser(args.userId);
         if (!user?.chatId) {
