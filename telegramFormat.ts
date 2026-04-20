@@ -192,37 +192,109 @@ export const TG_EMOJI_CATALOG: TgEmoji[] = [
     { char: '🫳', id: '5321465420341845195' }, // 5th harvested variant, not in the petting-speed set
 ];
 
-/** First-occurrence-wins map used by the bare-unicode auto-upgrade path. */
-const DEFAULT_TG_EMOJI_BY_CHAR: Map<string, string> = (() => {
+/** Static catalog → first-id-by-char (catalog order wins). Stable across runtime. */
+const STATIC_TG_EMOJI_BY_CHAR: Map<string, string> = (() => {
     const m = new Map<string, string>();
     for (const e of TG_EMOJI_CATALOG) if (!m.has(e.char)) m.set(e.char, e.id);
     return m;
 })();
 
-/** System-prompt block listing labeled variants so the AI can emit the right tag.
- * Unlabeled entries are omitted — they'll still auto-upgrade from bare unicode. */
-export function tgEmojiPromptBlock(): string {
-    const labeled = TG_EMOJI_CATALOG.filter(e => e.desc);
-    if (labeled.length === 0) return '';
-    const lines = labeled.map(e =>
-        `  ${e.char} (${e.desc}) — <tg-emoji emoji-id="${e.id}">${e.char}</tg-emoji>`);
-    return [
+/** Dynamic merge cache (30s TTL): static catalog labels + DB-cached analyzed custom emojis.
+ * The DB read is cheap (small table, indexed by kind), but we hit this on every AI request
+ * via the prompt block. 30s is short enough that newly-analyzed user emojis show up quickly. */
+const DYNAMIC_CACHE_TTL_MS = 30_000;
+let dynamicCachedAt = 0;
+let cachedPromptBlock = '';
+let cachedByCharMap: Map<string, string> = STATIC_TG_EMOJI_BY_CHAR;
+
+function rebuildDynamicCache(): void {
+    // Lazy import — telegramFormat is sometimes imported from modules that load before db.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const {getAllAnalyzedCustomEmojis} = require('./userStore') as typeof import('./userStore');
+    const analyzed = getAllAnalyzedCustomEmojis();
+
+    // Build merged char→id map: static catalog wins for any char it covers, cache fills the rest.
+    const merged = new Map(STATIC_TG_EMOJI_BY_CHAR);
+    for (const entry of analyzed) {
+        for (const ch of entry.emojis) {
+            if (!merged.has(ch)) merged.set(ch, entry.cacheKey);
+        }
+    }
+    cachedByCharMap = merged;
+
+    // Build prompt block: dedup by id (catalog labels and cached descriptions for the same id collapse,
+    // catalog label wins because it appears first).
+    const seenIds = new Set<string>();
+    const lines: string[] = [];
+    for (const e of TG_EMOJI_CATALOG) {
+        if (!e.desc || seenIds.has(e.id)) continue;
+        seenIds.add(e.id);
+        lines.push(`  ${e.char} (${e.desc}) — <tg-emoji emoji-id="${e.id}">${e.char}</tg-emoji>`);
+    }
+    for (const entry of analyzed) {
+        if (seenIds.has(entry.cacheKey)) continue;
+        seenIds.add(entry.cacheKey);
+        const ch = entry.emojis[0] || '?';
+        // Truncate long Vision descriptions so the prompt stays compact.
+        const shortDesc = entry.description.length > 120
+            ? entry.description.slice(0, 117) + '...'
+            : entry.description;
+        lines.push(`  ${ch} (${shortDesc}) — <tg-emoji emoji-id="${entry.cacheKey}">${ch}</tg-emoji>`);
+    }
+
+    cachedPromptBlock = lines.length === 0 ? '' : [
         'CUSTOM EMOJI (Telegram Premium, animated):',
-        '- Writing the bare unicode (e.g. 🔥) auto-upgrades to the default animated variant.',
+        '- Writing the bare unicode (e.g. 🔥) auto-upgrades to the default variant.',
         '- For the specific variants below, emit the full tag verbatim:',
         ...lines,
     ].join('\n');
+
+    dynamicCachedAt = Date.now();
+}
+
+function ensureFresh(): void {
+    if (Date.now() - dynamicCachedAt > DYNAMIC_CACHE_TTL_MS) {
+        try {
+            rebuildDynamicCache();
+        } catch (err) {
+            // Don't break the prompt path on DB issues — fall back to static catalog only.
+            console.warn('[tg-emoji] dynamic cache rebuild failed, using static catalog:', err instanceof Error ? err.message : err);
+            cachedByCharMap = STATIC_TG_EMOJI_BY_CHAR;
+            cachedPromptBlock = (() => {
+                const labeled = TG_EMOJI_CATALOG.filter(e => e.desc);
+                if (labeled.length === 0) return '';
+                const ls = labeled.map(e =>
+                    `  ${e.char} (${e.desc}) — <tg-emoji emoji-id="${e.id}">${e.char}</tg-emoji>`);
+                return [
+                    'CUSTOM EMOJI (Telegram Premium, animated):',
+                    '- Writing the bare unicode (e.g. 🔥) auto-upgrades to the default variant.',
+                    '- For the specific variants below, emit the full tag verbatim:',
+                    ...ls,
+                ].join('\n');
+            })();
+            dynamicCachedAt = Date.now();
+        }
+    }
+}
+
+/** System-prompt block listing labeled variants (static catalog + DB-cached analyzed
+ * custom emojis). Cached for 30s so SYSTEM_PROMPT assembly stays cheap. */
+export function tgEmojiPromptBlock(): string {
+    ensureFresh();
+    return cachedPromptBlock;
 }
 
 /** Wrap mapped unicode emoji in <tg-emoji> tags in a single pass.
  * - Longest-first alternation so ZWJ sequences (e.g. 😵‍💫) match before their base (😵).
  * - Existing <tg-emoji> blocks are preserved verbatim (no double-wrap).
- * - For chars with multiple catalog entries, the first-occurrence variant wins.
+ * - Static catalog wins for chars it covers; DB-cached entries fill in chars catalog doesn't have.
  */
 export function replaceUnicodeWithTgEmoji(text: string): string {
-    if (DEFAULT_TG_EMOJI_BY_CHAR.size === 0) return text;
+    ensureFresh();
+    const map = cachedByCharMap;
+    if (map.size === 0) return text;
 
-    const chars = [...DEFAULT_TG_EMOJI_BY_CHAR.keys()].sort((a, b) => b.length - a.length);
+    const chars = [...map.keys()].sort((a, b) => b.length - a.length);
     const escapeForRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const alternation = chars.map(escapeForRegex).join('|');
     const combined = new RegExp(`(<tg-emoji\\s+emoji-id="[^"]*">[\\s\\S]*?<\\/tg-emoji>)|(${alternation})`, 'g');
@@ -230,7 +302,7 @@ export function replaceUnicodeWithTgEmoji(text: string): string {
     return text.replace(combined, (match, preserved: string | undefined, emoji: string | undefined) => {
         if (preserved) return preserved;
         if (!emoji) return match;
-        const id = DEFAULT_TG_EMOJI_BY_CHAR.get(emoji);
+        const id = map.get(emoji);
         return `<tg-emoji emoji-id="${id}">${emoji}</tg-emoji>`;
     });
 }

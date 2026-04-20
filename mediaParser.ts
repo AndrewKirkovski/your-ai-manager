@@ -46,7 +46,8 @@ export interface MediaParserConfig {
     bot: TelegramBot;
     openaiWhisper: OpenAI | null;  // OpenAI client for Whisper (null if not configured)
     anthropic: OpenAI;              // Anthropic client (OpenAI-compatible) for vision
-    visionModel: string;            // e.g., 'claude-sonnet-4-20250514'
+    visionModel: string;            // For photo analysis (default Sonnet)
+    stickerVisionModel?: string;    // For stickers + custom emojis (default Haiku — cheaper, sticker descriptions are simple)
     whisperModel?: string;          // Default: 'whisper-1'
     language?: string;              // Default: 'ru' for transcription
     maxImageTokens?: number;        // Default: 300
@@ -60,6 +61,7 @@ export class MediaParser {
     private openaiWhisper: OpenAI | null;
     private anthropic: OpenAI;
     private visionModel: string;
+    private stickerVisionModel: string;
     private whisperModel: string;
     private language: string;
     private maxImageTokens: number;
@@ -70,6 +72,7 @@ export class MediaParser {
         this.openaiWhisper = config.openaiWhisper;
         this.anthropic = config.anthropic;
         this.visionModel = config.visionModel;
+        this.stickerVisionModel = config.stickerVisionModel || config.visionModel;
         this.whisperModel = config.whisperModel || 'whisper-1';
         this.language = config.language || 'ru';
         this.maxImageTokens = config.maxImageTokens || 300;
@@ -525,7 +528,7 @@ export class MediaParser {
         const setContext = sticker.set_name ? `It's from the sticker pack "${sticker.set_name}". ` : '';
 
         const response = await this.anthropic.chat.completions.create({
-            model: this.visionModel,
+            model: this.stickerVisionModel,
             messages: [{
                 role: 'user',
                 content: [
@@ -553,7 +556,7 @@ export class MediaParser {
         const sourceLabel = isVideo ? 'animated (video) sticker' : 'animated (Lottie) sticker';
 
         const response = await this.anthropic.chat.completions.create({
-            model: this.visionModel,
+            model: this.stickerVisionModel,
             messages: [{
                 role: 'user',
                 content: [

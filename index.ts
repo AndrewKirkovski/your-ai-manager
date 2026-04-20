@@ -13,7 +13,7 @@ import { OpenAIProvider } from './aiProvider.openai';
 import { AnthropicProvider } from './aiProvider.anthropic';
 import type { AIProvider } from './aiProvider';
 import {
-    SYSTEM_PROMPT,
+    getSystemPrompt,
     GREETING_PROMPT,
     GOAL_SET_PROMPT,
     GOAL_CLEAR_PROMPT,
@@ -146,6 +146,7 @@ const AI_PROVIDER_TYPE = (process.env.AI_PROVIDER || 'openai') as 'openai' | 'an
 const OPENAI_WHISPER_API_KEY = process.env.OPENAI_WHISPER_API_KEY;
 const WHISPER_MODEL = process.env.WHISPER_MODEL || 'whisper-1';
 const VISION_MODEL = process.env.VISION_MODEL || 'claude-sonnet-4-20250514';
+const STICKER_VISION_MODEL = process.env.STICKER_VISION_MODEL || 'claude-haiku-4-5-20251001';
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: true});
 initLuxmedMonitor(bot);
@@ -174,6 +175,7 @@ initializeMediaParser({
     openaiWhisper,              // OpenAI for Whisper (null if not configured)
     anthropic: openai,          // Anthropic client (via OpenAI-compatible SDK) for vision
     visionModel: VISION_MODEL,
+    stickerVisionModel: STICKER_VISION_MODEL,
     whisperModel: WHISPER_MODEL,
     language: 'ru'
 });
@@ -263,7 +265,7 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
 
         const memory = await getCurrentInfo(userId);
         const fullPrompt = ` 
-            ${SYSTEM_PROMPT}       
+            ${getSystemPrompt()}
             
             ${memory}`;
 
@@ -430,7 +432,7 @@ cron.schedule('* * * * *', async () => {
                     const result = await AIService.streamAIResponse({
                         userId: user.userId,
                         userMessage: taskPrompt,
-                        systemPrompt: SYSTEM_PROMPT,
+                        systemPrompt: getSystemPrompt(),
                         bot,
                         provider,
                         model: OPEN_AI_MODEL,
@@ -543,7 +545,7 @@ bot.onText(/\/goal(.*)/, serialTextHandler(async (msg, match) => {
         const result = await AIService.streamAIResponse({
             userId,
             userMessage: GOAL_SET_PROMPT(newGoal),
-            systemPrompt: SYSTEM_PROMPT,
+            systemPrompt: getSystemPrompt(),
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -558,7 +560,7 @@ bot.onText(/\/goal(.*)/, serialTextHandler(async (msg, match) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: SYSTEM_PROMPT,
+            systemPrompt: getSystemPrompt(),
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -601,7 +603,7 @@ bot.onText(/\/cleargoal/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId,
             userMessage: GOAL_CLEAR_PROMPT(),
-            systemPrompt: SYSTEM_PROMPT,
+            systemPrompt: getSystemPrompt(),
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -617,7 +619,7 @@ bot.onText(/\/cleargoal/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: SYSTEM_PROMPT,
+            systemPrompt: getSystemPrompt(),
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -663,7 +665,7 @@ bot.onText(/\/routines/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: SYSTEM_PROMPT,
+            systemPrompt: getSystemPrompt(),
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -704,7 +706,7 @@ bot.onText(/\/tasks/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: SYSTEM_PROMPT,
+            systemPrompt: getSystemPrompt(),
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -749,7 +751,7 @@ bot.onText(/\/memory/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: SYSTEM_PROMPT,
+            systemPrompt: getSystemPrompt(),
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -829,7 +831,7 @@ bot.onText(/\/help/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: DEFAULT_HELP_PROMPT(),
-            systemPrompt: SYSTEM_PROMPT,
+            systemPrompt: getSystemPrompt(),
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -970,7 +972,7 @@ bot.on('message', async (msg) => {
             const result = await AIService.streamAIResponse({
                 userId,
                 userMessage: GREETING_PROMPT,
-                systemPrompt: SYSTEM_PROMPT,
+                systemPrompt: getSystemPrompt(),
                 bot,
                 provider,
                 model: OPEN_AI_MODEL,
@@ -1006,7 +1008,7 @@ bot.on('message', async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: SYSTEM_PROMPT,
+            systemPrompt: getSystemPrompt(),
             bot,
             provider,
             model: OPEN_AI_MODEL,

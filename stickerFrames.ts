@@ -14,10 +14,14 @@ import {tmpdir} from 'os';
 import {join} from 'path';
 import {randomBytes} from 'crypto';
 import ffmpegPath from 'ffmpeg-static';
+import ffprobeInstaller from '@ffprobe-installer/ffprobe';
 import ffmpeg from 'fluent-ffmpeg';
 import sharp from 'sharp';
 
+// ffmpeg-static ships only the ffmpeg binary; ffprobe lives in @ffprobe-installer/ffprobe.
+// Without setFfprobePath, fluent-ffmpeg's ffprobe() throws "Cannot find ffprobe" on first call.
 if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+if (ffprobeInstaller?.path) ffmpeg.setFfprobePath(ffprobeInstaller.path);
 
 const FRAME_SIZE = 256;
 const TARGET_FRAMES = 5;

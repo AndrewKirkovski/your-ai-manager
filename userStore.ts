@@ -760,6 +760,16 @@ export function findStickerCacheEntries(filter: {
     return rows.map(rowToStickerCache);
 }
 
+/** All cached custom-emoji entries with a non-empty description.
+ * Used by telegramFormat to merge into the dynamic tg-emoji prompt block + auto-upgrade map.
+ * No limit — bounded by total custom emojis the bot has ever seen (small in practice). */
+export function getAllAnalyzedCustomEmojis(): StickerCacheEntry[] {
+    const rows = db.prepare<[], StickerCacheRow>(
+        `SELECT * FROM sticker_cache WHERE kind = 'custom_emoji' AND description != '' ORDER BY updated_at DESC`
+    ).all();
+    return rows.map(rowToStickerCache);
+}
+
 // ============== STAT TRACKING ==============
 
 export async function addStatEntry(userId: number, name: string, value: number, unit?: string, note?: string, timestamp?: Date): Promise<number> {

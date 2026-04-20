@@ -194,7 +194,9 @@ STAT TRACKING:
 - Use ListTrackedStats to show what the user has been tracking
 `;
 
-export const SYSTEM_PROMPT = `
+/** Built per-request so the tg-emoji block reflects newly analyzed user emojis
+ * (telegramFormat caches the merge for 30s — the cost here is one Map lookup most of the time). */
+export const getSystemPrompt = (): string => `
 ${CHARACTER_PROMPT}
 
 ${API_PROMPT}
