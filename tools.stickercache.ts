@@ -158,6 +158,83 @@ export const FindStickerInCache: Tool = {
     },
 };
 
+export const SendStickerToUser: Tool = {
+    name: 'SendStickerToUser',
+    description:
+        "Send a cached sticker as part of your reaction (instead of, or alongside, a text reply). " +
+        "Pass a vibe phrase describing the mood / content you want (e.g. 'wolf laughing', 'agreement', 'tired', 'heart love'). " +
+        "Tool searches the description cache + emoji list for a substring match and sends the freshest matching sticker. " +
+        "If nothing in the cache matches the vibe, returns success=false with no_match=true — fall back to a normal text reply, do NOT pretend you sent something. " +
+        "Cache only contains stickers users have sent the bot before, so the available repertoire grows organically.",
+    parameters: {
+        type: 'object',
+        properties: {
+            vibe_query: {
+                type: 'string',
+                description: "Free-text description of the mood or content (e.g. 'laughing', 'sad cat', 'celebration', 'thumbs up'). Matched as a substring against the cached description AND the emoji list.",
+            },
+            emoji: {
+                type: 'string',
+                description: "Optional: only consider stickers associated with this emoji (e.g. '😂'). Useful when vibe_query alone is too broad.",
+            },
+        },
+        required: ['vibe_query'],
+    },
+    execute: async (args: {userId: number; vibe_query: string; emoji?: string}) => {
+        if (!botInstance) {
+            return {success: false, message: 'SendStickerToUser: bot instance not initialized'};
+        }
+        const query = args.vibe_query?.trim();
+        if (!query) {
+            return {success: false, message: 'vibe_query is empty'};
+        }
+
+        // Search by description first; if no hit, retry by treating the query as an emoji-list substring.
+        let candidates = findStickerCacheEntries({
+            descriptionContains: query,
+            emojiContains: args.emoji,
+            limit: 5,
+        });
+        if (candidates.length === 0 && !args.emoji) {
+            candidates = findStickerCacheEntries({emojiContains: query, limit: 5});
+        }
+        // Only entries with a sendable file_id qualify.
+        candidates = candidates.filter(c => !!c.fileId);
+
+        if (candidates.length === 0) {
+            return {
+                success: false,
+                no_match: true,
+                vibe_query: query,
+                message: `No cached sticker matches "${query}"${args.emoji ? ` with emoji ${args.emoji}` : ''}. Reply with text instead.`,
+            };
+        }
+
+        const pick = candidates[0];
+        const user = await getUser(args.userId);
+        if (!user?.chatId) {
+            return {success: false, message: 'User chat_id unknown; cannot send sticker.'};
+        }
+        try {
+            const sent = await botInstance.sendSticker(user.chatId, pick.fileId!);
+            return {
+                success: true,
+                cache_key: pick.cacheKey,
+                kind: pick.kind,
+                emojis: pick.emojis,
+                description: pick.description,
+                sent_message_id: sent.message_id,
+                other_candidates: candidates.slice(1, 3).map(c => ({cache_key: c.cacheKey, description: c.description})),
+            };
+        } catch (err) {
+            return {
+                success: false,
+                message: `Failed to send sticker: ${err instanceof Error ? err.message : String(err)}`,
+            };
+        }
+    },
+};
+
 export const EchoStickerToUser: Tool = {
     name: 'EchoStickerToUser',
     description:

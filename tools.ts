@@ -53,6 +53,7 @@ import {
     DeleteStickerCache,
     FindStickerInCache,
     EchoStickerToUser,
+    SendStickerToUser,
 } from "./tools.stickercache";
 
 export const tools = {
@@ -124,6 +125,7 @@ export const tools = {
     DeleteStickerCache,
     FindStickerInCache,
     EchoStickerToUser,
+    SendStickerToUser,
 } as const;
 
 
