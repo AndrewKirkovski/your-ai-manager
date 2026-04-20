@@ -293,6 +293,7 @@ const stmts = {
             user_corrected = excluded.user_corrected
     `),
     deleteStickerCache: db.prepare('DELETE FROM sticker_cache WHERE cache_key = ?'),
+    refreshStickerCacheFileId: db.prepare('UPDATE sticker_cache SET file_id = ? WHERE cache_key = ?'),
     getStickerCacheByIds: db.prepare<[string], StickerCacheRow>('SELECT * FROM sticker_cache WHERE cache_key = ?'),
 
     // Stat Entries
@@ -725,6 +726,14 @@ export function upsertStickerCacheEntry(input: {
 export function deleteStickerCacheEntry(cacheKey: string): boolean {
     const result = stmts.deleteStickerCache.run(cacheKey);
     return result.changes > 0;
+}
+
+/** Update only the file_id of a cache entry (or null it to mark unsendable).
+ * Targeted update — does NOT touch description, kind, emojis, user_corrected, or updated_at.
+ * Used by parseSticker (refresh on cache hit when sticker.file_id rotates) and by
+ * SendStickerToUser on Telegram-rejected file_id (clear so it stops being a candidate). */
+export function refreshStickerCacheFileId(cacheKey: string, fileId: string | null): void {
+    stmts.refreshStickerCacheFileId.run(fileId, cacheKey);
 }
 
 export function findStickerCacheEntries(filter: {

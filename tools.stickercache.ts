@@ -6,6 +6,7 @@ import {
     upsertStickerCacheEntry,
     deleteStickerCacheEntry,
     findStickerCacheEntries,
+    refreshStickerCacheFileId,
     getUser,
     type StickerCacheEntry,
     type StickerCacheKind,
@@ -22,15 +23,14 @@ export function initStickerCacheTools(bot: TelegramBot, client: OpenAI, model?: 
 }
 
 /** Ask the cheap lookup model to pick the cache_key whose description best matches `vibe_query`.
- * Single-candidate fast-path: returns the only candidate (SQL already substring-matched, safe to send).
- * Multi-candidate path: Haiku ranks; on ANY failure (no client / API error / unparseable response /
- * model says "0" or "none") returns null so the caller falls back to a text reply rather than
- * sending a random sticker. */
+ * ALWAYS routes through Haiku when there are candidates — even single-candidate, because the SQL
+ * pre-filter widens up to a kind-only slice when specific matches are scarce, so a "match" can
+ * actually be unrelated. Haiku is the gate that prevents random sticker sends.
+ * Returns null on any failure path (no client, API error, unparseable response, or model says "0"). */
 async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEntry[]): Promise<StickerCacheEntry | null> {
     if (candidates.length === 0) return null;
-    if (candidates.length === 1) return candidates[0];
     if (!lookupClient) {
-        console.warn('[stickerPicker] no lookup client configured; returning null (multi-candidate, ambiguous)');
+        console.warn('[stickerPicker] no lookup client configured; returning null');
         return null;
     }
 
@@ -247,7 +247,8 @@ export const SendStickerToUser: Tool = {
         // Pull a BROAD candidate pool. The Haiku ranker handles semantic match;
         // SQL just narrows to plausible options + recency. Three passes with widening:
         //   1) substring match on description (cheap, often hits)
-        //   2) substring match on emoji list
+        //   2) substring match on emoji list — only if AI explicitly passed an emoji filter
+        //      (using the vibe_query as an emoji substring is nonsense — emojis are JSON like ["😴"])
         //   3) full kind/emoji slice (no description filter) — gives ranker the room to be smart
         const PRE_LIMIT = 30;
         const seen = new Map<string, StickerCacheEntry>();
@@ -255,8 +256,8 @@ export const SendStickerToUser: Tool = {
             for (const r of rows) if (r.fileId && !seen.has(r.cacheKey)) seen.set(r.cacheKey, r);
         };
         collect(findStickerCacheEntries({descriptionContains: query, emojiContains: args.emoji, kind, limit: PRE_LIMIT}));
-        if (seen.size < 5) {
-            collect(findStickerCacheEntries({emojiContains: args.emoji ?? query, kind, limit: PRE_LIMIT}));
+        if (seen.size < 5 && args.emoji) {
+            collect(findStickerCacheEntries({emojiContains: args.emoji, kind, limit: PRE_LIMIT}));
         }
         if (seen.size < 5) {
             collect(findStickerCacheEntries({kind, limit: PRE_LIMIT}));
@@ -299,9 +300,18 @@ export const SendStickerToUser: Tool = {
                 considered: candidates.length,
             };
         } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            // Telegram rejects stale/invalid file_ids with messages like "wrong file_id" or
+            // "wrong type of the web page content". Null the file_id so this entry stops being
+            // a SendStickerToUser candidate; parseSticker / parseCustomEmoji will re-populate
+            // it next time the user sends the same sticker (sticker.file_id is fresh per send).
+            if (/file_id|wrong type|invalid/i.test(errMsg)) {
+                refreshStickerCacheFileId(pick.cacheKey, null);
+                console.warn(`[SendStickerToUser] cleared stale file_id for ${pick.cacheKey}: ${errMsg}`);
+            }
             return {
                 success: false,
-                message: `Failed to send sticker: ${err instanceof Error ? err.message : String(err)}`,
+                message: `Failed to send sticker: ${errMsg}`,
             };
         }
     },

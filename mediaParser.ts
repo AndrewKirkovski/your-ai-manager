@@ -7,6 +7,7 @@ import { createReadStream } from 'fs';
 import {
     getStickerCacheEntry,
     upsertStickerCacheEntry,
+    refreshStickerCacheFileId,
     type StickerCacheKind,
 } from './userStore';
 import { gatherAllPackEmojis } from './stickerSetCache';
@@ -342,6 +343,12 @@ export class MediaParser {
         // Cache hit — skip Vision entirely
         const cached = getStickerCacheEntry(cacheKey);
         if (cached) {
+            // Self-heal: Telegram file_ids occasionally rotate (e.g., when a sticker pack is republished
+            // or after a long server-side TTL). Refresh on every cache hit so SendStickerToUser picks
+            // a sendable id next time. Targeted update — doesn't touch description/updated_at.
+            if (cached.fileId !== sticker.file_id) {
+                refreshStickerCacheFileId(cacheKey, sticker.file_id);
+            }
             return {
                 type: 'sticker',
                 content: cached.description,
@@ -421,6 +428,20 @@ export class MediaParser {
     async parseCustomEmoji(customEmojiId: string, fallbackChar?: string): Promise<ParsedMedia> {
         const cached = getStickerCacheEntry(customEmojiId);
         if (cached) {
+            let fileId = cached.fileId;
+            // Lazy re-fetch: if file_id was previously nulled (Telegram rejected an old id during
+            // SendStickerToUser), try once to recover via the free Bot API call. Cheap, no Vision cost.
+            if (!fileId) {
+                try {
+                    const fresh = (await this.bot.getCustomEmojiStickers([customEmojiId]))?.[0];
+                    if (fresh?.file_id) {
+                        fileId = fresh.file_id;
+                        refreshStickerCacheFileId(customEmojiId, fileId);
+                    }
+                } catch {
+                    // ignore; description still serves the AI even without a sendable id
+                }
+            }
             return {
                 type: 'sticker',
                 content: cached.description,
@@ -429,7 +450,7 @@ export class MediaParser {
                     emoji: fallbackChar,
                     emojis: cached.emojis,
                     setName: cached.setName,
-                    fileId: cached.fileId,
+                    fileId,
                     cacheKey: customEmojiId,
                     stickerKind: 'custom_emoji',
                     cacheHit: true,
