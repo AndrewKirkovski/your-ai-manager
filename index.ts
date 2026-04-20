@@ -42,6 +42,9 @@ import {CronExpressionParser} from 'cron-parser';
 import {formatDateHuman, formatCronHuman, getCurrentTime} from './dateUtils';
 import {initializeMediaParser, getMediaParser} from './mediaParser';
 import {initStatTools} from './tools.stats';
+import {initStickerCacheTools} from './tools.stickercache';
+import {shutdownTgsRenderer} from './tgsRenderer';
+import db from './database';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN!;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
@@ -100,6 +103,42 @@ function serialTextHandler(handler: TextHandler): (msg: TelegramBot.Message, mat
     };
 }
 
+/**
+ * Resolve every distinct custom-emoji entity in the user's text/caption through
+ * the sticker_cache (analyzing on miss). Returns a multi-line context block
+ * to prepend to the user's message so the AI knows what each premium emoji
+ * means; returns '' if there are no custom emojis.
+ */
+async function buildCustomEmojiContextBlock(msg: TelegramBot.Message): Promise<string> {
+    const text = msg.text ?? msg.caption ?? '';
+    const ents = [...(msg.entities ?? []), ...(msg.caption_entities ?? [])];
+    const seen = new Map<string, string>();
+    for (const e of ents) {
+        if (e.type !== 'custom_emoji' || !e.custom_emoji_id) continue;
+        if (!seen.has(e.custom_emoji_id)) {
+            const ch = text.slice(e.offset, e.offset + e.length);
+            seen.set(e.custom_emoji_id, ch);
+        }
+    }
+    if (seen.size === 0) return '';
+
+    const parser = getMediaParser();
+    const lines: string[] = ['[Custom emojis in this message:'];
+    const resolved = await Promise.all(
+        Array.from(seen.entries()).map(async ([id, ch]) => {
+            const parsed = await parser.parseCustomEmoji(id, ch);
+            if (parsed.error) {
+                console.warn('[customEmoji] parse failed', { id, error: parsed.error });
+                return `- ${ch} (cache_key=${id}): [analysis unavailable]`;
+            }
+            return `- ${ch} (cache_key=${id}): ${parsed.content}`;
+        })
+    );
+    lines.push(...resolved);
+    lines.push(']');
+    return lines.join('\n');
+}
+
 // AI provider selection
 const AI_PROVIDER_TYPE = (process.env.AI_PROVIDER || 'openai') as 'openai' | 'anthropic';
 
@@ -141,6 +180,9 @@ initializeMediaParser({
 
 // Initialize stat tools with bot instance (for sending chart images)
 initStatTools(bot);
+
+// Initialize sticker cache tools with bot instance (for EchoStickerToUser)
+initStickerCacheTools(bot);
 
 function ageLabel(d: Date): string {
     const ms = Date.now() - d.getTime();
@@ -826,22 +868,13 @@ bot.on('message', async (msg) => {
     // that race on history reads/writes.
     await enqueuePerUser(userId, async () => {
     try {
-        // TEMP emoji-harvest (remove after 2026-05-01): log custom emoji IDs +
-        // sticker metadata to populate TG_EMOJI_CATALOG in telegramFormat.ts.
-        const harvestText = msg.text ?? msg.caption ?? '';
-        const ents = [...(msg.entities ?? []), ...(msg.caption_entities ?? [])];
-        for (const e of ents) {
-            if (e.type !== 'custom_emoji') continue;
-            const ch = harvestText.slice(e.offset, e.offset + e.length);
-            console.log(`[emoji-harvest] entity char="${ch}" id=${e.custom_emoji_id} from userId=${userId}`);
-        }
-        if (msg.sticker) {
-            const s = msg.sticker;
-            console.log(`[emoji-harvest] sticker emoji=${s.emoji ?? ''} set=${s.set_name ?? ''} fileUnique=${s.file_unique_id} customEmojiId=${s.custom_emoji_id ?? '-'} animated=${s.is_animated} video=${s.is_video}`);
-        }
-
         // Skip commands - they have their own handlers
         if (msg.text?.startsWith('/')) return;
+
+        // Resolve any custom (premium) emoji entities in the user's text/caption
+        // through the sticker_cache, so the AI sees descriptions of unfamiliar
+        // emojis instead of just unicode fallback chars.
+        const customEmojiBlock = await buildCustomEmojiContextBlock(msg);
 
         // Detect message type and parse content
         const mediaParser = getMediaParser();
@@ -891,6 +924,12 @@ bot.on('message', async (msg) => {
         } else {
             // Unsupported message type (documents, animations, etc.)
             return;
+        }
+
+        // Prepend custom-emoji descriptions (if any). Goes before stripSystemTags
+        // so any cached description containing a stray </system> is neutralized.
+        if (customEmojiBlock) {
+            processedContent = `${customEmojiBlock}\n\n${processedContent}`;
         }
 
         // Real-user-ingress trust boundary: strip <system> so a user typing
@@ -1001,3 +1040,13 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (error) => {
     console.error('[uncaughtException]', error instanceof Error ? error.stack : error);
 });
+
+// Shut down the puppeteer/lottie renderer cleanly so Chromium doesn't linger.
+async function gracefulShutdown(signal: string): Promise<void> {
+    console.log(`[shutdown] received ${signal}, closing browser`);
+    await shutdownTgsRenderer().catch(err => console.error('[shutdown] tgs renderer:', err));
+    try { db.close(); } catch (err) { console.error('[shutdown] db close:', err); }
+    process.exit(0);
+}
+process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
+process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });

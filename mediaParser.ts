@@ -4,6 +4,14 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { writeFile, unlink } from 'fs/promises';
 import { createReadStream } from 'fs';
+import {
+    getStickerCacheEntry,
+    upsertStickerCacheEntry,
+    type StickerCacheKind,
+} from './userStore';
+import { gatherAllPackEmojis } from './stickerSetCache';
+import { extractFramesFromWebm, stitchFramesHorizontal } from './stickerFrames';
+import { renderTgsFrames } from './tgsRenderer';
 
 // ============== TYPE DEFINITIONS ==============
 
@@ -15,10 +23,14 @@ export interface ParsedMedia {
     originalType: string;      // e.g., 'voice', 'photo', 'sticker'
     metadata?: {
         duration?: number;     // For voice messages
-        emoji?: string;        // For stickers
+        emoji?: string;        // For stickers — what the *sender* picked
+        emojis?: string[];     // For stickers — full pack-associated emoji list
         setName?: string;      // For stickers
         fileSize?: number;
         fileId?: string;       // Telegram file_id for re-downloading
+        cacheKey?: string;     // For stickers / custom emojis — file_unique_id or custom_emoji_id
+        stickerKind?: StickerCacheKind;
+        cacheHit?: boolean;    // True if description came from sticker_cache
         mimeType?: string;
         // Location metadata
         latitude?: number;
@@ -72,7 +84,7 @@ export class MediaParser {
     detectMediaType(msg: Message): MediaType {
         if (msg.voice) return 'voice';
         if (msg.photo && msg.photo.length > 0) return 'photo';
-        if (msg.sticker && !msg.sticker.is_animated && !msg.sticker.is_video) return 'sticker';
+        if (msg.sticker) return 'sticker';
         if (msg.location) return 'location';
         if (msg.text) return 'text';
         return 'unsupported';
@@ -315,97 +327,250 @@ export class MediaParser {
     // ============== STICKER PARSING ==============
 
     /**
-     * Download and analyze static sticker using Claude Vision
-     * Includes emoji context for better AI understanding
+     * Cache-aware sticker parser: dispatches to static / animated (.tgs) /
+     * video (.webm) handlers, looks up file_unique_id in sticker_cache first,
+     * gathers all pack-associated emojis, and stores the description on miss.
      */
     async parseSticker(sticker: Sticker): Promise<ParsedMedia> {
-        // Reject animated/video stickers
-        if (sticker.is_animated || sticker.is_video) {
+        const cacheKey = sticker.file_unique_id;
+        const kind: StickerCacheKind = sticker.is_video
+            ? 'video_sticker'
+            : sticker.is_animated
+                ? 'animated_sticker'
+                : 'sticker';
+
+        // Cache hit — skip Vision entirely
+        const cached = getStickerCacheEntry(cacheKey);
+        if (cached) {
             return {
                 type: 'sticker',
-                content: `User sent an animated sticker with emoji ${sticker.emoji || 'unknown'}`,
-                originalType: 'animated_sticker',
+                content: cached.description,
+                originalType: cached.kind,
                 metadata: {
                     emoji: sticker.emoji,
-                    setName: sticker.set_name
+                    emojis: cached.emojis,
+                    setName: cached.setName,
+                    fileSize: sticker.file_size,
+                    fileId: sticker.file_id,
+                    cacheKey,
+                    stickerKind: cached.kind,
+                    cacheHit: true,
                 },
-                error: 'Animated stickers are not supported for visual analysis'
             };
         }
 
+        // Cache miss — gather full emoji list from the pack (best-effort)
+        const allEmojis = await gatherAllPackEmojis(this.bot, sticker.set_name, cacheKey, sticker.emoji);
+
         try {
-            // Step 1: Download sticker (WebP format)
-            const fileStream = this.bot.getFileStream(sticker.file_id);
-            const chunks: Buffer[] = [];
-
-            for await (const chunk of fileStream) {
-                chunks.push(chunk as Buffer);
-            }
-            const stickerBuffer = Buffer.concat(chunks);
-
-            // Step 2: Convert to base64
-            const base64Sticker = stickerBuffer.toString('base64');
-            const stickerUrl = `data:image/webp;base64,${base64Sticker}`;
-
-            // Step 3: Build context-aware prompt
-            const emojiContext = sticker.emoji ? `This sticker is associated with the emoji: ${sticker.emoji}. ` : '';
-            const setContext = sticker.set_name ? `It's from the sticker pack "${sticker.set_name}". ` : '';
-
-            // Step 4: Analyze with Claude Vision
-            const response = await this.anthropic.chat.completions.create({
-                model: this.visionModel,
-                messages: [
-                    {
-                        role: 'user',
-                        content: [
-                            {
-                                type: 'text',
-                                text: `Analyze this sticker image. ${emojiContext}${setContext}` +
-                                    'Describe what it shows: the character, expression, action, and emotional tone. ' +
-                                    'What message or emotion is the user trying to convey by sending this sticker? '
-                            },
-                            {
-                                type: 'image_url',
-                                image_url: { url: stickerUrl }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens: this.maxStickerTokens
+            const description = await this.analyzeStickerByKind(sticker, kind, allEmojis);
+            upsertStickerCacheEntry({
+                cacheKey,
+                kind,
+                emojis: allEmojis,
+                setName: sticker.set_name,
+                description,
+                fileId: sticker.file_id,
             });
-
-            const description = response.choices[0]?.message?.content || 'Unable to analyze sticker';
-
             return {
                 type: 'sticker',
                 content: description,
-                originalType: 'sticker',
+                originalType: kind,
                 metadata: {
                     emoji: sticker.emoji,
+                    emojis: allEmojis,
                     setName: sticker.set_name,
-                    fileSize: sticker.file_size
-                }
+                    fileSize: sticker.file_size,
+                    fileId: sticker.file_id,
+                    cacheKey,
+                    stickerKind: kind,
+                    cacheHit: false,
+                },
             };
         } catch (error) {
             console.error('Sticker parsing failed:', {
                 error: error instanceof Error ? error.message : String(error),
+                kind,
                 emoji: sticker.emoji,
-                setName: sticker.set_name
+                setName: sticker.set_name,
+                cacheKey,
             });
-
-            // Fallback to emoji-only description
-            const emojiHint = sticker.emoji ? ` (${sticker.emoji})` : '';
+            const emojiHint = allEmojis.length > 0 ? ` (${allEmojis.join(' ')})` : '';
             return {
                 type: 'sticker',
-                content: `User sent a sticker${emojiHint}`,
-                originalType: 'sticker',
+                content: `User sent a ${kind}${emojiHint}`,
+                originalType: kind,
                 metadata: {
                     emoji: sticker.emoji,
-                    setName: sticker.set_name
+                    emojis: allEmojis,
+                    setName: sticker.set_name,
+                    fileId: sticker.file_id,
+                    cacheKey,
+                    stickerKind: kind,
                 },
-                error: error instanceof Error ? error.message : 'Unknown sticker error'
+                error: error instanceof Error ? error.message : 'Unknown sticker error',
             };
         }
+    }
+
+    /**
+     * Analyze a custom (premium) emoji by its custom_emoji_id. Looks up the
+     * sticker_cache; on miss, fetches the underlying sticker via
+     * bot.getCustomEmojiStickers and runs Vision on it.
+     */
+    async parseCustomEmoji(customEmojiId: string, fallbackChar?: string): Promise<ParsedMedia> {
+        const cached = getStickerCacheEntry(customEmojiId);
+        if (cached) {
+            return {
+                type: 'sticker',
+                content: cached.description,
+                originalType: 'custom_emoji',
+                metadata: {
+                    emoji: fallbackChar,
+                    emojis: cached.emojis,
+                    setName: cached.setName,
+                    fileId: cached.fileId,
+                    cacheKey: customEmojiId,
+                    stickerKind: 'custom_emoji',
+                    cacheHit: true,
+                },
+            };
+        }
+
+        try {
+            const stickers = await this.bot.getCustomEmojiStickers([customEmojiId]);
+            const sticker = stickers?.[0];
+            if (!sticker) {
+                throw new Error(`getCustomEmojiStickers returned no sticker for ${customEmojiId}`);
+            }
+            const charForList = sticker.emoji || fallbackChar;
+            const emojis = charForList ? [charForList] : [];
+            const kind: StickerCacheKind = sticker.is_video
+                ? 'video_sticker'
+                : sticker.is_animated
+                    ? 'animated_sticker'
+                    : 'custom_emoji';
+
+            const description = await this.analyzeStickerByKind(sticker, kind === 'custom_emoji' ? 'sticker' : kind, emojis);
+            upsertStickerCacheEntry({
+                cacheKey: customEmojiId,
+                kind: 'custom_emoji',
+                emojis,
+                setName: sticker.set_name,
+                description,
+                fileId: sticker.file_id,
+            });
+            return {
+                type: 'sticker',
+                content: description,
+                originalType: 'custom_emoji',
+                metadata: {
+                    emoji: fallbackChar,
+                    emojis,
+                    setName: sticker.set_name,
+                    fileId: sticker.file_id,
+                    cacheKey: customEmojiId,
+                    stickerKind: 'custom_emoji',
+                    cacheHit: false,
+                },
+            };
+        } catch (error) {
+            console.error('Custom emoji parsing failed:', {
+                error: error instanceof Error ? error.message : String(error),
+                customEmojiId,
+            });
+            const fallbackDesc = fallbackChar
+                ? `Custom emoji rendering of ${fallbackChar} (analysis unavailable)`
+                : 'Custom emoji (analysis unavailable)';
+            return {
+                type: 'sticker',
+                content: fallbackDesc,
+                originalType: 'custom_emoji',
+                metadata: {
+                    emoji: fallbackChar,
+                    emojis: fallbackChar ? [fallbackChar] : [],
+                    cacheKey: customEmojiId,
+                    stickerKind: 'custom_emoji',
+                },
+                error: error instanceof Error ? error.message : 'Unknown custom emoji error',
+            };
+        }
+    }
+
+    /**
+     * Dispatch by sticker kind. Returns the Vision-generated description string.
+     * Throws on unrecoverable error.
+     */
+    private async analyzeStickerByKind(sticker: Sticker, kind: StickerCacheKind, emojis: string[]): Promise<string> {
+        const buffer = await this.downloadFile(sticker.file_id);
+        if (kind === 'video_sticker') {
+            const frames = await extractFramesFromWebm(buffer, 5);
+            const strip = await stitchFramesHorizontal(frames);
+            return this.analyzeAnimatedStrip(strip, sticker, emojis, /*isVideo*/ true);
+        }
+        if (kind === 'animated_sticker') {
+            const frames = await renderTgsFrames(buffer, 5);
+            const strip = await stitchFramesHorizontal(frames);
+            return this.analyzeAnimatedStrip(strip, sticker, emojis, /*isVideo*/ false);
+        }
+        // static .webp
+        return this.analyzeStaticSticker(buffer, sticker, emojis);
+    }
+
+    private async analyzeStaticSticker(webp: Buffer, sticker: Sticker, emojis: string[]): Promise<string> {
+        const stickerUrl = `data:image/webp;base64,${webp.toString('base64')}`;
+        const emojiContext = emojis.length > 0
+            ? `This sticker is associated in its pack with these emojis: ${emojis.join(' ')}. `
+            : '';
+        const setContext = sticker.set_name ? `It's from the sticker pack "${sticker.set_name}". ` : '';
+
+        const response = await this.anthropic.chat.completions.create({
+            model: this.visionModel,
+            messages: [{
+                role: 'user',
+                content: [
+                    {
+                        type: 'text',
+                        text: `Analyze this sticker image. ${emojiContext}${setContext}` +
+                            'Describe what it shows: the character, expression, action, and emotional tone. ' +
+                            'What message or emotion is typically conveyed by sending this sticker? ' +
+                            'Be concise (2-3 sentences).',
+                    },
+                    { type: 'image_url', image_url: { url: stickerUrl } },
+                ],
+            }],
+            max_tokens: this.maxStickerTokens,
+        });
+        return response.choices[0]?.message?.content || 'Unable to analyze sticker';
+    }
+
+    private async analyzeAnimatedStrip(strip: Buffer, sticker: Sticker, emojis: string[], isVideo: boolean): Promise<string> {
+        const url = `data:image/png;base64,${strip.toString('base64')}`;
+        const emojiContext = emojis.length > 0
+            ? `Pack-associated emojis: ${emojis.join(' ')}. `
+            : '';
+        const setContext = sticker.set_name ? `Pack: "${sticker.set_name}". ` : '';
+        const sourceLabel = isVideo ? 'animated (video) sticker' : 'animated (Lottie) sticker';
+
+        const response = await this.anthropic.chat.completions.create({
+            model: this.visionModel,
+            messages: [{
+                role: 'user',
+                content: [
+                    {
+                        type: 'text',
+                        text: `These are 5 frames (left → right, evenly spaced in time) from an ${sourceLabel}. ` +
+                            `${emojiContext}${setContext}` +
+                            'Describe what is happening across the frames: the character, the motion or expression change, ' +
+                            'and what message/emotion the sender is typically conveying when using this sticker. ' +
+                            'Be concise (3-4 sentences).',
+                    },
+                    { type: 'image_url', image_url: { url } },
+                ],
+            }],
+            max_tokens: Math.max(this.maxStickerTokens, 350),
+        });
+        return response.choices[0]?.message?.content || 'Unable to analyze animated sticker';
     }
 
     // ============== LOCATION MESSAGE PARSING ==============
@@ -473,9 +638,24 @@ export class MediaParser {
             case 'photo':
                 return `[User sent a photo]\nImage description: ${parsed.content}\n[End of photo description]`;
 
-            case 'sticker':
-                const emojiHint = parsed.metadata?.emoji ? ` (${parsed.metadata.emoji})` : '';
-                return `[User sent a sticker${emojiHint}]\nSticker analysis: ${parsed.content}\n[End of sticker analysis]`;
+            case 'sticker': {
+                const m = parsed.metadata ?? {};
+                const kindLabel = m.stickerKind === 'video_sticker'
+                    ? 'video sticker'
+                    : m.stickerKind === 'animated_sticker'
+                        ? 'animated sticker'
+                        : m.stickerKind === 'custom_emoji'
+                            ? 'custom emoji'
+                            : 'sticker';
+                const lines: string[] = [`[User sent a ${kindLabel}]`];
+                if (m.cacheKey) lines.push(`cache_key: ${m.cacheKey}`);
+                if (m.emoji) lines.push(`sender chose emoji: ${m.emoji}`);
+                if (m.emojis && m.emojis.length > 0) lines.push(`pack-associated emojis: ${m.emojis.join(' ')}`);
+                if (m.setName) lines.push(`pack: ${m.setName}`);
+                lines.push(`analysis: ${parsed.content}`);
+                lines.push(`[End of ${kindLabel}]`);
+                return lines.join('\n');
+            }
 
             case 'location':
                 const liveHint = parsed.metadata?.livePeriod ? ' (LIVE)' : '';
@@ -500,8 +680,19 @@ export class MediaParser {
                 return `[Voice ${parsed.metadata?.duration}s]`;
             case 'photo':
                 return '[Photo]';
-            case 'sticker':
-                return `[Sticker ${parsed.metadata?.emoji || ''}]`;
+            case 'sticker': {
+                const m = parsed.metadata ?? {};
+                const kindAbbrev = m.stickerKind === 'video_sticker'
+                    ? 'VidSticker'
+                    : m.stickerKind === 'animated_sticker'
+                        ? 'AnimSticker'
+                        : m.stickerKind === 'custom_emoji'
+                            ? 'CustomEmoji'
+                            : 'Sticker';
+                const e = m.emojis && m.emojis.length > 0 ? m.emojis.join('') : (m.emoji || '');
+                const hit = m.cacheHit ? ' cached' : '';
+                return `[${kindAbbrev} ${e}${hit}]`;
+            }
             case 'location':
                 return parsed.metadata?.livePeriod ? '[Live Location]' : '[Location]';
             default:

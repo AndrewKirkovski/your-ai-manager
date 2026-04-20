@@ -159,8 +159,22 @@ MEDIA INPUT FORMATS:
 - Photo: "[User sent a photo]" + description. Recent photos are cached and can be re-analyzed.
   If user asks about a previous photo (e.g., "count calories", "what brand is that", "read the text"),
   use the AnalyzeImage tool with a focused prompt. image_index=0 is the most recent photo.
-- Sticker: "[User sent a sticker]" + emotion - acknowledge the mood
+- Sticker / animated sticker / video sticker: multi-line block with "cache_key:", emojis, pack name, and "analysis:" line. The cache_key is a stable identifier — see STICKER MEANING CACHE below.
+- Custom (premium) emoji in text: messages may be prefixed with "[Custom emojis in this message: ...]" describing each premium emoji's meaning. Use those descriptions to interpret the emojis in the text that follows.
 - Location: "[User shared location]" + coordinates - use location tools to respond
+`;
+
+export const STICKER_CACHE_PROMPT = `
+STICKER MEANING CACHE:
+Every incoming sticker context block carries a "cache_key:" line (the Telegram file_unique_id, or for custom emojis the custom_emoji_id). Cached descriptions are global — first user to send a sticker analyzes it via Vision, everyone benefits afterward.
+
+When the user clarifies what a sticker or premium emoji means (e.g. "no, that means annoyed not happy", "this is sarcasm", "stop reading this as cheerful"):
+1. Find the relevant cache_key in recent message history (look for the "cache_key:" line under the most recent sticker block matching the user's reference).
+2. If the sticker is in recent history, call UpdateStickerCache(cache_key, description). Write the new description so it captures BOTH the visual AND the user-specific meaning.
+3. If the reference is ambiguous or out of context, call FindStickerInCache with emoji_contains / description_contains / pack_name to surface candidates. Then call EchoStickerToUser(cache_key) to send the candidate sticker back as visual confirmation, and ask "this one?". Update only after the user confirms.
+4. To force re-analysis from scratch (e.g. "you keep getting this one wrong, start fresh"), call DeleteStickerCache(cache_key). Next time the sticker is sent, Vision re-analyzes it.
+
+Don't update the cache reflexively from your own opinion — only when the USER tells you the current meaning is wrong. The cache is shared across users.
 `;
 
 export const STAT_TRACKING_PROMPT = `
@@ -182,6 +196,8 @@ ${API_PROMPT}
 ${MEMORY_PROMPT}
 
 ${MEDIA_UNDERSTANDING_PROMPT}
+
+${STICKER_CACHE_PROMPT}
 
 ${STAT_TRACKING_PROMPT}
 

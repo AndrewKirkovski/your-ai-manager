@@ -131,6 +131,18 @@ interface ImageRow {
     timestamp: string;
 }
 
+interface StickerCacheRow {
+    cache_key: string;
+    kind: string;
+    emojis: string;
+    set_name: string | null;
+    description: string;
+    file_id: string | null;
+    analyzed_at: string;
+    updated_at: string;
+    user_corrected: number;
+}
+
 interface StatRow {
     id: number;
     user_id: number;
@@ -265,6 +277,23 @@ const stmts = {
     insertImage: db.prepare('INSERT INTO image_cache (user_id, file_id, caption, description, timestamp) VALUES (?, ?, ?, ?, ?)'),
     getRecentImages: db.prepare<[number, number], ImageRow>('SELECT * FROM image_cache WHERE user_id = ? ORDER BY id DESC LIMIT ?'),
     pruneImages: db.prepare('DELETE FROM image_cache WHERE user_id = ? AND id NOT IN (SELECT id FROM image_cache WHERE user_id = ? ORDER BY id DESC LIMIT ?)'),
+
+    // Sticker / Custom Emoji Cache (global, keyed by file_unique_id or custom_emoji_id)
+    getStickerCache: db.prepare<[string], StickerCacheRow>('SELECT * FROM sticker_cache WHERE cache_key = ?'),
+    upsertStickerCache: db.prepare(`
+        INSERT INTO sticker_cache (cache_key, kind, emojis, set_name, description, file_id, analyzed_at, updated_at, user_corrected)
+        VALUES (@cache_key, @kind, @emojis, @set_name, @description, @file_id, @analyzed_at, @updated_at, @user_corrected)
+        ON CONFLICT(cache_key) DO UPDATE SET
+            kind = excluded.kind,
+            emojis = excluded.emojis,
+            set_name = COALESCE(excluded.set_name, set_name),
+            description = excluded.description,
+            file_id = COALESCE(excluded.file_id, file_id),
+            updated_at = excluded.updated_at,
+            user_corrected = excluded.user_corrected
+    `),
+    deleteStickerCache: db.prepare('DELETE FROM sticker_cache WHERE cache_key = ?'),
+    getStickerCacheByIds: db.prepare<[string], StickerCacheRow>('SELECT * FROM sticker_cache WHERE cache_key = ?'),
 
     // Stat Entries
     insertStat: db.prepare('INSERT INTO stat_entries (user_id, name, value, unit, note, timestamp) VALUES (?, ?, ?, ?, ?, ?)'),
@@ -623,6 +652,112 @@ export async function getRecentImages(userId: number, limit: number = 10): Promi
         description: row.description ?? undefined,
         timestamp: new Date(row.timestamp),
     }));
+}
+
+// ============== STICKER / CUSTOM-EMOJI CACHE ==============
+
+export type StickerCacheKind = 'sticker' | 'animated_sticker' | 'video_sticker' | 'custom_emoji';
+
+export type StickerCacheEntry = {
+    cacheKey: string;
+    kind: StickerCacheKind;
+    emojis: string[];
+    setName?: string;
+    description: string;
+    fileId?: string;
+    analyzedAt: Date;
+    updatedAt: Date;
+    userCorrected: boolean;
+};
+
+function parseEmojis(json: string): string[] {
+    try {
+        const parsed = JSON.parse(json);
+        return Array.isArray(parsed) ? parsed.filter(e => typeof e === 'string') : [];
+    } catch {
+        return [];
+    }
+}
+
+function rowToStickerCache(row: StickerCacheRow): StickerCacheEntry {
+    return {
+        cacheKey: row.cache_key,
+        kind: row.kind as StickerCacheKind,
+        emojis: parseEmojis(row.emojis),
+        setName: row.set_name ?? undefined,
+        description: row.description,
+        fileId: row.file_id ?? undefined,
+        analyzedAt: new Date(row.analyzed_at),
+        updatedAt: new Date(row.updated_at),
+        userCorrected: !!row.user_corrected,
+    };
+}
+
+export function getStickerCacheEntry(cacheKey: string): StickerCacheEntry | undefined {
+    const row = stmts.getStickerCache.get(cacheKey);
+    return row ? rowToStickerCache(row) : undefined;
+}
+
+export function upsertStickerCacheEntry(input: {
+    cacheKey: string;
+    kind: StickerCacheKind;
+    emojis: string[];
+    setName?: string;
+    description: string;
+    fileId?: string;
+    userCorrected?: boolean;
+}): void {
+    const existing = stmts.getStickerCache.get(input.cacheKey);
+    const now = new Date().toISOString();
+    stmts.upsertStickerCache.run({
+        cache_key: input.cacheKey,
+        kind: input.kind,
+        emojis: JSON.stringify(input.emojis),
+        set_name: input.setName ?? null,
+        description: input.description,
+        file_id: input.fileId ?? null,
+        analyzed_at: existing?.analyzed_at ?? now,
+        updated_at: now,
+        user_corrected: input.userCorrected ? 1 : (existing?.user_corrected ?? 0),
+    });
+}
+
+export function deleteStickerCacheEntry(cacheKey: string): boolean {
+    const result = stmts.deleteStickerCache.run(cacheKey);
+    return result.changes > 0;
+}
+
+export function findStickerCacheEntries(filter: {
+    emojiContains?: string;
+    descriptionContains?: string;
+    packName?: string;
+    kind?: StickerCacheKind;
+    limit?: number;
+}): StickerCacheEntry[] {
+    const conds: string[] = [];
+    const params: unknown[] = [];
+    if (filter.emojiContains) {
+        conds.push('emojis LIKE ?');
+        params.push(`%${filter.emojiContains}%`);
+    }
+    if (filter.descriptionContains) {
+        conds.push('description LIKE ?');
+        params.push(`%${filter.descriptionContains}%`);
+    }
+    if (filter.packName) {
+        conds.push('set_name LIKE ?');
+        params.push(`%${filter.packName}%`);
+    }
+    if (filter.kind) {
+        conds.push('kind = ?');
+        params.push(filter.kind);
+    }
+    const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    const limit = Math.max(1, Math.min(filter.limit ?? 10, 50));
+    params.push(limit);
+    const sql = `SELECT * FROM sticker_cache ${where} ORDER BY updated_at DESC LIMIT ?`;
+    const rows = db.prepare<unknown[], StickerCacheRow>(sql).all(...params);
+    return rows.map(rowToStickerCache);
 }
 
 // ============== STAT TRACKING ==============

@@ -129,6 +129,18 @@ export const SCHEMA_SQL = `
         expires_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS sticker_cache (
+        cache_key      TEXT PRIMARY KEY,
+        kind           TEXT NOT NULL,
+        emojis         TEXT NOT NULL DEFAULT '[]',
+        set_name       TEXT,
+        description    TEXT NOT NULL,
+        file_id        TEXT,
+        analyzed_at    TEXT NOT NULL,
+        updated_at     TEXT NOT NULL,
+        user_corrected INTEGER NOT NULL DEFAULT 0
+    );
+
     CREATE TABLE IF NOT EXISTS stat_entries (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id   INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
@@ -151,4 +163,6 @@ export const INDEXES_SQL = `
     CREATE INDEX IF NOT EXISTS idx_luxmed_monitorings_active ON luxmed_monitorings(active, user_id);
     CREATE INDEX IF NOT EXISTS idx_user_addresses_user ON user_addresses(user_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_clinics_name ON luxmed_clinics(name);
+    CREATE INDEX IF NOT EXISTS idx_sticker_cache_kind ON sticker_cache(kind);
+    CREATE INDEX IF NOT EXISTS idx_sticker_cache_set_name ON sticker_cache(set_name);
 `;

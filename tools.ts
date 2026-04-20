@@ -48,6 +48,12 @@ import {
 } from "./tools.luxmed";
 import { GetDirections } from "./tools.directions";
 import { SaveAddress, ListAddresses, DeleteAddress } from "./tools.address";
+import {
+    UpdateStickerCache,
+    DeleteStickerCache,
+    FindStickerInCache,
+    EchoStickerToUser,
+} from "./tools.stickercache";
 
 export const tools = {
     get_current_time,
@@ -113,6 +119,11 @@ export const tools = {
     SaveAddress,
     ListAddresses,
     DeleteAddress,
+    // Sticker / custom-emoji cache
+    UpdateStickerCache,
+    DeleteStickerCache,
+    FindStickerInCache,
+    EchoStickerToUser,
 } as const;
 
 
