@@ -1,4 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
+import OpenAI from 'openai';
 import {Tool} from './tool.types';
 import {
     getStickerCacheEntry,
@@ -6,13 +7,52 @@ import {
     deleteStickerCacheEntry,
     findStickerCacheEntries,
     getUser,
+    type StickerCacheEntry,
     type StickerCacheKind,
 } from './userStore';
 
 let botInstance: TelegramBot | null = null;
+let lookupClient: OpenAI | null = null;
+let lookupModel: string = 'claude-haiku-4-5-20251001';
 
-export function initStickerCacheTools(bot: TelegramBot): void {
+export function initStickerCacheTools(bot: TelegramBot, client: OpenAI, model?: string): void {
     botInstance = bot;
+    lookupClient = client;
+    if (model) lookupModel = model;
+}
+
+/** Ask the cheap lookup model to pick the cache_key whose description best matches `vibe_query`.
+ * Returns the chosen entry, or candidates[0] on any error so the caller still sends *something*. */
+async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEntry[]): Promise<StickerCacheEntry> {
+    if (candidates.length <= 1 || !lookupClient) return candidates[0];
+
+    const numbered = candidates.map((c, i) => {
+        const emojis = c.emojis.length > 0 ? ` [${c.emojis.join(' ')}]` : '';
+        const desc = c.description.length > 220 ? c.description.slice(0, 217) + '...' : c.description;
+        return `${i + 1}.${emojis} ${desc}`;
+    }).join('\n');
+
+    const prompt =
+        `Pick the single best sticker for vibe "${vibe_query}" from this numbered list. ` +
+        `Match by visual content / emotion / character — not just keyword overlap. ` +
+        `If nothing fits well, still pick the closest. ` +
+        `Reply with ONLY the integer index (1-${candidates.length}), no other text.\n\n${numbered}`;
+
+    try {
+        const resp = await lookupClient.chat.completions.create({
+            model: lookupModel,
+            messages: [{role: 'user', content: prompt}],
+            max_tokens: 10,
+        });
+        const raw = resp.choices[0]?.message?.content?.trim() ?? '';
+        const idx = parseInt(raw.match(/\d+/)?.[0] ?? '', 10);
+        if (Number.isFinite(idx) && idx >= 1 && idx <= candidates.length) {
+            return candidates[idx - 1];
+        }
+    } catch (err) {
+        console.warn('[stickerPicker] lookup model failed, falling back to first candidate:', err instanceof Error ? err.message : err);
+    }
+    return candidates[0];
 }
 
 const KIND_VALUES: StickerCacheKind[] = ['sticker', 'animated_sticker', 'video_sticker', 'custom_emoji'];
@@ -163,24 +203,29 @@ export const SendStickerToUser: Tool = {
     description:
         "Send a cached sticker as part of your reaction (instead of, or alongside, a text reply). " +
         "Pass a vibe phrase describing the mood / content you want (e.g. 'wolf laughing', 'agreement', 'tired', 'heart love'). " +
-        "Tool searches the description cache + emoji list for a substring match and sends the freshest matching sticker. " +
-        "If nothing in the cache matches the vibe, returns success=false with no_match=true — fall back to a normal text reply, do NOT pretend you sent something. " +
+        "A cheap lookup model (Haiku) ranks the cached descriptions by semantic match to your vibe and picks the best one — better than keyword matching. " +
+        "If nothing in the cache fits the vibe, returns success=false with no_match=true — fall back to a normal text reply, do NOT pretend you sent something. " +
         "Cache only contains stickers users have sent the bot before, so the available repertoire grows organically.",
     parameters: {
         type: 'object',
         properties: {
             vibe_query: {
                 type: 'string',
-                description: "Free-text description of the mood or content (e.g. 'laughing', 'sad cat', 'celebration', 'thumbs up'). Matched as a substring against the cached description AND the emoji list.",
+                description: "Free-text description of the mood or content (e.g. 'laughing wolf', 'sad cat', 'celebration', 'thumbs up'). The picker model matches by meaning, so vivid phrases work better than single keywords.",
             },
             emoji: {
                 type: 'string',
                 description: "Optional: only consider stickers associated with this emoji (e.g. '😂'). Useful when vibe_query alone is too broad.",
             },
+            kind: {
+                type: 'string',
+                enum: ['sticker', 'animated_sticker', 'video_sticker', 'custom_emoji'],
+                description: "Optional: restrict to a sticker kind. Use 'custom_emoji' when you want a small inline reaction; 'sticker'/'animated_sticker'/'video_sticker' for full stickers.",
+            },
         },
         required: ['vibe_query'],
     },
-    execute: async (args: {userId: number; vibe_query: string; emoji?: string}) => {
+    execute: async (args: {userId: number; vibe_query: string; emoji?: string; kind?: string}) => {
         if (!botInstance) {
             return {success: false, message: 'SendStickerToUser: bot instance not initialized'};
         }
@@ -188,29 +233,38 @@ export const SendStickerToUser: Tool = {
         if (!query) {
             return {success: false, message: 'vibe_query is empty'};
         }
+        const kind = isStickerKind(args.kind) ? args.kind : undefined;
 
-        // Search by description first; if no hit, retry by treating the query as an emoji-list substring.
-        let candidates = findStickerCacheEntries({
-            descriptionContains: query,
-            emojiContains: args.emoji,
-            limit: 5,
-        });
-        if (candidates.length === 0 && !args.emoji) {
-            candidates = findStickerCacheEntries({emojiContains: query, limit: 5});
+        // Pull a BROAD candidate pool. The Haiku ranker handles semantic match;
+        // SQL just narrows to plausible options + recency. Three passes with widening:
+        //   1) substring match on description (cheap, often hits)
+        //   2) substring match on emoji list
+        //   3) full kind/emoji slice (no description filter) — gives ranker the room to be smart
+        const PRE_LIMIT = 30;
+        const seen = new Map<string, StickerCacheEntry>();
+        const collect = (rows: StickerCacheEntry[]) => {
+            for (const r of rows) if (r.fileId && !seen.has(r.cacheKey)) seen.set(r.cacheKey, r);
+        };
+        collect(findStickerCacheEntries({descriptionContains: query, emojiContains: args.emoji, kind, limit: PRE_LIMIT}));
+        if (seen.size < 5) {
+            collect(findStickerCacheEntries({emojiContains: args.emoji ?? query, kind, limit: PRE_LIMIT}));
         }
-        // Only entries with a sendable file_id qualify.
-        candidates = candidates.filter(c => !!c.fileId);
+        if (seen.size < 5) {
+            collect(findStickerCacheEntries({kind, limit: PRE_LIMIT}));
+        }
 
+        const candidates = Array.from(seen.values());
         if (candidates.length === 0) {
             return {
                 success: false,
                 no_match: true,
                 vibe_query: query,
-                message: `No cached sticker matches "${query}"${args.emoji ? ` with emoji ${args.emoji}` : ''}. Reply with text instead.`,
+                message: `No cached sticker available${kind ? ` of kind ${kind}` : ''}${args.emoji ? ` for emoji ${args.emoji}` : ''}. Reply with text instead.`,
             };
         }
 
-        const pick = candidates[0];
+        const pick = await pickStickerByVibe(query, candidates);
+
         const user = await getUser(args.userId);
         if (!user?.chatId) {
             return {success: false, message: 'User chat_id unknown; cannot send sticker.'};
@@ -224,7 +278,7 @@ export const SendStickerToUser: Tool = {
                 emojis: pick.emojis,
                 description: pick.description,
                 sent_message_id: sent.message_id,
-                other_candidates: candidates.slice(1, 3).map(c => ({cache_key: c.cacheKey, description: c.description})),
+                considered: candidates.length,
             };
         } catch (err) {
             return {

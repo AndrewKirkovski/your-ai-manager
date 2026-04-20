@@ -146,7 +146,7 @@ const AI_PROVIDER_TYPE = (process.env.AI_PROVIDER || 'openai') as 'openai' | 'an
 const OPENAI_WHISPER_API_KEY = process.env.OPENAI_WHISPER_API_KEY;
 const WHISPER_MODEL = process.env.WHISPER_MODEL || 'whisper-1';
 const VISION_MODEL = process.env.VISION_MODEL || 'claude-sonnet-4-20250514';
-const STICKER_VISION_MODEL = process.env.STICKER_VISION_MODEL || 'claude-haiku-4-5-20251001';
+const STICKER_LOOKUP_MODEL = process.env.STICKER_LOOKUP_MODEL || 'claude-haiku-4-5-20251001';
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: true});
 initLuxmedMonitor(bot);
@@ -175,7 +175,6 @@ initializeMediaParser({
     openaiWhisper,              // OpenAI for Whisper (null if not configured)
     anthropic: openai,          // Anthropic client (via OpenAI-compatible SDK) for vision
     visionModel: VISION_MODEL,
-    stickerVisionModel: STICKER_VISION_MODEL,
     whisperModel: WHISPER_MODEL,
     language: 'ru'
 });
@@ -183,8 +182,8 @@ initializeMediaParser({
 // Initialize stat tools with bot instance (for sending chart images)
 initStatTools(bot);
 
-// Initialize sticker cache tools with bot instance (for EchoStickerToUser)
-initStickerCacheTools(bot);
+// Initialize sticker cache tools with bot + Haiku lookup client for SendStickerToUser ranking
+initStickerCacheTools(bot, openai, STICKER_LOOKUP_MODEL);
 
 function ageLabel(d: Date): string {
     const ms = Date.now() - d.getTime();
