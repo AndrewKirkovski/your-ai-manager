@@ -104,8 +104,8 @@ export async function extractFramesFromWebm(
             frames.push(await fs.readFile(out));
         }
 
-        if (frames.length < 2) {
-            throw new Error(`extractFramesFromWebm: only ${frames.length} frame(s) extracted from ${duration.toFixed(2)}s clip (needed ≥2)`);
+        if (frames.length === 0) {
+            throw new Error(`extractFramesFromWebm: 0 frames extracted from ${duration.toFixed(2)}s clip`);
         }
         return frames;
     } finally {

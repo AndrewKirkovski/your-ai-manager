@@ -121,10 +121,13 @@ export async function renderTgsFrames(buffer: Buffer, count: number = 5): Promis
             animationData as never,
         );
 
-        const safeTotal = Math.max(1, totalFrames - 1);
+        // Don't render more positions than there are distinct frames in the animation.
+        // A 1-frame (static) Lottie gets exactly 1 screenshot; a 3-frame loop gets 3.
+        const safeTotal = Math.max(0, totalFrames - 1);
+        const actualCount = Math.max(1, Math.min(count, safeTotal + 1));
         const positions: number[] = [];
-        for (let i = 0; i < count; i++) {
-            positions.push((safeTotal * i) / Math.max(1, count - 1));
+        for (let i = 0; i < actualCount; i++) {
+            positions.push(actualCount === 1 ? 0 : (safeTotal * i) / (actualCount - 1));
         }
 
         const frames: Buffer[] = [];

@@ -532,8 +532,7 @@ export class MediaParser {
         if (kind === 'video_sticker') {
             try {
                 const frames = await extractFramesFromWebm(buffer, 5);
-                const strip = await stitchFramesHorizontal(frames);
-                return this.analyzeAnimatedStrip(strip, sticker, emojis, /*isVideo*/ true);
+                return this.analyzeFramesOrStatic(frames, sticker, emojis, 'video');
             } catch (err) {
                 console.warn(`[mediaParser] video frame extraction failed for ${sticker.file_unique_id}, falling back to thumbnail:`, err instanceof Error ? err.message : err);
                 return this.analyzeFromThumbnail(sticker, emojis, 'video');
@@ -542,8 +541,7 @@ export class MediaParser {
         if (kind === 'animated_sticker') {
             try {
                 const frames = await renderTgsFrames(buffer, 5);
-                const strip = await stitchFramesHorizontal(frames);
-                return this.analyzeAnimatedStrip(strip, sticker, emojis, /*isVideo*/ false);
+                return this.analyzeFramesOrStatic(frames, sticker, emojis, 'lottie');
             } catch (err) {
                 console.warn(`[mediaParser] TGS render failed for ${sticker.file_unique_id}, falling back to thumbnail:`, err instanceof Error ? err.message : err);
                 return this.analyzeFromThumbnail(sticker, emojis, 'lottie');
@@ -551,6 +549,22 @@ export class MediaParser {
         }
         // static .webp
         return this.analyzeStaticSticker(buffer, sticker, emojis);
+    }
+
+    /** Route extracted frames to animated-strip or static analysis based on count.
+     * Handles the common cases: source has <5 distinct frames, or is static-animated
+     * (1 frame in a video container / 1-frame Lottie). Avoids wasting Vision tokens on
+     * a 5-copies strip when 1 frame would do. */
+    private async analyzeFramesOrStatic(frames: Buffer[], sticker: Sticker, emojis: string[], animKind: 'video' | 'lottie'): Promise<string> {
+        if (frames.length === 0) {
+            throw new Error(`no frames extracted from ${animKind} sticker`);
+        }
+        if (frames.length === 1) {
+            // Source is effectively static — no motion to observe, skip the animated-strip prompt.
+            return this.analyzeStaticSticker(frames[0], sticker, emojis);
+        }
+        const strip = await stitchFramesHorizontal(frames);
+        return this.analyzeAnimatedStrip(strip, sticker, emojis, animKind === 'video');
     }
 
     /** Fallback path when we can't render frames: use the static thumbnail Telegram
