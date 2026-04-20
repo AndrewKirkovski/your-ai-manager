@@ -520,22 +520,53 @@ export class MediaParser {
 
     /**
      * Dispatch by sticker kind. Returns the Vision-generated description string.
-     * Throws on unrecoverable error.
+     * Throws on unrecoverable error (caller: parseSticker / parseCustomEmoji have
+     * their own outer try/catch that produces a fallback ParsedMedia with error set).
+     *
+     * For animated/video kinds: if frame extraction fails (short clips, codec quirks,
+     * TGS render errors), falls back to analyzing the Telegram-provided thumbnail —
+     * worse than an animated strip but far better than "[analysis unavailable]".
      */
     private async analyzeStickerByKind(sticker: Sticker, kind: StickerCacheKind, emojis: string[]): Promise<string> {
         const buffer = await this.downloadFile(sticker.file_id);
         if (kind === 'video_sticker') {
-            const frames = await extractFramesFromWebm(buffer, 5);
-            const strip = await stitchFramesHorizontal(frames);
-            return this.analyzeAnimatedStrip(strip, sticker, emojis, /*isVideo*/ true);
+            try {
+                const frames = await extractFramesFromWebm(buffer, 5);
+                const strip = await stitchFramesHorizontal(frames);
+                return this.analyzeAnimatedStrip(strip, sticker, emojis, /*isVideo*/ true);
+            } catch (err) {
+                console.warn(`[mediaParser] video frame extraction failed for ${sticker.file_unique_id}, falling back to thumbnail:`, err instanceof Error ? err.message : err);
+                return this.analyzeFromThumbnail(sticker, emojis, 'video');
+            }
         }
         if (kind === 'animated_sticker') {
-            const frames = await renderTgsFrames(buffer, 5);
-            const strip = await stitchFramesHorizontal(frames);
-            return this.analyzeAnimatedStrip(strip, sticker, emojis, /*isVideo*/ false);
+            try {
+                const frames = await renderTgsFrames(buffer, 5);
+                const strip = await stitchFramesHorizontal(frames);
+                return this.analyzeAnimatedStrip(strip, sticker, emojis, /*isVideo*/ false);
+            } catch (err) {
+                console.warn(`[mediaParser] TGS render failed for ${sticker.file_unique_id}, falling back to thumbnail:`, err instanceof Error ? err.message : err);
+                return this.analyzeFromThumbnail(sticker, emojis, 'lottie');
+            }
         }
         // static .webp
         return this.analyzeStaticSticker(buffer, sticker, emojis);
+    }
+
+    /** Fallback path when we can't render frames: use the static thumbnail Telegram
+     * ships with every animated/video sticker. Loses motion information but preserves
+     * character/visual identity, which is what the AI mostly needs. */
+    private async analyzeFromThumbnail(sticker: Sticker, emojis: string[], animKind: 'video' | 'lottie'): Promise<string> {
+        const thumbId = sticker.thumbnail?.file_id;
+        if (!thumbId) {
+            throw new Error(`no thumbnail available for ${animKind} sticker ${sticker.file_unique_id}`);
+        }
+        const thumbBuf = await this.downloadFile(thumbId);
+        // Thumbnails are JPEG/WebP. analyzeStaticSticker sends it as webp MIME; Vision
+        // accepts both — if Telegram returned JPEG bytes, the MIME mismatch is harmless
+        // since the vision provider sniffs the actual payload.
+        const desc = await this.analyzeStaticSticker(thumbBuf, sticker, emojis);
+        return `[Static thumbnail only — ${animKind === 'video' ? 'video frame extraction failed' : 'Lottie render failed'}, animation not visible]\n${desc}`;
     }
 
     private async analyzeStaticSticker(webp: Buffer, sticker: Sticker, emojis: string[]): Promise<string> {

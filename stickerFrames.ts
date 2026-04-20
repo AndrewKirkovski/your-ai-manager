@@ -60,29 +60,52 @@ export async function extractFramesFromWebm(
 
     try {
         const duration = await probeDuration(inputPath);
-        // Evenly-spaced timestamps avoiding the absolute first/last sample which often render as a black/empty frame.
-        const margin = duration * 0.05;
-        const usable = duration - 2 * margin;
+        // Evenly-spaced timestamps. NO margin trimming — for custom emojis
+        // (often 0.5–1s clips), 5% of a 0.5s clip is 0.025s which ffmpeg may round
+        // to frame 0, colliding with the next timestamp. Sample from 0 to duration
+        // directly; ffmpeg clamps timestamps past EOF to the last frame.
         const timestamps: number[] = [];
         for (let i = 0; i < count; i++) {
-            timestamps.push(margin + (usable * i) / Math.max(1, count - 1));
+            timestamps.push((duration * i) / Math.max(1, count - 1));
         }
 
         const frames: Buffer[] = [];
         for (let i = 0; i < timestamps.length; i++) {
             const out = join(dir, `frame_${i}.png`);
-            await new Promise<void>((resolve, reject) => {
-                ffmpeg(inputPath)
-                    .seekInput(timestamps[i])
-                    .frames(1)
-                    .size(`${FRAME_SIZE}x${FRAME_SIZE}`)
-                    .outputOptions(['-vf', 'scale=256:256:force_original_aspect_ratio=decrease,pad=256:256:(ow-iw)/2:(oh-ih)/2:color=white@0'])
-                    .output(out)
-                    .on('end', () => resolve())
-                    .on('error', reject)
-                    .run();
-            });
+            let stderrBuf = '';
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    ffmpeg(inputPath)
+                        // Output-seek (after -i) — accurate decoding, essential on short clips
+                        // where fast input-seek rounds to an I-frame past our target timestamp.
+                        .seek(timestamps[i])
+                        .frames(1)
+                        .outputOptions([
+                            '-vf',
+                            `scale=${FRAME_SIZE}:${FRAME_SIZE}:force_original_aspect_ratio=decrease,pad=${FRAME_SIZE}:${FRAME_SIZE}:(ow-iw)/2:(oh-ih)/2`,
+                        ])
+                        .output(out)
+                        .on('stderr', line => { stderrBuf += line + '\n'; })
+                        .on('end', () => resolve())
+                        .on('error', reject)
+                        .run();
+                });
+            } catch (err) {
+                console.warn(`[ffmpeg] frame ${i} @${timestamps[i].toFixed(3)}s failed:`, err instanceof Error ? err.message : err, stderrBuf.split('\n').slice(-3).join(' | '));
+                continue; // try the next timestamp
+            }
+            // Verify the file actually exists before reading — ffmpeg can exit 0 without writing output.
+            try {
+                await fs.access(out);
+            } catch {
+                console.warn(`[ffmpeg] frame ${i} @${timestamps[i].toFixed(3)}s: no output file produced`);
+                continue;
+            }
             frames.push(await fs.readFile(out));
+        }
+
+        if (frames.length < 2) {
+            throw new Error(`extractFramesFromWebm: only ${frames.length} frame(s) extracted from ${duration.toFixed(2)}s clip (needed ≥2)`);
         }
         return frames;
     } finally {
