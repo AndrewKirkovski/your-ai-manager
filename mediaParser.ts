@@ -55,6 +55,49 @@ export interface MediaParserConfig {
     maxStickerTokens?: number;      // Default: 200
 }
 
+// ============== STICKER DESCRIPTION PROMPTS + CLEANUP ==============
+
+/** Strict prompt for static-sticker Vision analysis. Optimized for compact output:
+ * no preamble, no markdown headers, no "this sticker" filler, no emoji name echoes. */
+const STICKER_DESCRIPTION_PROMPT =
+    'Describe the sticker in 2-3 sentences of plain prose. ' +
+    'STRICT FORMAT RULES — violating any of these wastes tokens in our cache:\n' +
+    '1. NO preamble. Do NOT start with "The sticker", "This sticker", "Sticker", "Image", "I see", or any meta-reference. Start directly with the visual description (e.g. "Anthropomorphic gray wolf with...").\n' +
+    '2. NO markdown headers, NO "##", NO "Sticker Analysis" titles, NO bullet lists. Plain prose only.\n' +
+    '3. NO mention of the associated emoji char or pack name — those are tracked separately.\n' +
+    '4. NO meta-phrases like "Senders typically use this to" or "essentially a stylized X" — just say what the meaning IS.\n' +
+    'WHAT to include: the character/subject, expression/pose, emotional tone, and what feeling/message the sender conveys. ' +
+    'WHEN named characters are recognizable (e.g. "Pepe the Frog", a known anime character), use **bold** ONLY for the proper noun. Otherwise no markdown.';
+
+/** Animated variant — same rules, plus describe motion across frames. */
+const ANIMATED_DESCRIPTION_PROMPT =
+    'Describe what happens across the frames in 3-4 sentences of plain prose. ' +
+    'STRICT FORMAT RULES:\n' +
+    '1. NO preamble. Do NOT start with "The sticker", "Across the frames", "This animation". Start with the subject (e.g. "Anthropomorphic wolf gradually...").\n' +
+    '2. NO markdown headers, NO "##", NO bullet lists. Plain prose only.\n' +
+    '3. NO mention of the associated emoji char or pack name.\n' +
+    '4. NO meta-phrases like "Senders typically use this sticker to" — state the meaning directly.\n' +
+    'WHAT to include: subject, motion/expression change across frames, what feeling/message the animation conveys. ' +
+    'WHEN named characters are recognizable, **bold** the proper noun. Otherwise no markdown.';
+
+/** Defense-in-depth: strip known boilerplate even when Vision violates the strict prompt.
+ * Operates on already-trimmed Vision output before cache write. Idempotent. */
+function cleanStickerDescription(text: string): string {
+    let s = text.trim();
+    // Markdown header line at start ("## Sticker Analysis", "# Description" etc).
+    s = s.replace(/^#{1,6}\s+[^\n]*\n+/, '');
+    // "The sticker (features|depicts|shows|features a|...)" / "This sticker shows ..." / "This image features ..."
+    s = s.replace(/^(?:\*\*)?(?:The|This)\s+(?:sticker|image|emoji|animation|gif)(?:\*\*)?\s+(?:features?|depicts?|shows?|displays?|presents?|portrays?|is)\s+(?:a|an)?\s*/i, '');
+    // "Across the frames, ..." preamble (animated case)
+    s = s.replace(/^Across the frames,?\s+/i, '');
+    // Capitalize first letter after the strip
+    if (s.length > 0) s = s[0].toUpperCase() + s.slice(1);
+    return s;
+}
+
+// Test surface for unit testing — not exported via index, but accessible via direct import.
+export const __TEST_ONLY__ = { cleanStickerDescription };
+
 // ============== MAIN CLASS ==============
 
 export class MediaParser {
@@ -588,10 +631,10 @@ export class MediaParser {
         // "specified using image/webp media type, but the image appears to be image/png".
         const pngBuf = await sharp(rawBuf).png().toBuffer();
         const stickerUrl = `data:image/png;base64,${pngBuf.toString('base64')}`;
-        const emojiContext = emojis.length > 0
-            ? `This sticker is associated in its pack with these emojis: ${emojis.join(' ')}. `
-            : '';
-        const setContext = sticker.set_name ? `It's from the sticker pack "${sticker.set_name}". ` : '';
+        const ctxParts: string[] = [];
+        if (emojis.length > 0) ctxParts.push(`Pack emojis: ${emojis.join(' ')}.`);
+        if (sticker.set_name) ctxParts.push(`Pack: "${sticker.set_name}".`);
+        const context = ctxParts.length > 0 ? ctxParts.join(' ') + ' ' : '';
 
         const response = await this.anthropic.chat.completions.create({
             model: this.visionModel,
@@ -600,26 +643,23 @@ export class MediaParser {
                 content: [
                     {
                         type: 'text',
-                        text: `Analyze this sticker image. ${emojiContext}${setContext}` +
-                            'Describe what it shows: the character, expression, action, and emotional tone. ' +
-                            'What message or emotion is typically conveyed by sending this sticker? ' +
-                            'Be concise (2-3 sentences).',
+                        text: context + STICKER_DESCRIPTION_PROMPT,
                     },
                     { type: 'image_url', image_url: { url: stickerUrl } },
                 ],
             }],
             max_tokens: this.maxStickerTokens,
         });
-        return response.choices[0]?.message?.content || 'Unable to analyze sticker';
+        return cleanStickerDescription(response.choices[0]?.message?.content || 'Unable to analyze sticker');
     }
 
     private async analyzeAnimatedStrip(strip: Buffer, sticker: Sticker, emojis: string[], isVideo: boolean): Promise<string> {
         const url = `data:image/png;base64,${strip.toString('base64')}`;
-        const emojiContext = emojis.length > 0
-            ? `Pack-associated emojis: ${emojis.join(' ')}. `
-            : '';
-        const setContext = sticker.set_name ? `Pack: "${sticker.set_name}". ` : '';
-        const sourceLabel = isVideo ? 'animated (video) sticker' : 'animated (Lottie) sticker';
+        const ctxParts: string[] = [];
+        if (emojis.length > 0) ctxParts.push(`Pack emojis: ${emojis.join(' ')}.`);
+        if (sticker.set_name) ctxParts.push(`Pack: "${sticker.set_name}".`);
+        const context = ctxParts.length > 0 ? ctxParts.join(' ') + ' ' : '';
+        const sourceLabel = isVideo ? 'animated (video)' : 'animated (Lottie)';
 
         const response = await this.anthropic.chat.completions.create({
             model: this.visionModel,
@@ -628,18 +668,15 @@ export class MediaParser {
                 content: [
                     {
                         type: 'text',
-                        text: `These are 5 frames (left → right, evenly spaced in time) from an ${sourceLabel}. ` +
-                            `${emojiContext}${setContext}` +
-                            'Describe what is happening across the frames: the character, the motion or expression change, ' +
-                            'and what message/emotion the sender is typically conveying when using this sticker. ' +
-                            'Be concise (3-4 sentences).',
+                        text: `5 frames (left → right, evenly spaced in time) from an ${sourceLabel} sticker. ` +
+                            context + ANIMATED_DESCRIPTION_PROMPT,
                     },
                     { type: 'image_url', image_url: { url } },
                 ],
             }],
             max_tokens: Math.max(this.maxStickerTokens, 350),
         });
-        return response.choices[0]?.message?.content || 'Unable to analyze animated sticker';
+        return cleanStickerDescription(response.choices[0]?.message?.content || 'Unable to analyze animated sticker');
     }
 
     // ============== LOCATION MESSAGE PARSING ==============
