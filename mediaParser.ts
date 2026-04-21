@@ -13,6 +13,7 @@ import {
 import { gatherAllPackEmojis } from './stickerSetCache';
 import { extractFramesFromWebm, stitchFramesHorizontal } from './stickerFrames';
 import { renderTgsFrames } from './tgsRenderer';
+import sharp from 'sharp';
 
 // ============== TYPE DEFINITIONS ==============
 
@@ -576,15 +577,17 @@ export class MediaParser {
             throw new Error(`no thumbnail available for ${animKind} sticker ${sticker.file_unique_id}`);
         }
         const thumbBuf = await this.downloadFile(thumbId);
-        // Thumbnails are JPEG/WebP. analyzeStaticSticker sends it as webp MIME; Vision
-        // accepts both — if Telegram returned JPEG bytes, the MIME mismatch is harmless
-        // since the vision provider sniffs the actual payload.
         const desc = await this.analyzeStaticSticker(thumbBuf, sticker, emojis);
         return `[Static thumbnail only — ${animKind === 'video' ? 'video frame extraction failed' : 'Lottie render failed'}, animation not visible]\n${desc}`;
     }
 
-    private async analyzeStaticSticker(webp: Buffer, sticker: Sticker, emojis: string[]): Promise<string> {
-        const stickerUrl = `data:image/webp;base64,${webp.toString('base64')}`;
+    private async analyzeStaticSticker(rawBuf: Buffer, sticker: Sticker, emojis: string[]): Promise<string> {
+        // Normalize to PNG before sending. Inputs vary (real .webp stickers, PNG/JPEG
+        // thumbnails from the fallback path, single-frame extracts) and Anthropic Vision
+        // sniffs the bytes — hardcoding image/webp as we used to caused 400 errors like
+        // "specified using image/webp media type, but the image appears to be image/png".
+        const pngBuf = await sharp(rawBuf).png().toBuffer();
+        const stickerUrl = `data:image/png;base64,${pngBuf.toString('base64')}`;
         const emojiContext = emojis.length > 0
             ? `This sticker is associated in its pack with these emojis: ${emojis.join(' ')}. `
             : '';

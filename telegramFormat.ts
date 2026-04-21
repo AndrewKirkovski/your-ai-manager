@@ -1,6 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { marked } from 'marked';
 import sanitizeHtml from 'sanitize-html';
+import { getAllAnalyzedCustomEmojis } from './userStore';
 
 /** Tags whose content must NEVER reach the user (sanitize-html strips tag + children).
  * htmlparser2 auto-closes unclosed tags at end-of-input, so partial chunks mid-stream
@@ -208,9 +209,6 @@ let cachedPromptBlock = '';
 let cachedByCharMap: Map<string, string> = STATIC_TG_EMOJI_BY_CHAR;
 
 function rebuildDynamicCache(): void {
-    // Lazy import — telegramFormat is sometimes imported from modules that load before db.
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const {getAllAnalyzedCustomEmojis} = require('./userStore') as typeof import('./userStore');
     const analyzed = getAllAnalyzedCustomEmojis();
 
     // Build merged char→id map: static catalog wins for any char it covers, cache fills the rest.
