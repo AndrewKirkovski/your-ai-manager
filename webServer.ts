@@ -104,7 +104,7 @@ app.get('/api/users/:id', async (req: Request, res: Response) => {
 app.get('/api/token-usage', async (req: Request, res: Response) => {
     try {
         const scopeRaw = (typeof req.query.scope === 'string' ? req.query.scope : 'global');
-        const scope: TokenUsageScope = (scopeRaw === 'me' || scopeRaw === 'system' || scopeRaw === 'global') ? scopeRaw : 'global';
+        const scope: TokenUsageScope = (scopeRaw === 'me' || scopeRaw === 'global') ? scopeRaw : 'global';
         const userIdRaw = typeof req.query.user_id === 'string' ? parseInt(req.query.user_id, 10) : undefined;
         if (scope === 'me' && (userIdRaw === undefined || !Number.isFinite(userIdRaw))) {
             return res.status(400).json({ error: "scope='me' requires user_id query param" });

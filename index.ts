@@ -109,7 +109,7 @@ function serialTextHandler(handler: TextHandler): (msg: TelegramBot.Message, mat
  * to prepend to the user's message so the AI knows what each premium emoji
  * means; returns '' if there are no custom emojis.
  */
-async function buildCustomEmojiContextBlock(msg: TelegramBot.Message): Promise<string> {
+async function buildCustomEmojiContextBlock(msg: TelegramBot.Message, userId: number): Promise<string> {
     const text = msg.text ?? msg.caption ?? '';
     const ents = [...(msg.entities ?? []), ...(msg.caption_entities ?? [])];
     const seen = new Map<string, string>();
@@ -126,7 +126,7 @@ async function buildCustomEmojiContextBlock(msg: TelegramBot.Message): Promise<s
     const lines: string[] = ['[Custom emojis in this message:'];
     const resolved = await Promise.all(
         Array.from(seen.entries()).map(async ([id, ch]) => {
-            const parsed = await parser.parseCustomEmoji(id, ch);
+            const parsed = await parser.parseCustomEmoji(id, ch, userId);
             if (parsed.error) {
                 console.warn('[customEmoji] parse failed', { id, error: parsed.error });
                 return `- ${ch} (cache_key=${id}): [analysis unavailable]`;
@@ -875,7 +875,7 @@ bot.on('message', async (msg) => {
         // Resolve any custom (premium) emoji entities in the user's text/caption
         // through the sticker_cache, so the AI sees descriptions of unfamiliar
         // emojis instead of just unicode fallback chars.
-        const customEmojiBlock = await buildCustomEmojiContextBlock(msg);
+        const customEmojiBlock = await buildCustomEmojiContextBlock(msg, userId);
 
         // Detect message type and parse content
         const mediaParser = getMediaParser();
@@ -889,7 +889,7 @@ bot.on('message', async (msg) => {
             await bot.sendChatAction(msg.chat.id, 'typing');
 
             // Parse the media
-            const parsed = await mediaParser.parseMedia(msg);
+            const parsed = await mediaParser.parseMedia(msg, userId);
 
             if (parsed.error && !parsed.content) {
                 // Complete failure - notify user

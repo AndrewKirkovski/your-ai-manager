@@ -35,7 +35,7 @@ export const AnalyzeImage: Tool = {
         const mediaParser = getMediaParser();
 
         try {
-            const analysis = await mediaParser.analyzeImageByFileId(image.fileId, args.prompt);
+            const analysis = await mediaParser.analyzeImageByFileId(image.fileId, args.prompt, args.userId);
             return {
                 success: true,
                 analysis,

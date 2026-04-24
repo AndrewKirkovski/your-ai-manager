@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import {addMessageToHistory, getRecentMessageHistory, addStatEntry, bumpStickerUsedCount} from './userStore';
+import {addMessageToHistory, getRecentMessageHistory, recordAITokens, bumpStickerUsedCount} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
 import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers, exceedsTelegramLimit} from './telegramFormat';
@@ -251,17 +251,10 @@ export class AIService {
                 }
             }
 
-            // Record AI token usage into stat_entries (background, never blocks the reply path).
-            // user_id = the actual user for replies; cron/system flows pass userId=0 from caller.
+            // Record AI token usage. recordAITokens double-writes: per-user AND user_id=0 (global).
+            // userId is the actual user the AI is replying to or working on behalf of.
             const purpose = options.purpose ?? 'reply';
-            if (usageInputTokens > 0) {
-                addStatEntry(userId, 'ai_tokens_in', usageInputTokens, undefined, purpose).catch(err =>
-                    console.warn('[token-stat] failed to record ai_tokens_in:', err instanceof Error ? err.message : err));
-            }
-            if (usageOutputTokens > 0) {
-                addStatEntry(userId, 'ai_tokens_out', usageOutputTokens, undefined, purpose).catch(err =>
-                    console.warn('[token-stat] failed to record ai_tokens_out:', err instanceof Error ? err.message : err));
-            }
+            void recordAITokens(userId, usageInputTokens, usageOutputTokens, purpose);
 
             // Detect inline custom-emoji + sticker references the AI emitted in its reply.
             // Each unique cache_key bumped once per response (not once per occurrence in text).

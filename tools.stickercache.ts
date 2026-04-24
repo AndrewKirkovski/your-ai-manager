@@ -8,7 +8,7 @@ import {
     findStickerCacheEntries,
     refreshStickerCacheFileId,
     bumpStickerUsedCount,
-    addStatEntry,
+    recordAITokens,
     getUser,
     type StickerCacheEntry,
     type StickerCacheKind,
@@ -29,7 +29,7 @@ export function initStickerCacheTools(bot: TelegramBot, client: OpenAI, model?: 
  * pre-filter widens up to a kind-only slice when specific matches are scarce, so a "match" can
  * actually be unrelated. Haiku is the gate that prevents random sticker sends.
  * Returns null on any failure path (no client, API error, unparseable response, or model says "0"). */
-async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEntry[]): Promise<StickerCacheEntry | null> {
+async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEntry[], userId: number): Promise<StickerCacheEntry | null> {
     if (candidates.length === 0) return null;
     if (!lookupClient) {
         console.warn('[stickerPicker] no lookup client configured; returning null');
@@ -54,7 +54,7 @@ async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEnt
             messages: [{role: 'user', content: prompt}],
             max_tokens: 10,
         });
-        recordLookupUsage(resp, 'sticker_picker');
+        recordLookupUsage(resp, 'sticker_picker', userId);
         const raw = resp.choices[0]?.message?.content?.trim() ?? '';
         const idx = parseInt(raw.match(/\d+/)?.[0] ?? '', 10);
         if (Number.isFinite(idx) && idx >= 1 && idx <= candidates.length) {
@@ -67,15 +67,12 @@ async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEnt
     return null;
 }
 
-/** Record token usage from a Haiku lookup-model call. user_id=0 (system).
- * Fire-and-forget — never blocks the picker path. */
-function recordLookupUsage(resp: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string): void {
+/** Record token usage from a Haiku lookup-model call. Attributed to the user the
+ * AI is currently replying to. recordAITokens double-writes per-user + global. */
+function recordLookupUsage(resp: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string, userId: number): void {
     const u = resp.usage;
     if (!u) return;
-    const inT = u.prompt_tokens ?? 0;
-    const outT = u.completion_tokens ?? 0;
-    if (inT > 0) addStatEntry(0, 'ai_tokens_in', inT, undefined, purpose).catch(() => {});
-    if (outT > 0) addStatEntry(0, 'ai_tokens_out', outT, undefined, purpose).catch(() => {});
+    void recordAITokens(userId, u.prompt_tokens ?? 0, u.completion_tokens ?? 0, purpose);
 }
 
 const KIND_VALUES: StickerCacheKind[] = ['sticker', 'animated_sticker', 'video_sticker', 'custom_emoji'];
@@ -355,7 +352,7 @@ export const SuggestExpressions: Tool = {
                 messages: [{role: 'user', content: prompt}],
                 max_tokens: Math.max(50, intents.length * 25),
             });
-            recordLookupUsage(resp, 'suggest_expressions');
+            recordLookupUsage(resp, 'suggest_expressions', args.userId);
             const raw = resp.choices[0]?.message?.content?.trim() ?? '';
 
             const out: Record<string, Array<{cache_key: string; kind: string; emoji: string; short_tag: string; snippet: string}>> = {};
@@ -456,7 +453,7 @@ export const SendStickerToUser: Tool = {
             };
         }
 
-        const pick = await pickStickerByVibe(query, candidates);
+        const pick = await pickStickerByVibe(query, candidates, args.userId);
         if (!pick) {
             return {
                 success: false,

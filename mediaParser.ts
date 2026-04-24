@@ -9,7 +9,7 @@ import {
     upsertStickerCacheEntry,
     refreshStickerCacheFileId,
     bumpStickerUsedCount,
-    addStatEntry,
+    recordAITokens,
     type StickerCacheKind,
 } from './userStore';
 import { gatherAllPackEmojis } from './stickerSetCache';
@@ -132,16 +132,13 @@ function cleanStickerDescription(text: string): string {
 // Test surface for unit testing — not exported via index, but accessible via direct import.
 export const __TEST_ONLY__ = { cleanStickerDescription, parseStickerDescription };
 
-/** Record token usage from an OpenAI-compatible Vision response into stat_entries.
- * Uses synthetic user_id=0 since these calls are system-triggered (not tied to a user).
- * Fires-and-forgets — never blocks the analysis path. */
-function recordVisionUsage(response: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string): void {
+/** Record token usage from a Vision response. Attributed to the user whose
+ * incoming message triggered the analysis. recordAITokens double-writes to
+ * the user AND user_id=0 (denormalized global). Fire-and-forget. */
+function recordVisionUsage(response: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string, userId: number): void {
     const u = response.usage;
     if (!u) return;
-    const inT = u.prompt_tokens ?? 0;
-    const outT = u.completion_tokens ?? 0;
-    if (inT > 0) addStatEntry(0, 'ai_tokens_in', inT, undefined, purpose).catch(() => {});
-    if (outT > 0) addStatEntry(0, 'ai_tokens_out', outT, undefined, purpose).catch(() => {});
+    void recordAITokens(userId, u.prompt_tokens ?? 0, u.completion_tokens ?? 0, purpose);
 }
 
 // ============== MAIN CLASS ==============
@@ -195,7 +192,7 @@ export class MediaParser {
      * Parse any supported media type from a message
      * Returns formatted content ready for AI conversation
      */
-    async parseMedia(msg: Message): Promise<ParsedMedia> {
+    async parseMedia(msg: Message, userId: number): Promise<ParsedMedia> {
         const mediaType = this.detectMediaType(msg);
 
         try {
@@ -203,9 +200,9 @@ export class MediaParser {
                 case 'voice':
                     return await this.parseVoiceMessage(msg.voice!);
                 case 'photo':
-                    return await this.parsePhoto(msg.photo!, msg.caption);
+                    return await this.parsePhoto(msg.photo!, msg.caption, userId);
                 case 'sticker':
-                    return await this.parseSticker(msg.sticker!);
+                    return await this.parseSticker(msg.sticker!, userId);
                 case 'location':
                     return this.parseLocation(msg.location!);
                 case 'text':
@@ -326,7 +323,7 @@ export class MediaParser {
      * Download and analyze photo using Claude Vision.
      * If caption is provided, uses it to focus the analysis.
      */
-    async parsePhoto(photos: PhotoSize[], caption?: string): Promise<ParsedMedia> {
+    async parsePhoto(photos: PhotoSize[], caption: string | undefined, userId: number): Promise<ParsedMedia> {
         try {
             // Get highest resolution photo (last in array)
             const bestPhoto = photos[photos.length - 1];
@@ -347,7 +344,7 @@ export class MediaParser {
                   'Be concise but thorough.';
 
             // Step 4: Analyze with Claude Vision
-            const description = await this.analyzeImageBase64(base64Image, prompt, 500);
+            const description = await this.analyzeImageBase64(base64Image, prompt, userId, 500, 'vision_photo');
 
             return {
                 type: 'photo',
@@ -390,7 +387,7 @@ export class MediaParser {
      * Send a base64 image to Claude Vision with a custom prompt.
      * Records token usage as a system stat (user_id=0) tagged with the supplied purpose.
      */
-    private async analyzeImageBase64(base64: string, prompt: string, maxTokens?: number, purpose: string = 'vision_photo'): Promise<string> {
+    private async analyzeImageBase64(base64: string, prompt: string, userId: number, maxTokens?: number, purpose: string = 'vision_photo'): Promise<string> {
         const imageUrl = `data:image/jpeg;base64,${base64}`;
         const response = await this.anthropic.chat.completions.create({
             model: this.visionModel,
@@ -403,7 +400,7 @@ export class MediaParser {
             }],
             max_tokens: maxTokens ?? this.maxImageTokens
         });
-        recordVisionUsage(response, purpose);
+        recordVisionUsage(response, purpose, userId);
         return response.choices[0]?.message?.content || 'Unable to analyze image';
     }
 
@@ -411,10 +408,10 @@ export class MediaParser {
      * Re-analyze a previously sent image by Telegram file_id with a custom prompt.
      * Used by the AnalyzeImage tool for follow-up analysis.
      */
-    async analyzeImageByFileId(fileId: string, prompt: string): Promise<string> {
+    async analyzeImageByFileId(fileId: string, prompt: string, userId: number): Promise<string> {
         const imageBuffer = await this.downloadFile(fileId);
         const base64 = imageBuffer.toString('base64');
-        return this.analyzeImageBase64(base64, prompt, 800);
+        return this.analyzeImageBase64(base64, prompt, userId, 800, 'vision_photo_reanalyze');
     }
 
     // ============== STICKER PARSING ==============
@@ -424,7 +421,7 @@ export class MediaParser {
      * video (.webm) handlers, looks up file_unique_id in sticker_cache first,
      * gathers all pack-associated emojis, and stores the description on miss.
      */
-    async parseSticker(sticker: Sticker): Promise<ParsedMedia> {
+    async parseSticker(sticker: Sticker, userId: number): Promise<ParsedMedia> {
         const cacheKey = sticker.file_unique_id;
         const kind: StickerCacheKind = sticker.is_video
             ? 'video_sticker'
@@ -463,7 +460,7 @@ export class MediaParser {
         const allEmojis = await gatherAllPackEmojis(this.bot, sticker.set_name, cacheKey, sticker.emoji);
 
         try {
-            const rawDescription = await this.analyzeStickerByKind(sticker, kind, allEmojis);
+            const rawDescription = await this.analyzeStickerByKind(sticker, kind, allEmojis, userId);
             const { description, shortTag } = parseStickerDescription(rawDescription);
             upsertStickerCacheEntry({
                 cacheKey,
@@ -520,7 +517,7 @@ export class MediaParser {
      * sticker_cache; on miss, fetches the underlying sticker via
      * bot.getCustomEmojiStickers and runs Vision on it.
      */
-    async parseCustomEmoji(customEmojiId: string, fallbackChar?: string): Promise<ParsedMedia> {
+    async parseCustomEmoji(customEmojiId: string, fallbackChar: string | undefined, userId: number): Promise<ParsedMedia> {
         const cached = getStickerCacheEntry(customEmojiId);
         if (cached) {
             bumpStickerUsedCount(customEmojiId);
@@ -568,7 +565,7 @@ export class MediaParser {
                     ? 'animated_sticker'
                     : 'custom_emoji';
 
-            const rawDescription = await this.analyzeStickerByKind(sticker, kind === 'custom_emoji' ? 'sticker' : kind, emojis);
+            const rawDescription = await this.analyzeStickerByKind(sticker, kind === 'custom_emoji' ? 'sticker' : kind, emojis, userId);
             const { description, shortTag } = parseStickerDescription(rawDescription);
             upsertStickerCacheEntry({
                 cacheKey: customEmojiId,
@@ -625,60 +622,60 @@ export class MediaParser {
      * TGS render errors), falls back to analyzing the Telegram-provided thumbnail —
      * worse than an animated strip but far better than "[analysis unavailable]".
      */
-    private async analyzeStickerByKind(sticker: Sticker, kind: StickerCacheKind, emojis: string[]): Promise<string> {
+    private async analyzeStickerByKind(sticker: Sticker, kind: StickerCacheKind, emojis: string[], userId: number): Promise<string> {
         const buffer = await this.downloadFile(sticker.file_id);
         if (kind === 'video_sticker') {
             try {
                 const frames = await extractFramesFromWebm(buffer, 5);
-                return this.analyzeFramesOrStatic(frames, sticker, emojis, 'video');
+                return this.analyzeFramesOrStatic(frames, sticker, emojis, 'video', userId);
             } catch (err) {
                 console.warn(`[mediaParser] video frame extraction failed for ${sticker.file_unique_id}, falling back to thumbnail:`, err instanceof Error ? err.message : err);
-                return this.analyzeFromThumbnail(sticker, emojis, 'video');
+                return this.analyzeFromThumbnail(sticker, emojis, 'video', userId);
             }
         }
         if (kind === 'animated_sticker') {
             try {
                 const frames = await renderTgsFrames(buffer, 5);
-                return this.analyzeFramesOrStatic(frames, sticker, emojis, 'lottie');
+                return this.analyzeFramesOrStatic(frames, sticker, emojis, 'lottie', userId);
             } catch (err) {
                 console.warn(`[mediaParser] TGS render failed for ${sticker.file_unique_id}, falling back to thumbnail:`, err instanceof Error ? err.message : err);
-                return this.analyzeFromThumbnail(sticker, emojis, 'lottie');
+                return this.analyzeFromThumbnail(sticker, emojis, 'lottie', userId);
             }
         }
         // static .webp
-        return this.analyzeStaticSticker(buffer, sticker, emojis);
+        return this.analyzeStaticSticker(buffer, sticker, emojis, userId);
     }
 
     /** Route extracted frames to animated-strip or static analysis based on count.
      * Handles the common cases: source has <5 distinct frames, or is static-animated
      * (1 frame in a video container / 1-frame Lottie). Avoids wasting Vision tokens on
      * a 5-copies strip when 1 frame would do. */
-    private async analyzeFramesOrStatic(frames: Buffer[], sticker: Sticker, emojis: string[], animKind: 'video' | 'lottie'): Promise<string> {
+    private async analyzeFramesOrStatic(frames: Buffer[], sticker: Sticker, emojis: string[], animKind: 'video' | 'lottie', userId: number): Promise<string> {
         if (frames.length === 0) {
             throw new Error(`no frames extracted from ${animKind} sticker`);
         }
         if (frames.length === 1) {
             // Source is effectively static — no motion to observe, skip the animated-strip prompt.
-            return this.analyzeStaticSticker(frames[0], sticker, emojis);
+            return this.analyzeStaticSticker(frames[0], sticker, emojis, userId);
         }
         const strip = await stitchFramesHorizontal(frames);
-        return this.analyzeAnimatedStrip(strip, sticker, emojis, animKind === 'video');
+        return this.analyzeAnimatedStrip(strip, sticker, emojis, animKind === 'video', userId);
     }
 
     /** Fallback path when we can't render frames: use the static thumbnail Telegram
      * ships with every animated/video sticker. Loses motion information but preserves
      * character/visual identity, which is what the AI mostly needs. */
-    private async analyzeFromThumbnail(sticker: Sticker, emojis: string[], animKind: 'video' | 'lottie'): Promise<string> {
+    private async analyzeFromThumbnail(sticker: Sticker, emojis: string[], animKind: 'video' | 'lottie', userId: number): Promise<string> {
         const thumbId = sticker.thumbnail?.file_id;
         if (!thumbId) {
             throw new Error(`no thumbnail available for ${animKind} sticker ${sticker.file_unique_id}`);
         }
         const thumbBuf = await this.downloadFile(thumbId);
-        const desc = await this.analyzeStaticSticker(thumbBuf, sticker, emojis);
+        const desc = await this.analyzeStaticSticker(thumbBuf, sticker, emojis, userId);
         return `[Static thumbnail only — ${animKind === 'video' ? 'video frame extraction failed' : 'Lottie render failed'}, animation not visible]\n${desc}`;
     }
 
-    private async analyzeStaticSticker(rawBuf: Buffer, sticker: Sticker, emojis: string[]): Promise<string> {
+    private async analyzeStaticSticker(rawBuf: Buffer, sticker: Sticker, emojis: string[], userId: number): Promise<string> {
         // Normalize to PNG before sending. Inputs vary (real .webp stickers, PNG/JPEG
         // thumbnails from the fallback path, single-frame extracts) and Anthropic Vision
         // sniffs the bytes — hardcoding image/webp as we used to caused 400 errors like
@@ -704,11 +701,11 @@ export class MediaParser {
             }],
             max_tokens: this.maxStickerTokens,
         });
-        recordVisionUsage(response, 'vision_sticker');
+        recordVisionUsage(response, 'vision_sticker', userId);
         return response.choices[0]?.message?.content || 'Unable to analyze sticker';
     }
 
-    private async analyzeAnimatedStrip(strip: Buffer, sticker: Sticker, emojis: string[], isVideo: boolean): Promise<string> {
+    private async analyzeAnimatedStrip(strip: Buffer, sticker: Sticker, emojis: string[], isVideo: boolean, userId: number): Promise<string> {
         const url = `data:image/png;base64,${strip.toString('base64')}`;
         const ctxParts: string[] = [];
         if (emojis.length > 0) ctxParts.push(`Pack emojis: ${emojis.join(' ')}.`);
@@ -731,7 +728,7 @@ export class MediaParser {
             }],
             max_tokens: Math.max(this.maxStickerTokens, 350),
         });
-        recordVisionUsage(response, isVideo ? 'vision_video_sticker' : 'vision_animated_sticker');
+        recordVisionUsage(response, isVideo ? 'vision_video_sticker' : 'vision_animated_sticker', userId);
         return response.choices[0]?.message?.content || 'Unable to analyze animated sticker';
     }
 

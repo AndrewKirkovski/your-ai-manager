@@ -24,7 +24,7 @@ export const GetTokenUsage: Tool = {
     name: 'GetTokenUsage',
     description:
         "Aggregate AI token usage from stat_entries. Useful when the user asks 'how many tokens did I burn today / this week', " +
-        "or for self-reflection on cost. Supports scope=me|global|system and period=today|week|month|all. " +
+        "or for self-reflection on cost. Supports scope=me|global and period=today|week|month|all. " +
         "Returns input/output/total token counts, request count, per-purpose breakdown (e.g. 'reply', 'sticker_picker', 'vision_sticker', 'suggest_expressions'), " +
         "and (for week/month/all) per-day series. " +
         "For visualizations, use GenerateStatChart({name:'ai_tokens_in', period:'week'}) or 'ai_tokens_out'.",
@@ -33,8 +33,8 @@ export const GetTokenUsage: Tool = {
         properties: {
             scope: {
                 type: 'string',
-                enum: ['me', 'global', 'system'],
-                description: "'me' = just this user (default). 'global' = all users summed. 'system' = only background system calls (sticker picker, Vision analyses, etc; user_id=0).",
+                enum: ['me', 'global'],
+                description: "'me' = just this user (default). 'global' = total across all users (Vision analyses, sticker pickers, and replies — all flows are user-attributed; user_id=0 holds the denormalized global aggregate row).",
             },
             period: {
                 type: 'string',
@@ -44,7 +44,7 @@ export const GetTokenUsage: Tool = {
         },
     },
     execute: async (args: {userId: number; scope?: string; period?: string}) => {
-        const scope: TokenUsageScope = (args.scope === 'global' || args.scope === 'system') ? args.scope : 'me';
+        const scope: TokenUsageScope = args.scope === 'global' ? 'global' : 'me';
         const period = args.period ?? 'today';
         let range: { from: Date; to: Date; label: string };
         try {

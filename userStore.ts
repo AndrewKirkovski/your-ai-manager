@@ -943,7 +943,34 @@ export async function getTodayStats(userId: number, timezone?: string): Promise<
 
 // ============== AI TOKEN USAGE STATS ==============
 
-export type TokenUsageScope = 'me' | 'global' | 'system';
+/** Record AI token usage for a request. Double-writes to (a) the actual user
+ * and (b) user_id=0 as a denormalized global total. Every AI call is ultimately
+ * triggered by or for some user — there are no truly "system" calls — so callers
+ * always pass a real userId. The user_id=0 row is the global aggregate view that
+ * lets queries skip per-user SUMs.
+ *
+ * Fire-and-forget: failures never block the AI path.
+ * No-op if both token counts are 0. */
+export async function recordAITokens(userId: number, inputTokens: number, outputTokens: number, purpose: string): Promise<void> {
+    if (inputTokens > 0) {
+        addStatEntry(userId, 'ai_tokens_in', inputTokens, undefined, purpose).catch(err =>
+            console.warn('[token-stat] in (per-user) failed:', err instanceof Error ? err.message : err));
+        if (userId !== 0) {
+            addStatEntry(0, 'ai_tokens_in', inputTokens, undefined, purpose).catch(err =>
+                console.warn('[token-stat] in (global) failed:', err instanceof Error ? err.message : err));
+        }
+    }
+    if (outputTokens > 0) {
+        addStatEntry(userId, 'ai_tokens_out', outputTokens, undefined, purpose).catch(err =>
+            console.warn('[token-stat] out (per-user) failed:', err instanceof Error ? err.message : err));
+        if (userId !== 0) {
+            addStatEntry(0, 'ai_tokens_out', outputTokens, undefined, purpose).catch(err =>
+                console.warn('[token-stat] out (global) failed:', err instanceof Error ? err.message : err));
+        }
+    }
+}
+
+export type TokenUsageScope = 'me' | 'global';
 
 export type TokenUsageReport = {
     scope: TokenUsageScope;
@@ -966,15 +993,19 @@ export function getTokenUsageStats(filter: {
     from: Date;
     to: Date;
 }): TokenUsageReport {
+    // user_id=0 holds the denormalized global total (every per-user write also writes to 0).
+    // 'me'     → filter to the specific user.
+    // 'global' → read from the user_id=0 aggregate row (no SUM across users needed).
     let userClause = '';
     const params: unknown[] = [];
     if (filter.scope === 'me') {
         if (filter.userId == null) throw new Error("getTokenUsageStats: userId required for scope='me'");
         userClause = 'AND user_id = ?';
         params.push(filter.userId);
-    } else if (filter.scope === 'system') {
+    } else {
+        // global
         userClause = 'AND user_id = 0';
-    } // global: no user filter
+    }
 
     const fromIso = filter.from.toISOString();
     const toIso = filter.to.toISOString();
