@@ -14,7 +14,7 @@ import {Low} from 'lowdb';
 import {JSONFile} from 'lowdb/node';
 import Database from 'better-sqlite3';
 import {existsSync} from 'fs';
-import {SCHEMA_SQL, INDEXES_SQL} from './schema';
+import {SCHEMA_SQL, INDEXES_SQL, applyColumnMigrations} from './schema';
 
 // Determine paths
 const jsonPath = process.env.DB_PATH?.endsWith('.json')
@@ -36,8 +36,10 @@ const db = new Database(sqlitePath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
-// Create schema (shared with database.ts)
+// Create schema + apply ADD COLUMN migrations to an existing DB before creating
+// indexes that reference the new columns.
 db.exec(SCHEMA_SQL);
+applyColumnMigrations(db);
 db.exec(INDEXES_SQL);
 
 // Check if SQLite already has users

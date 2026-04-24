@@ -1,5 +1,23 @@
 /** SQLite schema — single source of truth for database.ts and migrate-to-sqlite.ts */
 
+import type Database from 'better-sqlite3';
+
+/** Apply idempotent ADD COLUMN migrations to an existing database. Safe to call
+ * before CREATE INDEX statements that reference the new columns. Used by both
+ * database.ts (bot startup) and migrate-to-sqlite.ts (pre-start migration). */
+export function applyColumnMigrations(db: Database.Database): void {
+    // sticker_cache: short_tag + used_count (added 2026-04-24)
+    {
+        const cols = db.prepare('PRAGMA table_info(sticker_cache)').all() as { name: string }[];
+        if (!cols.some(c => c.name === 'short_tag')) {
+            db.exec(`ALTER TABLE sticker_cache ADD COLUMN short_tag TEXT NOT NULL DEFAULT ''`);
+        }
+        if (!cols.some(c => c.name === 'used_count')) {
+            db.exec(`ALTER TABLE sticker_cache ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0`);
+        }
+    }
+}
+
 export const SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS users (
         user_id   INTEGER PRIMARY KEY,

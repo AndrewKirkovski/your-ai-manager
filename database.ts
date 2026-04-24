@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import {SCHEMA_SQL, INDEXES_SQL} from './schema';
+import {SCHEMA_SQL, INDEXES_SQL, applyColumnMigrations} from './schema';
 
 const DB_PATH = process.env.DB_PATH || 'bot.sqlite';
 // If the path ends with .json (legacy), switch to .sqlite
@@ -15,6 +15,7 @@ db.pragma('foreign_keys = ON');
 db.pragma('busy_timeout = 5000');
 
 db.exec(SCHEMA_SQL);
+applyColumnMigrations(db);
 db.exec(INDEXES_SQL);
 
 // --- Idempotent column migrations for existing DBs ---
@@ -29,17 +30,6 @@ db.exec(INDEXES_SQL);
         const backfill = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
         db.prepare(`UPDATE memory SET first_recorded_at = ? WHERE first_recorded_at = ''`).run(backfill);
         db.prepare(`UPDATE memory SET updated_at = ? WHERE updated_at = ''`).run(backfill);
-    }
-}
-
-// sticker_cache: short_tag + used_count (added 2026-04-24)
-{
-    const cols = db.prepare('PRAGMA table_info(sticker_cache)').all() as { name: string }[];
-    if (!cols.some(c => c.name === 'short_tag')) {
-        db.exec(`ALTER TABLE sticker_cache ADD COLUMN short_tag TEXT NOT NULL DEFAULT ''`);
-    }
-    if (!cols.some(c => c.name === 'used_count')) {
-        db.exec(`ALTER TABLE sticker_cache ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0`);
     }
 }
 
