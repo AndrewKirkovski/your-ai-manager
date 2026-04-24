@@ -135,10 +135,12 @@ export const SCHEMA_SQL = `
         emojis         TEXT NOT NULL DEFAULT '[]',
         set_name       TEXT,
         description    TEXT NOT NULL,
+        short_tag      TEXT NOT NULL DEFAULT '',
         file_id        TEXT,
         analyzed_at    TEXT NOT NULL,
         updated_at     TEXT NOT NULL,
-        user_corrected INTEGER NOT NULL DEFAULT 0
+        user_corrected INTEGER NOT NULL DEFAULT 0,
+        used_count     INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS stat_entries (
@@ -165,4 +167,6 @@ export const INDEXES_SQL = `
     CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_clinics_name ON luxmed_clinics(name);
     CREATE INDEX IF NOT EXISTS idx_sticker_cache_kind ON sticker_cache(kind);
     CREATE INDEX IF NOT EXISTS idx_sticker_cache_set_name ON sticker_cache(set_name);
+    CREATE INDEX IF NOT EXISTS idx_sticker_cache_used_count ON sticker_cache(used_count DESC);
+    CREATE INDEX IF NOT EXISTS idx_stats_name_ts ON stat_entries(name, timestamp DESC);
 `;

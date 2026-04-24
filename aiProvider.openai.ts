@@ -29,6 +29,7 @@ export class OpenAIProvider implements AIProvider {
             model: request.model,
             max_tokens: request.maxTokens,
             stream: true as const,
+            stream_options: { include_usage: true },
             messages,
         };
 
@@ -54,7 +55,21 @@ export class OpenAIProvider implements AIProvider {
             requestOptions as unknown as OpenAI.ChatCompletionCreateParamsStreaming
         );
 
+        let pendingDone = false;
         for await (const chunk of stream) {
+            // With include_usage:true the LAST chunk has empty choices[] and a populated usage field.
+            // Some providers also send usage on a chunk that still has finish_reason — handle both.
+            const usage = (chunk as { usage?: { prompt_tokens?: number; completion_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } }).usage;
+            if (usage && (usage.prompt_tokens || usage.completion_tokens)) {
+                yield {
+                    type: 'usage',
+                    input_tokens: usage.prompt_tokens ?? 0,
+                    output_tokens: usage.completion_tokens ?? 0,
+                    cache_creation_tokens: usage.cache_creation_input_tokens,
+                    cache_read_tokens: usage.cache_read_input_tokens,
+                };
+            }
+
             const delta = chunk.choices[0]?.delta;
 
             if (delta?.content) {
@@ -84,10 +99,11 @@ export class OpenAIProvider implements AIProvider {
             }
 
             if (chunk.choices[0]?.finish_reason) {
-                yield { type: 'done' };
-                break;
+                pendingDone = true;
+                // Don't break here — let the final usage-only chunk arrive after finish_reason.
             }
         }
+        if (pendingDone) yield { type: 'done' };
     }
 
     async completeChat(request: CompletionRequest): Promise<string> {

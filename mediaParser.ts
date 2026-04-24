@@ -8,6 +8,8 @@ import {
     getStickerCacheEntry,
     upsertStickerCacheEntry,
     refreshStickerCacheFileId,
+    bumpStickerUsedCount,
+    addStatEntry,
     type StickerCacheKind,
 } from './userStore';
 import { gatherAllPackEmojis } from './stickerSetCache';
@@ -58,45 +60,89 @@ export interface MediaParserConfig {
 // ============== STICKER DESCRIPTION PROMPTS + CLEANUP ==============
 
 /** Strict prompt for static-sticker Vision analysis. Optimized for compact output:
- * no preamble, no markdown headers, no "this sticker" filler, no emoji name echoes. */
+ * no preamble, no markdown headers, no "this sticker" filler, no emoji name echoes.
+ * Now also asks for a TAG: line — a 3-6 word hyphenated semantic phrase used in the
+ * compact "vocabulary" prompt block the AI sees on every request. */
 const STICKER_DESCRIPTION_PROMPT =
-    'Describe the sticker in 2-3 sentences of plain prose. ' +
+    'Describe the sticker in 2-3 sentences of plain prose, then on a NEW LINE provide a TAG.\n' +
     'STRICT FORMAT RULES — violating any of these wastes tokens in our cache:\n' +
     '1. NO preamble. Do NOT start with "The sticker", "This sticker", "Sticker", "Image", "I see", or any meta-reference. Start directly with the visual description (e.g. "Anthropomorphic gray wolf with...").\n' +
     '2. NO markdown headers, NO "##", NO "Sticker Analysis" titles, NO bullet lists. Plain prose only.\n' +
     '3. NO mention of the associated emoji char or pack name — those are tracked separately.\n' +
     '4. NO meta-phrases like "Senders typically use this to" or "essentially a stylized X" — just say what the meaning IS.\n' +
-    'WHAT to include: the character/subject, expression/pose, emotional tone, and what feeling/message the sender conveys. ' +
+    '5. END with a separate line in EXACTLY this format: "TAG: hyphenated-3-to-6-word-semantic-phrase". The tag should be the most distinctive descriptor (e.g. "wolf-laughing-maniac", "tsuki-heart-floats-love", "pepe-shocked-pogchamp"). Lowercase. Use - between words.\n' +
+    'WHAT to include in the prose: the character/subject, expression/pose, emotional tone, and what feeling/message the sender conveys. ' +
     'WHEN named characters are recognizable (e.g. "Pepe the Frog", a known anime character), use **bold** ONLY for the proper noun. Otherwise no markdown.';
 
 /** Animated variant — same rules, plus describe motion across frames. */
 const ANIMATED_DESCRIPTION_PROMPT =
-    'Describe what happens across the frames in 3-4 sentences of plain prose. ' +
+    'Describe what happens across the frames in 3-4 sentences of plain prose, then on a NEW LINE provide a TAG.\n' +
     'STRICT FORMAT RULES:\n' +
     '1. NO preamble. Do NOT start with "The sticker", "Across the frames", "This animation". Start with the subject (e.g. "Anthropomorphic wolf gradually...").\n' +
     '2. NO markdown headers, NO "##", NO bullet lists. Plain prose only.\n' +
     '3. NO mention of the associated emoji char or pack name.\n' +
     '4. NO meta-phrases like "Senders typically use this sticker to" — state the meaning directly.\n' +
-    'WHAT to include: subject, motion/expression change across frames, what feeling/message the animation conveys. ' +
+    '5. END with a separate line: "TAG: hyphenated-3-to-6-word-semantic-phrase" (lowercase, dash-separated). Capture the motion + emotion concisely.\n' +
+    'WHAT to include in the prose: subject, motion/expression change across frames, what feeling/message the animation conveys. ' +
     'WHEN named characters are recognizable, **bold** the proper noun. Otherwise no markdown.';
 
-/** Defense-in-depth: strip known boilerplate even when Vision violates the strict prompt.
- * Operates on already-trimmed Vision output before cache write. Idempotent. */
-function cleanStickerDescription(text: string): string {
-    let s = text.trim();
-    // Markdown header line at start ("## Sticker Analysis", "# Description" etc).
+export type ParsedDescription = { description: string; shortTag: string };
+
+/** Split Vision output into prose description + short TAG. Defense-in-depth strip
+ * for known boilerplate. Idempotent. Falls back to deriving a tag from the description
+ * if Vision forgot to emit a TAG: line. */
+export function parseStickerDescription(text: string): ParsedDescription {
+    let raw = text.trim();
+    let shortTag = '';
+
+    // Pull TAG: line if present — usually the last line.
+    const tagMatch = raw.match(/^TAG\s*:\s*([^\n]+)$/im);
+    if (tagMatch) {
+        shortTag = tagMatch[1].trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '').slice(0, 60);
+        raw = raw.replace(tagMatch[0], '').trim();
+    }
+
+    let s = raw;
     s = s.replace(/^#{1,6}\s+[^\n]*\n+/, '');
-    // "The sticker (features|depicts|shows|features a|...)" / "This sticker shows ..." / "This image features ..."
     s = s.replace(/^(?:\*\*)?(?:The|This)\s+(?:sticker|image|emoji|animation|gif)(?:\*\*)?\s+(?:features?|depicts?|shows?|displays?|presents?|portrays?|is)\s+(?:a|an)?\s*/i, '');
-    // "Across the frames, ..." preamble (animated case)
     s = s.replace(/^Across the frames,?\s+/i, '');
-    // Capitalize first letter after the strip
     if (s.length > 0) s = s[0].toUpperCase() + s.slice(1);
-    return s;
+
+    // Fallback tag if Vision didn't emit one: take first 4 words of cleaned description.
+    if (!shortTag && s.length > 0) {
+        shortTag = s
+            .replace(/\*\*/g, '')
+            .toLowerCase()
+            .split(/[\s,.;:—-]+/)
+            .filter(Boolean)
+            .slice(0, 4)
+            .join('-')
+            .replace(/[^a-z0-9-]/g, '')
+            .slice(0, 60);
+    }
+
+    return { description: s, shortTag };
+}
+
+// Legacy back-compat for any caller still importing cleanStickerDescription.
+function cleanStickerDescription(text: string): string {
+    return parseStickerDescription(text).description;
 }
 
 // Test surface for unit testing — not exported via index, but accessible via direct import.
-export const __TEST_ONLY__ = { cleanStickerDescription };
+export const __TEST_ONLY__ = { cleanStickerDescription, parseStickerDescription };
+
+/** Record token usage from an OpenAI-compatible Vision response into stat_entries.
+ * Uses synthetic user_id=0 since these calls are system-triggered (not tied to a user).
+ * Fires-and-forgets — never blocks the analysis path. */
+function recordVisionUsage(response: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string): void {
+    const u = response.usage;
+    if (!u) return;
+    const inT = u.prompt_tokens ?? 0;
+    const outT = u.completion_tokens ?? 0;
+    if (inT > 0) addStatEntry(0, 'ai_tokens_in', inT, undefined, purpose).catch(() => {});
+    if (outT > 0) addStatEntry(0, 'ai_tokens_out', outT, undefined, purpose).catch(() => {});
+}
 
 // ============== MAIN CLASS ==============
 
@@ -342,8 +388,9 @@ export class MediaParser {
 
     /**
      * Send a base64 image to Claude Vision with a custom prompt.
+     * Records token usage as a system stat (user_id=0) tagged with the supplied purpose.
      */
-    private async analyzeImageBase64(base64: string, prompt: string, maxTokens?: number): Promise<string> {
+    private async analyzeImageBase64(base64: string, prompt: string, maxTokens?: number, purpose: string = 'vision_photo'): Promise<string> {
         const imageUrl = `data:image/jpeg;base64,${base64}`;
         const response = await this.anthropic.chat.completions.create({
             model: this.visionModel,
@@ -356,6 +403,7 @@ export class MediaParser {
             }],
             max_tokens: maxTokens ?? this.maxImageTokens
         });
+        recordVisionUsage(response, purpose);
         return response.choices[0]?.message?.content || 'Unable to analyze image';
     }
 
@@ -387,12 +435,13 @@ export class MediaParser {
         // Cache hit — skip Vision entirely
         const cached = getStickerCacheEntry(cacheKey);
         if (cached) {
-            // Self-heal: Telegram file_ids occasionally rotate (e.g., when a sticker pack is republished
-            // or after a long server-side TTL). Refresh on every cache hit so SendStickerToUser picks
-            // a sendable id next time. Targeted update — doesn't touch description/updated_at.
+            // Self-heal: Telegram file_ids occasionally rotate. Refresh on every cache hit
+            // so SendStickerById/SendStickerToUser picks a sendable id next time.
             if (cached.fileId !== sticker.file_id) {
                 refreshStickerCacheFileId(cacheKey, sticker.file_id);
             }
+            // User-send is a usage signal — boosts ranking in the system-prompt vocabulary.
+            bumpStickerUsedCount(cacheKey);
             return {
                 type: 'sticker',
                 content: cached.description,
@@ -414,13 +463,15 @@ export class MediaParser {
         const allEmojis = await gatherAllPackEmojis(this.bot, sticker.set_name, cacheKey, sticker.emoji);
 
         try {
-            const description = await this.analyzeStickerByKind(sticker, kind, allEmojis);
+            const rawDescription = await this.analyzeStickerByKind(sticker, kind, allEmojis);
+            const { description, shortTag } = parseStickerDescription(rawDescription);
             upsertStickerCacheEntry({
                 cacheKey,
                 kind,
                 emojis: allEmojis,
                 setName: sticker.set_name,
                 description,
+                shortTag,
                 fileId: sticker.file_id,
             });
             return {
@@ -472,6 +523,7 @@ export class MediaParser {
     async parseCustomEmoji(customEmojiId: string, fallbackChar?: string): Promise<ParsedMedia> {
         const cached = getStickerCacheEntry(customEmojiId);
         if (cached) {
+            bumpStickerUsedCount(customEmojiId);
             let fileId = cached.fileId;
             // Lazy re-fetch: if file_id was previously nulled (Telegram rejected an old id during
             // SendStickerToUser), try once to recover via the free Bot API call. Cheap, no Vision cost.
@@ -516,13 +568,15 @@ export class MediaParser {
                     ? 'animated_sticker'
                     : 'custom_emoji';
 
-            const description = await this.analyzeStickerByKind(sticker, kind === 'custom_emoji' ? 'sticker' : kind, emojis);
+            const rawDescription = await this.analyzeStickerByKind(sticker, kind === 'custom_emoji' ? 'sticker' : kind, emojis);
+            const { description, shortTag } = parseStickerDescription(rawDescription);
             upsertStickerCacheEntry({
                 cacheKey: customEmojiId,
                 kind: 'custom_emoji',
                 emojis,
                 setName: sticker.set_name,
                 description,
+                shortTag,
                 fileId: sticker.file_id,
             });
             return {
@@ -650,7 +704,8 @@ export class MediaParser {
             }],
             max_tokens: this.maxStickerTokens,
         });
-        return cleanStickerDescription(response.choices[0]?.message?.content || 'Unable to analyze sticker');
+        recordVisionUsage(response, 'vision_sticker');
+        return response.choices[0]?.message?.content || 'Unable to analyze sticker';
     }
 
     private async analyzeAnimatedStrip(strip: Buffer, sticker: Sticker, emojis: string[], isVideo: boolean): Promise<string> {
@@ -676,7 +731,8 @@ export class MediaParser {
             }],
             max_tokens: Math.max(this.maxStickerTokens, 350),
         });
-        return cleanStickerDescription(response.choices[0]?.message?.content || 'Unable to analyze animated sticker');
+        recordVisionUsage(response, isVideo ? 'vision_video_sticker' : 'vision_animated_sticker');
+        return response.choices[0]?.message?.content || 'Unable to analyze animated sticker';
     }
 
     // ============== LOCATION MESSAGE PARSING ==============

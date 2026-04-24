@@ -54,7 +54,10 @@ import {
     FindStickerInCache,
     EchoStickerToUser,
     SendStickerToUser,
+    SendStickerById,
+    SuggestExpressions,
 } from "./tools.stickercache";
+import { GetTokenUsage } from "./tools.tokens";
 
 export const tools = {
     get_current_time,
@@ -125,7 +128,11 @@ export const tools = {
     DeleteStickerCache,
     FindStickerInCache,
     EchoStickerToUser,
-    SendStickerToUser,
+    SendStickerToUser,        // legacy fallback (vibe-query → Haiku rank → send)
+    SendStickerById,          // primary natural-flow path: pick from catalog, send directly
+    SuggestExpressions,       // batch helper for multi-intent replies
+    // Token usage
+    GetTokenUsage,
 } as const;
 
 

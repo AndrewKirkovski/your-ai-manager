@@ -1,7 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { marked } from 'marked';
 import sanitizeHtml from 'sanitize-html';
-import { getAllAnalyzedCustomEmojis } from './userStore';
+import { getAllAnalyzedCustomEmojis, getAllSendableStickers, type StickerCacheEntry } from './userStore';
 
 /** Tags whose content must NEVER reach the user (sanitize-html strips tag + children).
  * htmlparser2 auto-closes unclosed tags at end-of-input, so partial chunks mid-stream
@@ -200,53 +200,94 @@ const STATIC_TG_EMOJI_BY_CHAR: Map<string, string> = (() => {
     return m;
 })();
 
-/** Dynamic merge cache (30s TTL): static catalog labels + DB-cached analyzed custom emojis.
- * The DB read is cheap (small table, indexed by kind), but we hit this on every AI request
- * via the prompt block. 30s is short enough that newly-analyzed user emojis show up quickly. */
+/** Dynamic merge cache (30s TTL): static catalog labels + DB-cached analyzed custom emojis +
+ * sendable stickers. The DB reads are cheap (small indexed table) but we hit this on every AI
+ * request via the prompt block. 30s is short enough that newly-analyzed user emojis show up
+ * quickly without per-request DB cost. */
 const DYNAMIC_CACHE_TTL_MS = 30_000;
 let dynamicCachedAt = 0;
 let cachedPromptBlock = '';
 let cachedByCharMap: Map<string, string> = STATIC_TG_EMOJI_BY_CHAR;
 
-function rebuildDynamicCache(): void {
-    const analyzed = getAllAnalyzedCustomEmojis();
+function shortenForCatalog(text: string, max: number): string {
+    if (!text) return '';
+    const stripped = text.replace(/\*\*/g, '').replace(/\s+/g, ' ').trim();
+    if (stripped.length <= max) return stripped;
+    // Truncate at last word boundary before `max`, fall back to hard cut.
+    const cut = stripped.slice(0, max);
+    const lastSpace = cut.lastIndexOf(' ');
+    return (lastSpace > max * 0.6 ? cut.slice(0, lastSpace) : cut).trim() + '…';
+}
 
-    // Build merged char→id map: static catalog wins for any char it covers, cache fills the rest.
+function fallbackTag(entry: StickerCacheEntry): string {
+    if (entry.shortTag) return entry.shortTag;
+    // Derive a tag from the first few words of the cleaned description.
+    return entry.description
+        .replace(/\*\*/g, '')
+        .toLowerCase()
+        .split(/[\s,.;:—-]+/)
+        .filter(Boolean)
+        .slice(0, 4)
+        .join('-')
+        .replace(/[^a-z0-9-]/g, '')
+        .slice(0, 60) || 'unnamed';
+}
+
+function rebuildDynamicCache(): void {
+    const customEmojis = getAllAnalyzedCustomEmojis();
+    const stickers = getAllSendableStickers();
+
+    // 1. Bare-unicode auto-upgrade map: static catalog wins, custom-emoji cache fills the rest.
     const merged = new Map(STATIC_TG_EMOJI_BY_CHAR);
-    for (const entry of analyzed) {
+    for (const entry of customEmojis) {
         for (const ch of entry.emojis) {
             if (!merged.has(ch)) merged.set(ch, entry.cacheKey);
         }
     }
     cachedByCharMap = merged;
 
-    // Build prompt block: dedup by id (catalog labels and cached descriptions for the same id collapse,
-    // catalog label wins because it appears first).
-    const seenIds = new Set<string>();
-    const lines: string[] = [];
+    // 2. EMOJIS section — static catalog labels (curated, terse) + cached custom emojis.
+    // Format: `  {emoji} {cache_key} {short_tag}`  (~50 chars/row)
+    const emojiLines: string[] = [];
+    const seenEmojiIds = new Set<string>();
     for (const e of TG_EMOJI_CATALOG) {
-        if (!e.desc || seenIds.has(e.id)) continue;
-        seenIds.add(e.id);
-        lines.push(`  ${e.char} (${e.desc}) — <tg-emoji emoji-id="${e.id}">${e.char}</tg-emoji>`);
+        if (!e.desc || seenEmojiIds.has(e.id)) continue;
+        seenEmojiIds.add(e.id);
+        emojiLines.push(`  ${e.char} ${e.id} ${e.desc}`);
     }
-    for (const entry of analyzed) {
-        if (seenIds.has(entry.cacheKey)) continue;
-        seenIds.add(entry.cacheKey);
+    for (const entry of customEmojis) {
+        if (seenEmojiIds.has(entry.cacheKey)) continue;
+        seenEmojiIds.add(entry.cacheKey);
         const ch = entry.emojis[0] || '?';
-        // Truncate long Vision descriptions so the prompt stays compact.
-        const shortDesc = entry.description.length > 120
-            ? entry.description.slice(0, 117) + '...'
-            : entry.description;
-        lines.push(`  ${ch} (${shortDesc}) — <tg-emoji emoji-id="${entry.cacheKey}">${ch}</tg-emoji>`);
+        emojiLines.push(`  ${ch} ${entry.cacheKey} ${shortenForCatalog(fallbackTag(entry), 40)}`);
     }
 
-    cachedPromptBlock = lines.length === 0 ? '' : [
-        'CUSTOM EMOJI (Telegram Premium, animated):',
-        '- Writing the bare unicode (e.g. 🔥) auto-upgrades to the default variant.',
-        '- For the specific variants below, emit the full tag verbatim:',
-        ...lines,
-    ].join('\n');
+    // 3. STICKERS section — sendable stickers only (have file_id). Format same as emojis.
+    const stickerLines: string[] = [];
+    for (const entry of stickers) {
+        const ch = entry.emojis[0] || '🖼';
+        stickerLines.push(`  ${ch} ${entry.cacheKey} ${shortenForCatalog(fallbackTag(entry), 40)}`);
+    }
 
+    const sections: string[] = [];
+    if (emojiLines.length > 0) {
+        sections.push(
+            'CUSTOM EMOJIS (Telegram Premium — write the tag inline in your reply):',
+            '- For specific emoji-id variants below, emit `<tg-emoji emoji-id="ID">char</tg-emoji>` verbatim.',
+            '- Bare unicode (e.g. 🔥) auto-upgrades to the catalog default. List sorted by recent usage.',
+            ...emojiLines,
+        );
+    }
+    if (stickerLines.length > 0) {
+        if (sections.length > 0) sections.push('');
+        sections.push(
+            'STICKERS (call SendStickerById("cache_key") to send one as a separate message):',
+            '- Pick freely when a sticker fits the moment. Sorted by recent usage.',
+            ...stickerLines,
+        );
+    }
+
+    cachedPromptBlock = sections.join('\n');
     dynamicCachedAt = Date.now();
 }
 
@@ -258,29 +299,28 @@ function ensureFresh(): void {
             // Don't break the prompt path on DB issues — fall back to static catalog only.
             console.warn('[tg-emoji] dynamic cache rebuild failed, using static catalog:', err instanceof Error ? err.message : err);
             cachedByCharMap = STATIC_TG_EMOJI_BY_CHAR;
-            cachedPromptBlock = (() => {
-                const labeled = TG_EMOJI_CATALOG.filter(e => e.desc);
-                if (labeled.length === 0) return '';
-                const ls = labeled.map(e =>
-                    `  ${e.char} (${e.desc}) — <tg-emoji emoji-id="${e.id}">${e.char}</tg-emoji>`);
-                return [
-                    'CUSTOM EMOJI (Telegram Premium, animated):',
-                    '- Writing the bare unicode (e.g. 🔥) auto-upgrades to the default variant.',
-                    '- For the specific variants below, emit the full tag verbatim:',
-                    ...ls,
+            const labeled = TG_EMOJI_CATALOG.filter(e => e.desc);
+            cachedPromptBlock = labeled.length === 0
+                ? ''
+                : [
+                    'CUSTOM EMOJIS (Telegram Premium — write the tag inline in your reply):',
+                    '- For specific emoji-id variants below, emit `<tg-emoji emoji-id="ID">char</tg-emoji>` verbatim.',
+                    ...labeled.map(e => `  ${e.char} ${e.id} ${e.desc}`),
                 ].join('\n');
-            })();
             dynamicCachedAt = Date.now();
         }
     }
 }
 
-/** System-prompt block listing labeled variants (static catalog + DB-cached analyzed
- * custom emojis). Cached for 30s so SYSTEM_PROMPT assembly stays cheap. */
-export function tgEmojiPromptBlock(): string {
+/** System-prompt block — compact two-section vocabulary (EMOJIS + STICKERS).
+ * Cached for 30s so SYSTEM_PROMPT assembly stays cheap. */
+export function getExpressionVocabulary(): string {
     ensureFresh();
     return cachedPromptBlock;
 }
+
+/** Back-compat alias for the previous prompt-block name. */
+export const tgEmojiPromptBlock = getExpressionVocabulary;
 
 /** Wrap mapped unicode emoji in <tg-emoji> tags in a single pass.
  * - Longest-first alternation so ZWJ sequences (e.g. 😵‍💫) match before their base (😵).

@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import {addMessageToHistory, getRecentMessageHistory} from './userStore';
+import {addMessageToHistory, getRecentMessageHistory, addStatEntry, bumpStickerUsedCount} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
 import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers, exceedsTelegramLimit} from './telegramFormat';
@@ -21,6 +21,8 @@ export interface AIStreamOptions {
     appendMessagesAfterUser?: ProviderMessage[];
     /** Callback to handle images from search results (sent separately, not in history) */
     onImageResults?: (images: string[]) => Promise<void>;
+    /** Recorded into stat_entries.note for the token-usage stat. Default 'reply'. */
+    purpose?: string;
 }
 
 export interface AIStreamResult {
@@ -185,6 +187,8 @@ export class AIService {
             let historyResponseAccumulated = '';
             const toolCalls: ToolCallInfo[] = [];
             let thinkingBlocks: ThinkingBlockData[] | undefined;
+            let usageInputTokens = 0;
+            let usageOutputTokens = 0;
 
             await bot.sendChatAction(userId, 'typing');
 
@@ -236,10 +240,40 @@ export class AIService {
                         thinkingBlocks = chunk.blocks;
                         break;
 
+                    case 'usage':
+                        usageInputTokens = chunk.input_tokens;
+                        usageOutputTokens = chunk.output_tokens;
+                        break;
+
                     case 'done':
                         clearInterval(updateInterval_id);
                         break;
                 }
+            }
+
+            // Record AI token usage into stat_entries (background, never blocks the reply path).
+            // user_id = the actual user for replies; cron/system flows pass userId=0 from caller.
+            const purpose = options.purpose ?? 'reply';
+            if (usageInputTokens > 0) {
+                addStatEntry(userId, 'ai_tokens_in', usageInputTokens, undefined, purpose).catch(err =>
+                    console.warn('[token-stat] failed to record ai_tokens_in:', err instanceof Error ? err.message : err));
+            }
+            if (usageOutputTokens > 0) {
+                addStatEntry(userId, 'ai_tokens_out', usageOutputTokens, undefined, purpose).catch(err =>
+                    console.warn('[token-stat] failed to record ai_tokens_out:', err instanceof Error ? err.message : err));
+            }
+
+            // Detect inline custom-emoji + sticker references the AI emitted in its reply.
+            // Each unique cache_key bumped once per response (not once per occurrence in text).
+            // Failures are swallowed — usage tracking is fire-and-forget.
+            try {
+                const emittedKeys = new Set<string>();
+                const tgEmojiRe = /<tg-emoji\s+emoji-id="([^"]+)">/gi;
+                let m: RegExpExecArray | null;
+                while ((m = tgEmojiRe.exec(aiResponseAccumulated)) !== null) emittedKeys.add(m[1]);
+                for (const key of emittedKeys) bumpStickerUsedCount(key);
+            } catch (err) {
+                console.warn('[used_count] inline tag scan failed:', err instanceof Error ? err.message : err);
             }
 
             // Ensure interval is cleared even if 'done' wasn't received

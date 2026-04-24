@@ -137,10 +137,12 @@ interface StickerCacheRow {
     emojis: string;
     set_name: string | null;
     description: string;
+    short_tag: string;
     file_id: string | null;
     analyzed_at: string;
     updated_at: string;
     user_corrected: number;
+    used_count: number;
 }
 
 interface StatRow {
@@ -281,19 +283,22 @@ const stmts = {
     // Sticker / Custom Emoji Cache (global, keyed by file_unique_id or custom_emoji_id)
     getStickerCache: db.prepare<[string], StickerCacheRow>('SELECT * FROM sticker_cache WHERE cache_key = ?'),
     upsertStickerCache: db.prepare(`
-        INSERT INTO sticker_cache (cache_key, kind, emojis, set_name, description, file_id, analyzed_at, updated_at, user_corrected)
-        VALUES (@cache_key, @kind, @emojis, @set_name, @description, @file_id, @analyzed_at, @updated_at, @user_corrected)
+        INSERT INTO sticker_cache (cache_key, kind, emojis, set_name, description, short_tag, file_id, analyzed_at, updated_at, user_corrected)
+        VALUES (@cache_key, @kind, @emojis, @set_name, @description, @short_tag, @file_id, @analyzed_at, @updated_at, @user_corrected)
         ON CONFLICT(cache_key) DO UPDATE SET
             kind = excluded.kind,
             emojis = excluded.emojis,
             set_name = COALESCE(excluded.set_name, set_name),
             description = excluded.description,
+            short_tag = CASE WHEN excluded.short_tag != '' THEN excluded.short_tag ELSE short_tag END,
             file_id = COALESCE(excluded.file_id, file_id),
             updated_at = excluded.updated_at,
             user_corrected = excluded.user_corrected
     `),
     deleteStickerCache: db.prepare('DELETE FROM sticker_cache WHERE cache_key = ?'),
     refreshStickerCacheFileId: db.prepare('UPDATE sticker_cache SET file_id = ? WHERE cache_key = ?'),
+    bumpStickerUsedCount: db.prepare('UPDATE sticker_cache SET used_count = used_count + 1 WHERE cache_key = ?'),
+    setStickerShortTag: db.prepare('UPDATE sticker_cache SET short_tag = ? WHERE cache_key = ?'),
     getStickerCacheByIds: db.prepare<[string], StickerCacheRow>('SELECT * FROM sticker_cache WHERE cache_key = ?'),
 
     // Stat Entries
@@ -665,10 +670,12 @@ export type StickerCacheEntry = {
     emojis: string[];
     setName?: string;
     description: string;
+    shortTag: string;
     fileId?: string;
     analyzedAt: Date;
     updatedAt: Date;
     userCorrected: boolean;
+    usedCount: number;
 };
 
 function parseEmojis(json: string): string[] {
@@ -687,10 +694,12 @@ function rowToStickerCache(row: StickerCacheRow): StickerCacheEntry {
         emojis: parseEmojis(row.emojis),
         setName: row.set_name ?? undefined,
         description: row.description,
+        shortTag: row.short_tag ?? '',
         fileId: row.file_id ?? undefined,
         analyzedAt: new Date(row.analyzed_at),
         updatedAt: new Date(row.updated_at),
         userCorrected: !!row.user_corrected,
+        usedCount: row.used_count ?? 0,
     };
 }
 
@@ -705,6 +714,7 @@ export function upsertStickerCacheEntry(input: {
     emojis: string[];
     setName?: string;
     description: string;
+    shortTag?: string;
     fileId?: string;
     userCorrected?: boolean;
 }): void {
@@ -716,11 +726,25 @@ export function upsertStickerCacheEntry(input: {
         emojis: JSON.stringify(input.emojis),
         set_name: input.setName ?? null,
         description: input.description,
+        short_tag: input.shortTag ?? '',
         file_id: input.fileId ?? null,
         analyzed_at: existing?.analyzed_at ?? now,
         updated_at: now,
         user_corrected: input.userCorrected ? 1 : (existing?.user_corrected ?? 0),
     });
+}
+
+/** Increment used_count when AI emits a sticker/emoji or user re-sends one.
+ * Idempotent on missing rows (no-op). Used by aiService inline-tag scanner,
+ * SendStickerById, and parseSticker's cache-hit branch. */
+export function bumpStickerUsedCount(cacheKey: string): void {
+    stmts.bumpStickerUsedCount.run(cacheKey);
+}
+
+/** Set short_tag without touching anything else. Used by the one-shot backfill
+ * and by mediaParser when Vision returns a TAG: line in its analysis output. */
+export function setStickerShortTag(cacheKey: string, shortTag: string): void {
+    stmts.setStickerShortTag.run(shortTag, cacheKey);
 }
 
 export function deleteStickerCacheEntry(cacheKey: string): boolean {
@@ -774,7 +798,17 @@ export function findStickerCacheEntries(filter: {
  * No limit — bounded by total custom emojis the bot has ever seen (small in practice). */
 export function getAllAnalyzedCustomEmojis(): StickerCacheEntry[] {
     const rows = db.prepare<[], StickerCacheRow>(
-        `SELECT * FROM sticker_cache WHERE kind = 'custom_emoji' AND description != '' ORDER BY updated_at DESC`
+        `SELECT * FROM sticker_cache WHERE kind = 'custom_emoji' AND description != '' ORDER BY used_count DESC, updated_at DESC`
+    ).all();
+    return rows.map(rowToStickerCache);
+}
+
+/** All sendable sticker rows (non-custom-emoji kinds) with a stored file_id.
+ * Used by getExpressionVocabulary to populate the STICKERS section of the system prompt.
+ * Sorted by used_count DESC so popular stickers float to the top of the prompt. */
+export function getAllSendableStickers(): StickerCacheEntry[] {
+    const rows = db.prepare<[], StickerCacheRow>(
+        `SELECT * FROM sticker_cache WHERE kind != 'custom_emoji' AND file_id IS NOT NULL AND description != '' ORDER BY used_count DESC, updated_at DESC`
     ).all();
     return rows.map(rowToStickerCache);
 }
@@ -905,6 +939,119 @@ export async function getTodayStats(userId: number, timezone?: string): Promise<
         count: row.count,
         unit: row.unit ?? undefined,
     }));
+}
+
+// ============== AI TOKEN USAGE STATS ==============
+
+export type TokenUsageScope = 'me' | 'global' | 'system';
+
+export type TokenUsageReport = {
+    scope: TokenUsageScope;
+    user_id?: number;
+    date_from: string;
+    date_to: string;
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    request_count: number;
+    by_purpose: Record<string, { input: number; output: number; count: number }>;
+    by_day: Array<{ date: string; input: number; output: number; count: number }>;
+};
+
+/** Aggregate ai_tokens_in / ai_tokens_out from stat_entries for a scope + date range.
+ * Returns totals, per-purpose breakdown (from `note` column), and per-day series. */
+export function getTokenUsageStats(filter: {
+    scope: TokenUsageScope;
+    userId?: number;          // required if scope='me'
+    from: Date;
+    to: Date;
+}): TokenUsageReport {
+    let userClause = '';
+    const params: unknown[] = [];
+    if (filter.scope === 'me') {
+        if (filter.userId == null) throw new Error("getTokenUsageStats: userId required for scope='me'");
+        userClause = 'AND user_id = ?';
+        params.push(filter.userId);
+    } else if (filter.scope === 'system') {
+        userClause = 'AND user_id = 0';
+    } // global: no user filter
+
+    const fromIso = filter.from.toISOString();
+    const toIso = filter.to.toISOString();
+
+    type Row = { name: string; note: string | null; day: string; total: number; cnt: number };
+    const rows = db.prepare<unknown[], Row>(
+        `SELECT name, note, substr(timestamp, 1, 10) AS day, SUM(value) AS total, COUNT(*) AS cnt
+         FROM stat_entries
+         WHERE name IN ('ai_tokens_in','ai_tokens_out') AND timestamp >= ? AND timestamp <= ? ${userClause}
+         GROUP BY name, note, day
+         ORDER BY day ASC`
+    ).all(fromIso, toIso, ...params);
+
+    const report: TokenUsageReport = {
+        scope: filter.scope,
+        user_id: filter.scope === 'me' ? filter.userId : undefined,
+        date_from: fromIso,
+        date_to: toIso,
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        request_count: 0,
+        by_purpose: {},
+        by_day: [],
+    };
+
+    const dayMap = new Map<string, { input: number; output: number; count: number }>();
+    const purposeMap = new Map<string, { input: number; output: number; count: number }>();
+
+    // Track count by (purpose, day) and pick MAX(in_count, out_count) so two stat rows per AI call don't double-count.
+    type CountKey = string; // `${purpose}|${day}`
+    const inCount = new Map<CountKey, number>();
+    const outCount = new Map<CountKey, number>();
+
+    for (const r of rows) {
+        const isIn = r.name === 'ai_tokens_in';
+        const purpose = r.note || 'unknown';
+        const day = r.day;
+
+        if (isIn) report.input_tokens += r.total;
+        else report.output_tokens += r.total;
+
+        // by_day
+        let d = dayMap.get(day);
+        if (!d) { d = { input: 0, output: 0, count: 0 }; dayMap.set(day, d); }
+        if (isIn) d.input += r.total; else d.output += r.total;
+
+        // by_purpose
+        let p = purposeMap.get(purpose);
+        if (!p) { p = { input: 0, output: 0, count: 0 }; purposeMap.set(purpose, p); }
+        if (isIn) p.input += r.total; else p.output += r.total;
+
+        // request count tracking
+        const ck: CountKey = `${purpose}|${day}`;
+        if (isIn) inCount.set(ck, (inCount.get(ck) ?? 0) + r.cnt);
+        else outCount.set(ck, (outCount.get(ck) ?? 0) + r.cnt);
+    }
+
+    // Reconcile per-day and per-purpose request counts: max(in, out) per (purpose, day) bucket
+    const allCountKeys = new Set([...inCount.keys(), ...outCount.keys()]);
+    for (const ck of allCountKeys) {
+        const [purpose, day] = ck.split('|');
+        const reqs = Math.max(inCount.get(ck) ?? 0, outCount.get(ck) ?? 0);
+        report.request_count += reqs;
+        const d = dayMap.get(day);
+        if (d) d.count += reqs;
+        const p = purposeMap.get(purpose);
+        if (p) p.count += reqs;
+    }
+
+    report.total_tokens = report.input_tokens + report.output_tokens;
+    report.by_purpose = Object.fromEntries(purposeMap);
+    report.by_day = [...dayMap.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([date, v]) => ({ date, input: v.input, output: v.output, count: v.count }));
+
+    return report;
 }
 
 // ============== LUXMED FUNCTIONS ==============

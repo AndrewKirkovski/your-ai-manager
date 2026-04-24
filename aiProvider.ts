@@ -28,6 +28,7 @@ export type StreamChunk =
     | { type: 'tool_call_args'; index: number; args: string }
     | { type: 'thinking'; content: string }
     | { type: 'thinking_blocks'; blocks: ThinkingBlockData[] }
+    | { type: 'usage'; input_tokens: number; output_tokens: number; cache_creation_tokens?: number; cache_read_tokens?: number }
     | { type: 'done' };
 
 // --- Request types ---

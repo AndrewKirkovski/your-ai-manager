@@ -53,6 +53,10 @@ export class AnthropicProvider implements AIProvider {
         // Capture thinking blocks (text + cryptographic signature) for multi-turn continuity
         const thinkingBlocks: ThinkingBlockData[] = [];
         let currentThinking: { thinking: string; signature: string } | null = null;
+        // Anthropic emits prompt-side input_tokens in message_start, output_tokens in message_delta usage.
+        let inputTokens = 0;
+        let cacheCreationTokens = 0;
+        let cacheReadTokens = 0;
 
         for await (const event of stream as AsyncIterable<Anthropic.MessageStreamEvent>) {
             switch (event.type) {
@@ -109,16 +113,37 @@ export class AnthropicProvider implements AIProvider {
                     break;
                 }
 
+                case 'message_start': {
+                    const u = (event as Anthropic.MessageStartEvent).message?.usage;
+                    if (u) {
+                        inputTokens = u.input_tokens ?? 0;
+                        cacheCreationTokens = u.cache_creation_input_tokens ?? 0;
+                        cacheReadTokens = u.cache_read_input_tokens ?? 0;
+                    }
+                    break;
+                }
+
                 case 'message_delta': {
                     // Emit accumulated thinking blocks before done (needed for recursive tool calls)
                     if (thinkingBlocks.length > 0) {
                         yield { type: 'thinking_blocks', blocks: thinkingBlocks };
                     }
+                    // Emit usage with the final output_token count from message_delta
+                    const u = (event as Anthropic.MessageDeltaEvent).usage;
+                    if (u) {
+                        yield {
+                            type: 'usage',
+                            input_tokens: inputTokens,
+                            output_tokens: u.output_tokens ?? 0,
+                            cache_creation_tokens: cacheCreationTokens || undefined,
+                            cache_read_tokens: cacheReadTokens || undefined,
+                        };
+                    }
                     yield { type: 'done' };
                     break;
                 }
 
-                // message_start, message_stop — no action needed
+                // message_stop — no action needed
             }
         }
     }

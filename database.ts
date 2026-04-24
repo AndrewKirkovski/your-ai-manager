@@ -32,6 +32,23 @@ db.exec(INDEXES_SQL);
     }
 }
 
+// sticker_cache: short_tag + used_count (added 2026-04-24)
+{
+    const cols = db.prepare('PRAGMA table_info(sticker_cache)').all() as { name: string }[];
+    if (!cols.some(c => c.name === 'short_tag')) {
+        db.exec(`ALTER TABLE sticker_cache ADD COLUMN short_tag TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!cols.some(c => c.name === 'used_count')) {
+        db.exec(`ALTER TABLE sticker_cache ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0`);
+    }
+}
+
+// Synthetic system user — required for stat_entries (FK to users) when recording
+// AI usage from cron/sticker-picker/Vision calls that aren't tied to a real user.
+db.prepare(
+    `INSERT OR IGNORE INTO users (user_id, chat_id, goal, timezone) VALUES (0, NULL, 'system', NULL)`
+).run();
+
 // --- One-shot case-normalization for existing rows ---
 // userStore.normalizeMemoryKey / normalizeClinicName now lowercase on every
 // write+read. Legacy rows written before that change keep their original case,

@@ -165,22 +165,42 @@ MEDIA INPUT FORMATS:
 `;
 
 export const STICKER_CACHE_PROMPT = `
-STICKER MEANING CACHE:
-Every incoming sticker context block carries a "cache_key:" line (the Telegram file_unique_id, or for custom emojis the custom_emoji_id). Cached descriptions are global — first user to send a sticker analyzes it via Vision, everyone benefits afterward.
+STICKER + CUSTOM-EMOJI USAGE:
 
-When the user clarifies what a sticker or premium emoji means (e.g. "no, that means annoyed not happy", "this is sarcasm", "stop reading this as cheerful"):
-1. Find the relevant cache_key in recent message history (look for the "cache_key:" line under the most recent sticker block matching the user's reference).
-2. If the sticker is in recent history, call UpdateStickerCache(cache_key, description). Write the new description so it captures BOTH the visual AND the user-specific meaning.
-3. If the reference is ambiguous or out of context, call FindStickerInCache with emoji_contains / description_contains / pack_name to surface candidates. Then call EchoStickerToUser(cache_key) to send the candidate sticker back as visual confirmation, and ask "this one?". Update only after the user confirms.
-4. To force re-analysis from scratch (e.g. "you keep getting this one wrong, start fresh"), call DeleteStickerCache(cache_key). Next time the sticker is sent, Vision re-analyzes it.
+Your at-a-glance vocabulary lives in the EMOJIS and STICKERS sections of this system prompt
+(below the RULES). Each line is "emoji  cache_key  short_tag". Use them naturally when a tone
+fits — don't ask permission, just emit them in your reply.
 
-Don't update the cache reflexively from your own opinion — only when the USER tells you the current meaning is wrong. The cache is shared across users.
+(A) Custom emojis — write the tag inline directly in your message text:
+    <tg-emoji emoji-id="THE_CACHE_KEY">😂</tg-emoji>
+    Bare unicode emojis auto-upgrade to the catalog default for that char, but for a SPECIFIC
+    variant (e.g. wolf-laughing instead of generic laughing) emit the tag verbatim.
 
-SENDING STICKERS BACK:
-You can react with a sticker via SendStickerToUser(vibe_query, emoji?). Pass a short vibe phrase ("laughing", "tired wolf", "agreement", "heart"). It searches cached descriptions + emoji lists and sends the freshest match.
-- If success=true, the sticker IS your reply — keep accompanying text minimal or skip it. Don't say "вот тебе стикер" — just send it.
-- If no_match=true, the cache has nothing fitting; reply with text instead. Don't pretend you sent something.
-- The cache only contains stickers users have sent the bot before, so your repertoire grows organically. Don't force a sticker when nothing fits — text is always a valid choice.
+(B) Stickers — call SendStickerById("cache_key") to send one as a separate message.
+    Single round-trip, no semantic search. Pick freely when a sticker fits the moment.
+
+(C) For multi-beat replies where you'll express several emotions and don't see all the right
+    pieces in the catalog, call SuggestExpressions({intents:["sarcastic","tired"]}) BEFORE
+    writing. Returns top-2 candidates per intent. ONE round-trip serves a whole reply.
+
+(D) Long-tail fallback — if nothing in the catalog fits and SuggestExpressions returns no
+    matches, fall back to SendStickerToUser(vibe_query) which does a slower semantic search
+    over the full cache. Use sparingly.
+
+Don't force expressions — text is always a valid choice. The catalog grows organically as
+users send stickers/emojis to the bot.
+
+USER-CORRECTION FLOW (rare):
+- Incoming sticker context blocks include a "cache_key:" line. When the user clarifies what
+  a sticker means (e.g. "no, that means annoyed not happy"), call
+  UpdateStickerCache(cache_key, description) with the corrected meaning.
+- For ambiguous references, use FindStickerInCache + EchoStickerToUser to confirm.
+- To force re-analysis: DeleteStickerCache(cache_key).
+
+TOKEN USAGE STATS:
+- AI token consumption is auto-recorded as 'ai_tokens_in' and 'ai_tokens_out' stat entries.
+- If user asks "how many tokens", call GetTokenUsage({scope:'me'|'global', period:'today'|'week'|'month'}).
+- For a chart, call GenerateStatChart({name:'ai_tokens_in', period:'week'}).
 `;
 
 export const STAT_TRACKING_PROMPT = `

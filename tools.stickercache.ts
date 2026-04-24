@@ -7,6 +7,8 @@ import {
     deleteStickerCacheEntry,
     findStickerCacheEntries,
     refreshStickerCacheFileId,
+    bumpStickerUsedCount,
+    addStatEntry,
     getUser,
     type StickerCacheEntry,
     type StickerCacheKind,
@@ -52,6 +54,7 @@ async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEnt
             messages: [{role: 'user', content: prompt}],
             max_tokens: 10,
         });
+        recordLookupUsage(resp, 'sticker_picker');
         const raw = resp.choices[0]?.message?.content?.trim() ?? '';
         const idx = parseInt(raw.match(/\d+/)?.[0] ?? '', 10);
         if (Number.isFinite(idx) && idx >= 1 && idx <= candidates.length) {
@@ -62,6 +65,17 @@ async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEnt
         console.warn('[stickerPicker] lookup model failed; returning null:', err instanceof Error ? err.message : err);
     }
     return null;
+}
+
+/** Record token usage from a Haiku lookup-model call. user_id=0 (system).
+ * Fire-and-forget — never blocks the picker path. */
+function recordLookupUsage(resp: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string): void {
+    const u = resp.usage;
+    if (!u) return;
+    const inT = u.prompt_tokens ?? 0;
+    const outT = u.completion_tokens ?? 0;
+    if (inT > 0) addStatEntry(0, 'ai_tokens_in', inT, undefined, purpose).catch(() => {});
+    if (outT > 0) addStatEntry(0, 'ai_tokens_out', outT, undefined, purpose).catch(() => {});
 }
 
 const KIND_VALUES: StickerCacheKind[] = ['sticker', 'animated_sticker', 'video_sticker', 'custom_emoji'];
@@ -204,6 +218,175 @@ export const FindStickerInCache: Tool = {
                 updated_at: m.updatedAt.toISOString(),
             })),
         };
+    },
+};
+
+/** Direct-send tool — AI picks the cache_key from the EMOJIS/STICKERS catalog visible
+ * in the system prompt, no Haiku ranker round-trip. The natural-flow primary path. */
+export const SendStickerById: Tool = {
+    name: 'SendStickerById',
+    description:
+        "Send a specific sticker by its cache_key. Pick the cache_key from the STICKERS section " +
+        "of your system prompt vocabulary (each line shows: emoji + cache_key + short tag). " +
+        "Use this whenever a sticker fits your reaction — natural in-flow choice, no need to ask the user. " +
+        "Don't force it; if no listed sticker matches the moment, just write text. " +
+        "If the cache_key isn't in the catalog OR the sticker has no current file_id, returns success=false — fall back to text.",
+    parameters: {
+        type: 'object',
+        properties: {
+            cache_key: {
+                type: 'string',
+                description: 'EXACT cache_key string from the STICKERS catalog line (e.g. "AgADfQADl7yyCQ"). NOT the short tag, NOT a guess — copy verbatim.',
+            },
+        },
+        required: ['cache_key'],
+    },
+    execute: async (args: {userId: number; cache_key: string}) => {
+        if (!botInstance) return {success: false, message: 'SendStickerById: bot not initialized'};
+        const entry = getStickerCacheEntry(args.cache_key);
+        if (!entry) {
+            return {success: false, no_match: true, message: `No sticker with cache_key="${args.cache_key}" in the catalog. Reply with text.`};
+        }
+        if (!entry.fileId) {
+            return {success: false, no_match: true, message: `Sticker "${args.cache_key}" has no current file_id (Telegram rotated it). Will refresh on next user send. Reply with text.`};
+        }
+        const user = await getUser(args.userId);
+        if (!user?.chatId) return {success: false, message: 'User chat_id unknown.'};
+        try {
+            const sent = await botInstance.sendSticker(user.chatId, entry.fileId);
+            bumpStickerUsedCount(args.cache_key);
+            return {
+                success: true,
+                cache_key: args.cache_key,
+                kind: entry.kind,
+                short_tag: entry.shortTag,
+                sent_message_id: sent.message_id,
+            };
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            if (/file_id|wrong type|invalid/i.test(errMsg)) {
+                refreshStickerCacheFileId(args.cache_key, null);
+                console.warn(`[SendStickerById] cleared stale file_id for ${args.cache_key}: ${errMsg}`);
+            }
+            return {success: false, message: `sendSticker failed: ${errMsg}`};
+        }
+    },
+};
+
+/** Batch suggestion tool — for multi-intent replies where the AI can't quickly find
+ * the right pieces in the EMOJIS/STICKERS catalog scan. ONE Haiku call ranks the
+ * candidate pool against ALL intents simultaneously, returns top-2 per intent. */
+export const SuggestExpressions: Tool = {
+    name: 'SuggestExpressions',
+    description:
+        "Get a map of stickers/custom-emojis matching multiple intents in ONE call. " +
+        "Use this BEFORE writing your reply when (a) you'll express several emotional beats and (b) you can't quickly spot all the right pieces in the EMOJIS/STICKERS catalog visible in your system prompt. " +
+        "Returns top-2 candidates per intent (cache_key + emoji + short_tag + snippet) so you can weave them into your message naturally. " +
+        "For just ONE expression you've already spotted in the catalog, use SendStickerById or write the <tg-emoji> tag inline directly — don't waste a tool call.",
+    parameters: {
+        type: 'object',
+        properties: {
+            intents: {
+                type: 'array',
+                items: {type: 'string'},
+                description: 'Short list of moods/intents to find matches for (e.g. ["sarcastic agreement", "pretending to listen", "exhausted"]). 2-6 intents per call works best.',
+            },
+            kind: {
+                type: 'string',
+                enum: ['sticker', 'animated_sticker', 'video_sticker', 'custom_emoji'],
+                description: "Optional: restrict suggestions to one kind. Omit to consider both stickers and custom emojis.",
+            },
+        },
+        required: ['intents'],
+    },
+    execute: async (args: {userId: number; intents: string[]; kind?: string}) => {
+        const intents = (args.intents ?? []).map(s => s?.trim()).filter(s => s && s.length > 0);
+        if (intents.length === 0) return {success: false, message: 'intents is empty'};
+        const kind = isStickerKind(args.kind) ? args.kind : undefined;
+
+        // Pull a wide pool — the Haiku ranker handles semantic match.
+        const POOL = 100;
+        const pool = findStickerCacheEntries({kind, limit: POOL}).filter(c => !!c.fileId || c.kind === 'custom_emoji');
+        if (pool.length === 0) {
+            return {success: false, no_match: true, message: 'Cache is empty — nothing to suggest.'};
+        }
+
+        // Default: text-LIKE per-intent fallback (if Haiku unavailable or fails)
+        const fallback = (): Record<string, Array<{cache_key: string; kind: string; emoji: string; short_tag: string; snippet: string}>> => {
+            const out: Record<string, Array<{cache_key: string; kind: string; emoji: string; short_tag: string; snippet: string}>> = {};
+            for (const intent of intents) {
+                const matches = pool
+                    .filter(c => (c.shortTag + ' ' + c.description).toLowerCase().includes(intent.toLowerCase()))
+                    .slice(0, 2);
+                out[intent] = matches.map(c => ({
+                    cache_key: c.cacheKey,
+                    kind: c.kind,
+                    emoji: c.emojis[0] ?? '?',
+                    short_tag: c.shortTag,
+                    snippet: c.description.slice(0, 80),
+                }));
+            }
+            return out;
+        };
+
+        if (!lookupClient) {
+            return {success: true, source: 'text_fallback', suggestions: fallback()};
+        }
+
+        // Format candidates compactly for Haiku.
+        const lines = pool.map((c, i) => {
+            const tag = c.shortTag || '?';
+            const snip = c.description.length > 70 ? c.description.slice(0, 67) + '…' : c.description;
+            return `${i + 1}. [${c.kind === 'custom_emoji' ? 'E' : 'S'}] ${c.emojis[0] ?? '?'} ${tag} | ${snip}`;
+        }).join('\n');
+
+        const prompt =
+            `Match each INTENT to up to 2 candidate indices from the LIST. Reply ONLY in the format:\n` +
+            `intent: idx1, idx2\n` +
+            `intent: idx1\n` +
+            `(no header, no explanation, lowercase intent, comma-separated indices, one intent per line. ` +
+            `If no candidate fits an intent, write "intent: -")\n\n` +
+            `INTENTS:\n${intents.map((it, i) => `${i + 1}. ${it}`).join('\n')}\n\n` +
+            `LIST:\n${lines}`;
+
+        try {
+            const resp = await lookupClient.chat.completions.create({
+                model: lookupModel,
+                messages: [{role: 'user', content: prompt}],
+                max_tokens: Math.max(50, intents.length * 25),
+            });
+            recordLookupUsage(resp, 'suggest_expressions');
+            const raw = resp.choices[0]?.message?.content?.trim() ?? '';
+
+            const out: Record<string, Array<{cache_key: string; kind: string; emoji: string; short_tag: string; snippet: string}>> = {};
+            const lineRe = /^([^:\n]+):\s*(.+)$/gm;
+            let m: RegExpExecArray | null;
+            while ((m = lineRe.exec(raw)) !== null) {
+                const intentLabel = m[1].trim();
+                const matchedIntent = intents.find(it => it.toLowerCase() === intentLabel.toLowerCase());
+                if (!matchedIntent) continue;
+                const idxList = m[2]
+                    .split(',')
+                    .map(s => parseInt(s.trim(), 10))
+                    .filter(n => Number.isFinite(n) && n >= 1 && n <= pool.length);
+                out[matchedIntent] = idxList.slice(0, 2).map(i => {
+                    const c = pool[i - 1];
+                    return {
+                        cache_key: c.cacheKey,
+                        kind: c.kind,
+                        emoji: c.emojis[0] ?? '?',
+                        short_tag: c.shortTag,
+                        snippet: c.description.slice(0, 80),
+                    };
+                });
+            }
+            // Fill any intents the model omitted with empty arrays so AI sees explicit no-match.
+            for (const it of intents) if (!(it in out)) out[it] = [];
+            return {success: true, source: 'haiku_ranker', considered: pool.length, suggestions: out};
+        } catch (err) {
+            console.warn('[SuggestExpressions] Haiku call failed, falling back to text-LIKE:', err instanceof Error ? err.message : err);
+            return {success: true, source: 'text_fallback', error: err instanceof Error ? err.message : String(err), suggestions: fallback()};
+        }
     },
 };
 
