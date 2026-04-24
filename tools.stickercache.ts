@@ -359,7 +359,10 @@ export const SuggestExpressions: Tool = {
             const lineRe = /^([^:\n]+):\s*(.+)$/gm;
             let m: RegExpExecArray | null;
             while ((m = lineRe.exec(raw)) !== null) {
-                const intentLabel = m[1].trim();
+                // Strip leading "1. " / "1) " / "- " / "* " — Haiku occasionally adds list
+                // prefixes despite the prompt saying "no header". Without this the intent
+                // exact-match below silently misses and the caller sees an empty array.
+                const intentLabel = m[1].trim().replace(/^(?:[-*•]|\d+[.)])\s+/, '');
                 const matchedIntent = intents.find(it => it.toLowerCase() === intentLabel.toLowerCase());
                 if (!matchedIntent) continue;
                 const idxList = m[2]

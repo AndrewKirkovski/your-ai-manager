@@ -213,10 +213,10 @@ function shortenForCatalog(text: string, max: number): string {
     if (!text) return '';
     const stripped = text.replace(/\*\*/g, '').replace(/\s+/g, ' ').trim();
     if (stripped.length <= max) return stripped;
-    // Truncate at last word boundary before `max`, fall back to hard cut.
+    // Truncate at last word boundary (space OR hyphen — short_tags are hyphen-separated).
     const cut = stripped.slice(0, max);
-    const lastSpace = cut.lastIndexOf(' ');
-    return (lastSpace > max * 0.6 ? cut.slice(0, lastSpace) : cut).trim() + '…';
+    const lastBreak = Math.max(cut.lastIndexOf(' '), cut.lastIndexOf('-'));
+    return (lastBreak > max * 0.6 ? cut.slice(0, lastBreak) : cut).trim() + '…';
 }
 
 function fallbackTag(entry: StickerCacheEntry): string {

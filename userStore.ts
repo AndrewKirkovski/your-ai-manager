@@ -219,7 +219,11 @@ const stmts = {
             goal = @goal,
             timezone = @timezone
     `),
-    getAllUsers: db.prepare<[], UserRow>('SELECT * FROM users'),
+    // user_id=0 is the synthetic system user used as the FK target for global
+    // stat_entries aggregation rows. Hide it from normal iterations (cron, web admin)
+    // so it never gets treated as a real user. Token-usage queries that need it
+    // explicitly read from user_id=0 directly via getTokenUsageStats(scope='global').
+    getAllUsers: db.prepare<[], UserRow>('SELECT * FROM users WHERE user_id != 0'),
 
     // Routines (is_deleted=0 filter on reads, soft delete on remove)
     getRoutinesByUser: db.prepare<[number], RoutineRow>('SELECT * FROM routines WHERE user_id = ? AND is_deleted = 0'),

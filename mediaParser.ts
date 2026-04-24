@@ -438,7 +438,9 @@ export class MediaParser {
                 refreshStickerCacheFileId(cacheKey, sticker.file_id);
             }
             // User-send is a usage signal — boosts ranking in the system-prompt vocabulary.
-            bumpStickerUsedCount(cacheKey);
+            // Wrap in try so a transient DB lock doesn't crash the parse path.
+            try { bumpStickerUsedCount(cacheKey); }
+            catch (err) { console.warn('[mediaParser] bumpStickerUsedCount failed:', err instanceof Error ? err.message : err); }
             return {
                 type: 'sticker',
                 content: cached.description,
@@ -520,7 +522,8 @@ export class MediaParser {
     async parseCustomEmoji(customEmojiId: string, fallbackChar: string | undefined, userId: number): Promise<ParsedMedia> {
         const cached = getStickerCacheEntry(customEmojiId);
         if (cached) {
-            bumpStickerUsedCount(customEmojiId);
+            try { bumpStickerUsedCount(customEmojiId); }
+            catch (err) { console.warn('[mediaParser] bumpStickerUsedCount failed:', err instanceof Error ? err.message : err); }
             let fileId = cached.fileId;
             // Lazy re-fetch: if file_id was previously nulled (Telegram rejected an old id during
             // SendStickerToUser), try once to recover via the free Bot API call. Cheap, no Vision cost.
