@@ -22,7 +22,13 @@ export class OpenAIProvider implements AIProvider {
     }
 
     async *streamChat(request: StreamRequest): AsyncIterable<StreamChunk> {
-        const messages = this.convertMessages(request.systemPrompt, request.messages);
+        // OpenAI compat layer doesn't expose Anthropic's cache_control directly,
+        // so just concatenate prefix + main into a single system string. We lose
+        // the caching benefit on this path; native Anthropic provider keeps it.
+        const fullSystem = request.systemPromptCachePrefix
+            ? `${request.systemPromptCachePrefix}\n\n${request.systemPrompt}`
+            : request.systemPrompt;
+        const messages = this.convertMessages(fullSystem, request.messages);
         const tools = request.tools?.map(t => this.convertTool(t));
 
         const requestOptions: Record<string, unknown> = {
@@ -56,6 +62,10 @@ export class OpenAIProvider implements AIProvider {
         );
 
         let pendingDone = false;
+        // try/finally so when the consumer (aiService) breaks the for-await early —
+        // via throw, return, or generator.throw — we abort the underlying HTTP socket
+        // instead of letting the SDK keep it open until the server hangs up.
+        try {
         for await (const chunk of stream) {
             // With include_usage:true the LAST chunk has empty choices[] and a populated usage field.
             // Some providers also send usage on a chunk that still has finish_reason — handle both.
@@ -104,6 +114,13 @@ export class OpenAIProvider implements AIProvider {
             }
         }
         if (pendingDone) yield { type: 'done' };
+        } finally {
+            // OpenAI's Stream exposes `controller` (AbortController). Aborting on
+            // exit closes the socket. Safe to call after a clean finish — the SDK
+            // ignores aborts on already-completed streams.
+            const abort = (stream as { controller?: AbortController }).controller;
+            try { abort?.abort(); } catch { /* ignore */ }
+        }
     }
 
     async completeChat(request: CompletionRequest): Promise<string> {

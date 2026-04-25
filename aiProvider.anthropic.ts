@@ -31,10 +31,23 @@ export class AnthropicProvider implements AIProvider {
         if (budget && maxTokens <= budget) {
             maxTokens = budget + 4000;
         }
+        // Build the system param. When `systemPromptCachePrefix` is provided we
+        // emit it as a separate text block with cache_control={type:'ephemeral'}
+        // so Anthropic prompt-caching applies to the static scaffolding. The
+        // dynamic suffix (per-turn memory dump etc.) follows in a second block
+        // without cache_control. When no prefix is set, fall back to the legacy
+        // single-string form so older callers keep working.
+        const systemParam: Anthropic.MessageCreateParams['system'] = request.systemPromptCachePrefix
+            ? [
+                { type: 'text', text: request.systemPromptCachePrefix, cache_control: { type: 'ephemeral' } },
+                ...(request.systemPrompt ? [{ type: 'text' as const, text: request.systemPrompt }] : []),
+            ]
+            : request.systemPrompt;
+
         const params: Anthropic.MessageCreateParams = {
             model: request.model,
             max_tokens: maxTokens,
-            system: request.systemPrompt,
+            system: systemParam,
             messages,
             ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
             stream: true as const,
@@ -58,6 +71,10 @@ export class AnthropicProvider implements AIProvider {
         let cacheCreationTokens = 0;
         let cacheReadTokens = 0;
 
+        // try/finally so when the consumer (aiService) breaks the for-await early — via
+        // throw, return, or generator.throw — we abort the underlying HTTP socket
+        // instead of letting the SDK keep it open until the server hangs up.
+        try {
         for await (const event of stream as AsyncIterable<Anthropic.MessageStreamEvent>) {
             switch (event.type) {
                 case 'content_block_start': {
@@ -145,6 +162,13 @@ export class AnthropicProvider implements AIProvider {
 
                 // message_stop — no action needed
             }
+        }
+        } finally {
+            // Anthropic's Stream exposes `controller` (AbortController). Aborting on
+            // exit closes the socket. Safe to call after a clean finish — the SDK
+            // ignores aborts on already-completed streams.
+            const abort = (stream as { controller?: AbortController }).controller;
+            try { abort?.abort(); } catch { /* ignore */ }
         }
     }
 

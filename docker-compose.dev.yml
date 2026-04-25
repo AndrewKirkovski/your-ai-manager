@@ -10,8 +10,10 @@ services:
       DB_PORT: 5432
       TELEGRAM_ENABLED: "false"
       SERVER_PORT: 8080
-      MONITORING_WEBHOOK_URL: "http://host.docker.internal:3000/api/luxmed/monitoring-callback"
-      SECURITY_SECRET: "dev-secret-change-in-prod"
+      # Webhook URL must include ?secret=… because the bot's webhook handler
+      # is fail-closed on the LUXMED_WEBHOOK_SECRET env. Same shape as prod.
+      MONITORING_WEBHOOK_URL: "http://host.docker.internal:3000/api/luxmed/monitoring-callback?secret=${LUXMED_WEBHOOK_SECRET:?set LUXMED_WEBHOOK_SECRET in .env}"
+      SECURITY_SECRET: "${LUXMED_SECURITY_SECRET:?set LUXMED_SECURITY_SECRET in .env}"
     ports:
       - "8080:8080"
     depends_on:

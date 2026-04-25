@@ -59,7 +59,7 @@ export const GetMemory: Tool = {
 
 export const ListMemory: Tool = {
     name: 'ListMemory',
-    description: 'List all stored user preferences and information.',
+    description: 'List ALL stored user preferences and information. The system prompt only shows the 50 most-recently-updated entries — call this when you need to see older facts (anything not in the "Memory" block of your context). Returns every key/value the user has stored.',
     parameters: {
         type: 'object',
         properties: {}

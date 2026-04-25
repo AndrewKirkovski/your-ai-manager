@@ -823,8 +823,17 @@ export function getAllSendableStickers(): StickerCacheEntry[] {
 
 // ============== STAT TRACKING ==============
 
+// Stat names are AI-emitted free text. Without normalization the same metric
+// silently splits across rows: "sleep hours", "Sleep Hours", " sleep_hours " all
+// looked distinct before. Normalize at every read+write boundary so writes and
+// reads agree on the canonical key. Display names (chart titles etc.) keep
+// original casing — they're not used as lookup keys.
+export function normalizeStatName(name: string): string {
+    return name.trim().toLowerCase().replace(/\s+/g, '_');
+}
+
 export async function addStatEntry(userId: number, name: string, value: number, unit?: string, note?: string, timestamp?: Date): Promise<number> {
-    const result = stmts.insertStat.run(userId, name.toLowerCase(), value, unit ?? null, note ?? null, (timestamp ?? new Date()).toISOString());
+    const result = stmts.insertStat.run(userId, normalizeStatName(name), value, unit ?? null, note ?? null, (timestamp ?? new Date()).toISOString());
     return Number(result.lastInsertRowid);
 }
 
@@ -840,7 +849,7 @@ export async function addStatEntriesBatch(
             const ts = (e.timestamp ?? new Date()).toISOString();
             const result = stmts.insertStat.run(
                 userId,
-                e.name.toLowerCase(),
+                normalizeStatName(e.name),
                 e.value,
                 e.unit ?? null,
                 e.note ?? null,
@@ -873,7 +882,7 @@ export async function updateStatEntry(
 ): Promise<boolean> {
     const sets: string[] = [];
     const params: unknown[] = [];
-    if (patch.name !== undefined) { sets.push('name = ?'); params.push(patch.name.toLowerCase()); }
+    if (patch.name !== undefined) { sets.push('name = ?'); params.push(normalizeStatName(patch.name)); }
     if (patch.value !== undefined) { sets.push('value = ?'); params.push(patch.value); }
     if (patch.unit !== undefined) { sets.push('unit = ?'); params.push(patch.unit); }
     if (patch.note !== undefined) { sets.push('note = ?'); params.push(patch.note); }
@@ -897,14 +906,14 @@ export async function deleteStatEntriesByIds(userId: number, ids: number[]): Pro
 }
 
 export async function deleteStatEntriesRange(userId: number, name: string, from: Date, to: Date): Promise<number> {
-    const result = stmts.deleteStatRange.run(userId, name.toLowerCase(), from.toISOString(), to.toISOString());
+    const result = stmts.deleteStatRange.run(userId, normalizeStatName(name), from.toISOString(), to.toISOString());
     return result.changes;
 }
 
 export async function getStatEntries(userId: number, name: string, from?: Date, to?: Date): Promise<Array<{ id: number; name: string; value: number; unit?: string; note?: string; timestamp: Date }>> {
     const fromStr = (from ?? new Date('2000-01-01')).toISOString();
     const toStr = (to ?? new Date('2100-01-01')).toISOString();
-    const rows = stmts.getStatEntries.all(userId, name.toLowerCase(), fromStr, toStr);
+    const rows = stmts.getStatEntries.all(userId, normalizeStatName(name), fromStr, toStr);
     return rows.map(row => ({
         id: row.id,
         name: row.name,
@@ -924,7 +933,7 @@ export async function getTrackedStatNames(userId: number): Promise<Array<{ name:
 }
 
 export async function getLatestStat(userId: number, name: string): Promise<{ value: number; unit?: string; timestamp: Date } | undefined> {
-    const row = stmts.getLatestStat.get(userId, name.toLowerCase());
+    const row = stmts.getLatestStat.get(userId, normalizeStatName(name));
     if (!row) return undefined;
     return {
         value: row.value,
@@ -934,7 +943,7 @@ export async function getLatestStat(userId: number, name: string): Promise<{ val
 }
 
 export async function getStatCount(userId: number, name: string): Promise<number> {
-    const row = stmts.countStatEntries.get(userId, name.toLowerCase());
+    const row = stmts.countStatEntries.get(userId, normalizeStatName(name));
     return row?.count ?? 0;
 }
 

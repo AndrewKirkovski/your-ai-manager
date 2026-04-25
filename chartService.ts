@@ -100,6 +100,8 @@ export async function generateChartUrl(config: ChartConfig): Promise<string> {
         },
     };
 
+    // 15s budget — QuickChart usually responds in under 2s; cap so a wedged endpoint
+    // doesn't stall the AI tool call (and therefore the user's whole turn).
     const response = await fetch('https://quickchart.io/chart/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -111,6 +113,7 @@ export async function generateChartUrl(config: ChartConfig): Promise<string> {
             backgroundColor: 'white',
             format: 'png',
         }),
+        signal: AbortSignal.timeout(15000),
     });
 
     if (!response.ok) {

@@ -2,8 +2,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Start web server
-import './webServer';
+import { startWebServer } from './webServer';
 
 import TelegramBot from 'node-telegram-bot-api';
 import OpenAI from 'openai';
@@ -50,6 +49,12 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN!;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
 const OPEN_AI_ENDPOINT = process.env.OPEN_AI_ENDPOINT;
 const OPEN_AI_MODEL = process.env.OPENAI_MODEL || 'gpt-4-1106-preview';
+
+// Single timezone for the whole bot (cron, stat windows, log timestamps, …).
+// Per-user TZ is not planned — pin everything via env, default Warsaw. Also set
+// process.env.TZ on the bot container in docker-compose.yml so Node's Date and
+// luxon's local zone agree with this value.
+const BOT_TZ = process.env.TZ || 'Europe/Warsaw';
 
 // Owner-allowlist so random Telegram users can't DM the bot and consume the
 // owner's API quota. Comma-separated list of Telegram numeric user IDs.
@@ -150,6 +155,9 @@ const STICKER_LOOKUP_MODEL = process.env.STICKER_LOOKUP_MODEL || 'claude-haiku-4
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: true});
 initLuxmedMonitor(bot);
+// Start the admin/webhook server after the bot exists so the LuxMed webhook
+// can deliver notifications via bot.sendMessage.
+startWebServer(bot);
 
 // AI provider (switchable via AI_PROVIDER env var)
 const provider: AIProvider = AI_PROVIDER_TYPE === 'anthropic'
@@ -274,15 +282,14 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
         if (!user) return 'Ошибка: пользователь не найден';
 
         const memory = await getCurrentInfo(userId);
-        const fullPrompt = ` 
-            ${getSystemPrompt()}
-            
-            ${memory}`;
-
+        // Split static prefix (cacheable) from per-turn dynamic memory so Anthropic
+        // prompt-caching reuses the long scaffolding across turns. The provider
+        // handles concatenation for the OpenAI-compat path internally.
         const result = await AIService.streamAIResponse({
             userId,
             userMessage,
-            systemPrompt: fullPrompt,
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: memory,
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -350,6 +357,7 @@ cron.schedule('* * * * *', async () => {
     }
     routineTickRunning = true;
     try {
+
     const now = getCurrentTime();
     const users = await getAllUsers();
 
@@ -370,8 +378,10 @@ cron.schedule('* * * * *', async () => {
             if (!routine.isActive) continue;
 
             try {
-                // Check if routine should fire based on cron
-                const cronInterval = CronExpressionParser.parse(routine.cron);
+                // Check if routine should fire based on cron. Pin parser to BOT_TZ
+                // so e.g. "0 9 * * *" fires at 09:00 BOT_TZ regardless of host TZ
+                // and survives DST transitions.
+                const cronInterval = CronExpressionParser.parse(routine.cron, { tz: BOT_TZ });
                 cronInterval.next(); // advance iterator so .prev() returns the last fire time
                 const lastFireTime = cronInterval.prev().toDate();
 
@@ -437,7 +447,12 @@ cron.schedule('* * * * *', async () => {
                     // Serialize with the live bot.on('message') path via enqueuePerUser —
                     // otherwise a user typing at the same minute a routine fires produces
                     // two concurrent streams that interleave addMessageToHistory writes.
-                    await enqueuePerUser(user.userId, async () => {
+                    // Fire-and-forget: the queue itself enforces per-user serialization,
+                    // so this tick can return immediately and other users' tasks can run
+                    // in parallel. Awaiting here would block the whole tick on one user's
+                    // AI roundtrip and cause routineTickRunning to skip the next minute
+                    // for everyone.
+                    void enqueuePerUser(user.userId, async () => {
                         const memory = await getCurrentInfo(user.userId);
 
                         const taskPrompt = task.requiresAction
@@ -447,7 +462,8 @@ cron.schedule('* * * * *', async () => {
                         const result = await AIService.streamAIResponse({
                             userId: user.userId,
                             userMessage: taskPrompt,
-                            systemPrompt: getSystemPrompt(),
+                            systemPromptCachePrefix: getSystemPrompt(),
+                            systemPrompt: '', // memory is already inlined into taskPrompt
                             bot,
                             provider,
                             model: OPEN_AI_MODEL,
@@ -486,7 +502,7 @@ cron.schedule('* * * * *', async () => {
     } finally {
         routineTickRunning = false;
     }
-});
+}, { timezone: BOT_TZ });
 
 // Compact history once per hour
 cron.schedule('0 * * * *', async () => {
@@ -495,16 +511,16 @@ cron.schedule('0 * * * *', async () => {
     } catch (error) {
         console.error('🗜️ History compaction cron error:', error instanceof Error ? error.message : error);
     }
-});
+}, { timezone: BOT_TZ });
 
-// Daily user communication-style + ADHD-reaction scan at 04:00 Warsaw time
+// Daily user communication-style + ADHD-reaction scan at 04:00 (BOT_TZ)
 cron.schedule('0 4 * * *', async () => {
     try {
         await runStyleScan(provider, OPEN_AI_MODEL);
     } catch (error) {
         console.error('🎭 Style scan cron error:', error instanceof Error ? error.message : error);
     }
-}, { timezone: 'Europe/Warsaw' });
+}, { timezone: BOT_TZ });
 
 // LuxMed monitoring — check every 10 minutes
 cron.schedule('*/10 * * * *', async () => {
@@ -513,7 +529,7 @@ cron.schedule('*/10 * * * *', async () => {
     } catch (error) {
         console.error('[LuxMed Monitor] Cron error:', error instanceof Error ? error.message : error);
     }
-});
+}, { timezone: BOT_TZ });
 
 // Handle commands
 bot.onText(/\/goal(.*)/, serialTextHandler(async (msg, match) => {
@@ -561,7 +577,8 @@ bot.onText(/\/goal(.*)/, serialTextHandler(async (msg, match) => {
         const result = await AIService.streamAIResponse({
             userId,
             userMessage: GOAL_SET_PROMPT(newGoal),
-            systemPrompt: getSystemPrompt(),
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -576,7 +593,8 @@ bot.onText(/\/goal(.*)/, serialTextHandler(async (msg, match) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: getSystemPrompt(),
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -619,7 +637,8 @@ bot.onText(/\/cleargoal/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId,
             userMessage: GOAL_CLEAR_PROMPT(),
-            systemPrompt: getSystemPrompt(),
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -635,7 +654,8 @@ bot.onText(/\/cleargoal/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: getSystemPrompt(),
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -681,7 +701,8 @@ bot.onText(/\/routines/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: getSystemPrompt(),
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -722,7 +743,8 @@ bot.onText(/\/tasks/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: getSystemPrompt(),
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -767,7 +789,8 @@ bot.onText(/\/memory/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: getSystemPrompt(),
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -847,7 +870,8 @@ bot.onText(/\/help/, serialTextHandler(async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: DEFAULT_HELP_PROMPT(),
-            systemPrompt: getSystemPrompt(),
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
             bot,
             provider,
             model: OPEN_AI_MODEL,
@@ -988,7 +1012,8 @@ bot.on('message', async (msg) => {
             const result = await AIService.streamAIResponse({
                 userId,
                 userMessage: GREETING_PROMPT,
-                systemPrompt: getSystemPrompt(),
+                systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
                 bot,
                 provider,
                 model: OPEN_AI_MODEL,
@@ -1024,7 +1049,8 @@ bot.on('message', async (msg) => {
         const result = await AIService.streamAIResponse({
             userId: msg.from?.id || 0,
             userMessage: ERROR_MESSAGE_PROMPT,
-            systemPrompt: getSystemPrompt(),
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
             bot,
             provider,
             model: OPEN_AI_MODEL,

@@ -41,6 +41,15 @@ export interface ToolDefinition {
 
 export interface StreamRequest {
     systemPrompt: string;
+    /**
+     * Optional static prefix for the system prompt. When set, providers that
+     * support caching (Anthropic native) place this BEFORE `systemPrompt` and
+     * mark it as a cache breakpoint. Use it for the long, never-changing system
+     * scaffolding (CHARACTER + RULES + sticker catalog), and put per-turn
+     * dynamic content (memory dump, current tasks) into `systemPrompt`.
+     * Providers without caching (OpenAI compat) just concatenate the two.
+     */
+    systemPromptCachePrefix?: string;
     messages: ProviderMessage[];
     tools?: ToolDefinition[];
     maxTokens: number;

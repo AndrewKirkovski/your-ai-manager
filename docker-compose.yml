@@ -7,6 +7,10 @@ services:
       - .env
     environment:
       LUXMED_SIDECAR_URL: "http://luxmed-sidecar:8080"
+      # Pin Node's process timezone so cron, luxon, log timestamps, and routine
+      # parsing all agree on a single wall clock. Override in .env if needed —
+      # per-user TZ is not planned. Defaults to Europe/Warsaw.
+      TZ: "${TZ:-Europe/Warsaw}"
     ports:
       - "3000:3000"
     volumes:

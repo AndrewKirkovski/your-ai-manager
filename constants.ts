@@ -339,6 +339,15 @@ Date range of these messages: ${dateRange}
 Messages to summarize:
 ${messages}
 
+NOTE ON COMBINED RUNS:
+- The first message in this block MAY already be a previously-compacted summary (you'll
+  recognise it by the leading "<system>Compacted summary of N bot messages from …</system>"
+  marker followed by prose).
+- When that's the case, treat that prior summary as authoritative for everything before it
+  and merge in the new messages cleanly. The output should be ONE coherent summary covering
+  the full span, not "old summary + new bullet points".
+- Preserve "reminded about X N times" counters by adding the new occurrences to the prior count.
+
 INSTRUCTIONS:
 - Produce a single concise summary in the SAME LANGUAGE as the original messages
 - Preserve key facts: task names, decisions made, tool actions taken, important information shared
@@ -346,6 +355,7 @@ INSTRUCTIONS:
 - Keep tool call results if they contain important data
 - Maximum 300 words
 - Do NOT add any preamble like "Here is a summary" - just write the summary directly
+- Do NOT include the "<system>Compacted summary…</system>" marker yourself — the wrapper is added externally.
 `;
 
 export const DEFAULT_HELP_PROMPT = () => `

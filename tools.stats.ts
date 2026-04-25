@@ -23,7 +23,19 @@ export function initStatTools(bot: TelegramBot): void {
     botInstance = bot;
 }
 
-const TZ = 'Europe/Warsaw';
+const TZ = process.env.TZ || 'Europe/Warsaw';
+
+/**
+ * Parse a user-supplied ISO timestamp (from the AI) as BOT_TZ wall-clock when
+ * no offset is given. `new Date("2026-04-25T09:00")` parses bare ISO as host-local
+ * — in a UTC container that means the AI's "9 AM Warsaw breakfast" gets stored
+ * at 09:00Z (= 11:00 Warsaw). Use luxon to anchor parsing to BOT_TZ.
+ */
+function parseUserTimestamp(input: string): Date {
+    const dt = DateTime.fromISO(input, { zone: TZ });
+    if (!dt.isValid) throw new Error(`Invalid timestamp: ${input} (${dt.invalidReason ?? 'unknown'})`);
+    return dt.toJSDate();
+}
 
 function getPeriodRange(period: string, customFrom?: string, customTo?: string): { from: Date; to: Date } {
     const now = DateTime.now().setZone(TZ);
@@ -127,7 +139,7 @@ export const TrackStat: Tool = {
                 value: e.value,
                 unit: textify(e.unit),
                 note: textify(e.note),
-                timestamp: e.timestamp ? new Date(e.timestamp) : undefined,
+                timestamp: e.timestamp ? parseUserTimestamp(e.timestamp) : undefined,
             }));
             const inserted = await addStatEntriesBatch(args.userId, normalized);
             return {
@@ -152,7 +164,7 @@ export const TrackStat: Tool = {
         const name = textify(args.name);
         const unit = textify(args.unit);
         const note = textify(args.note);
-        const ts = args.timestamp ? new Date(args.timestamp) : undefined;
+        const ts = args.timestamp ? parseUserTimestamp(args.timestamp) : undefined;
         const id = await addStatEntry(args.userId, name, args.value, unit, note, ts);
 
         return {
@@ -309,7 +321,7 @@ async function applyStatPatch(userId: number, id: number, patch: UpdateStatPatch
         value: patch.value,
         unit,
         note,
-        timestamp: patch.timestamp ? new Date(patch.timestamp) : undefined,
+        timestamp: patch.timestamp ? parseUserTimestamp(patch.timestamp) : undefined,
     });
 }
 

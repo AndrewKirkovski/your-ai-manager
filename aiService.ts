@@ -9,6 +9,12 @@ export interface AIStreamOptions {
     userId: number;
     userMessage: string;
     systemPrompt: string;
+    /**
+     * Optional cacheable system-prompt prefix (passed through to provider).
+     * Use for the static scaffolding so it qualifies for prompt-cache hits
+     * across turns; put per-turn dynamic context in `systemPrompt`.
+     */
+    systemPromptCachePrefix?: string;
     bot: TelegramBot;
     provider: AIProvider;
     model: string;
@@ -67,6 +73,7 @@ export class AIService {
             userId,
             userMessage,
             systemPrompt,
+            systemPromptCachePrefix,
             bot,
             provider,
             model,
@@ -177,6 +184,7 @@ export class AIService {
             // Stream from provider
             const stream = provider.streamChat({
                 systemPrompt,
+                systemPromptCachePrefix,
                 messages,
                 tools: toolDefs,
                 maxTokens,
@@ -258,8 +266,11 @@ export class AIService {
 
             // Record AI token usage. recordAITokens double-writes: per-user AND user_id=0 (global).
             // userId is the actual user the AI is replying to or working on behalf of.
+            // Catch is required: SQLite write contention can reject and we don't want
+            // an unhandled rejection killing the process.
             const purpose = options.purpose ?? 'reply';
-            void recordAITokens(userId, usageInputTokens, usageOutputTokens, purpose);
+            recordAITokens(userId, usageInputTokens, usageOutputTokens, purpose)
+                .catch(err => console.warn('[token-stat] recordAITokens failed:', err instanceof Error ? err.message : err));
 
             // Detect inline custom-emoji + sticker references the AI emitted in its reply.
             // Each unique cache_key bumped once per response (not once per occurrence in text).

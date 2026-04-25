@@ -1,11 +1,17 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import type TelegramBot from 'node-telegram-bot-api';
 import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount, getTokenUsageStats, type TokenUsageScope } from './userStore';
-import { textify, stripSystemTags } from './telegramFormat';
+import { textify, stripSystemTags, safeSend } from './telegramFormat';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Bot instance — set via startWebServer(bot). webServer used to be a side-effect
+// import; now it's a function call so the LuxMed webhook can actually deliver
+// notifications via bot.sendMessage instead of just logging them.
+let botInstance: TelegramBot | null = null;
 
 const app = express();
 app.use(express.json());
@@ -218,7 +224,7 @@ app.patch('/api/users/:id/messages/:messageId', async (req: Request, res: Respon
 // only Content-Type and can't add custom headers — embed the secret in
 // MONITORING_WEBHOOK_URL instead). If LUXMED_WEBHOOK_SECRET is unset, all
 // requests are rejected (fail-closed).
-app.post('/api/luxmed/monitoring-callback', (req: Request, res: Response) => {
+app.post('/api/luxmed/monitoring-callback', async (req: Request, res: Response) => {
     try {
         if (!LUXMED_WEBHOOK_SECRET) {
             return res.status(503).json({ error: 'Webhook disabled: LUXMED_WEBHOOK_SECRET not configured' });
@@ -234,8 +240,21 @@ app.post('/api/luxmed/monitoring-callback', (req: Request, res: Response) => {
             return;
         }
         console.log(`[LuxMed webhook] chatId=${chatId}: ${message.slice(0, 100)}`);
-        // TODO: Forward message to Telegram user via bot.sendMessage(chatId, message)
-        // This requires access to the bot instance — will be wired in Phase 5
+
+        // Deliver to Telegram. The sidecar's chatId is a string but bot.sendMessage
+        // accepts string|number — Telegram chat IDs are numeric, so coerce.
+        // We DON'T propagate the send failure back to the sidecar (still 200) —
+        // a transient Telegram outage shouldn't make the sidecar retry forever.
+        if (!botInstance) {
+            console.warn('[LuxMed webhook] received notification but bot instance not initialized; dropping');
+        } else {
+            const numericChatId = /^-?\d+$/.test(chatId) ? Number(chatId) : chatId;
+            try {
+                await safeSend(botInstance, numericChatId, message);
+            } catch (sendErr) {
+                console.error('[LuxMed webhook] safeSend failed:', sendErr instanceof Error ? sendErr.message : sendErr);
+            }
+        }
         res.json({ success: true });
     } catch (error) {
         console.error('LuxMed webhook error:', error);
@@ -244,9 +263,18 @@ app.post('/api/luxmed/monitoring-callback', (req: Request, res: Response) => {
 });
 
 const PORT = process.env.WEB_PORT || 3000;
-// Bind 0.0.0.0 so Docker port publish works + the LuxMed sidecar webhook path
-// is reachable via `http://bot:3000/...`. Protection comes from the auth gate
-// above — not from the bind address.
-app.listen(Number(PORT), '0.0.0.0', () => {
-    console.log(`🌐 Web UI available at http://localhost:${PORT}`);
-});
+
+/**
+ * Start the admin/webhook web server. Pass the running bot so the LuxMed
+ * monitoring webhook can deliver notifications via bot.sendMessage. Call this
+ * once from index.ts after the TelegramBot instance is constructed.
+ */
+export function startWebServer(bot: TelegramBot): void {
+    botInstance = bot;
+    // Bind 0.0.0.0 so Docker port publish works + the LuxMed sidecar webhook path
+    // is reachable via `http://bot:3000/...`. Protection comes from the auth gate
+    // above — not from the bind address.
+    app.listen(Number(PORT), '0.0.0.0', () => {
+        console.log(`🌐 Web UI available at http://localhost:${PORT}`);
+    });
+}
