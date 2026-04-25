@@ -413,14 +413,18 @@ export async function getAllUsers(): Promise<UserData[]> {
 
 const MAX_MESSAGES = 5000;
 
-export async function addMessageToHistory(userId: number, role: 'user' | 'assistant', content: string): Promise<void> {
-    stmts.insertMessage.run(userId, role, content, new Date().toISOString());
-
-    // Cap enforcement
+const addMessageTxn = db.transaction((userId: number, role: 'user' | 'assistant', content: string, ts: string) => {
+    stmts.insertMessage.run(userId, role, content, ts);
     const { count } = stmts.countMessages.get(userId)!;
     if (count > MAX_MESSAGES) {
         stmts.deleteOldMessages.run(userId, userId, MAX_MESSAGES);
     }
+});
+
+export async function addMessageToHistory(userId: number, role: 'user' | 'assistant', content: string): Promise<void> {
+    // Atomic insert + count + prune so concurrent cron/message calls can't
+    // observe a stale count between insert and delete.
+    addMessageTxn(userId, role, content, new Date().toISOString());
 }
 
 export async function getUserMessageHistory(userId: number): Promise<MessageHistory[]> {

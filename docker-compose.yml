@@ -25,7 +25,9 @@ services:
       DB_PORT: 5432
       TELEGRAM_ENABLED: "false"
       SERVER_PORT: 8080
-      SECURITY_SECRET: "${LUXMED_SECURITY_SECRET:-luxmed-prod-secret-change-me}"
+      # Fail-closed: compose refuses to start if LUXMED_SECURITY_SECRET is unset
+      # (the `:?` expansion aborts with the message).
+      SECURITY_SECRET: "${LUXMED_SECURITY_SECRET:?set LUXMED_SECURITY_SECRET in .env — no default allowed}"
       MONITORING_WEBHOOK_URL: "http://bot:3000/api/luxmed/monitoring-callback"
     depends_on:
       - luxmed-db

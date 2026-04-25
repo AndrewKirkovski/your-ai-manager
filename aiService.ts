@@ -203,52 +203,57 @@ export class AIService {
                 }
             }, 500);
 
-            // Process streaming response
-            for await (const chunk of stream) {
-                switch (chunk.type) {
-                    case 'text':
-                        aiResponseAccumulated += chunk.content;
-                        break;
+            // try/finally guarantees clearInterval on stream throw — without it
+            // a mid-stream provider error (429, reset) leaks the 500ms timer for
+            // the life of the process, each tick firing another safeEdit call.
+            try {
+                for await (const chunk of stream) {
+                    switch (chunk.type) {
+                        case 'text':
+                            aiResponseAccumulated += chunk.content;
+                            break;
 
-                    case 'tool_call_start': {
-                        if (!toolCalls[chunk.index]) {
-                            toolCalls[chunk.index] = {
-                                id: chunk.id,
-                                name: chunk.name,
-                                arguments: '',
-                            };
-                        } else {
-                            // Append name if streamed in parts
-                            toolCalls[chunk.index].name += chunk.name;
+                        case 'tool_call_start': {
+                            if (!toolCalls[chunk.index]) {
+                                toolCalls[chunk.index] = {
+                                    id: chunk.id,
+                                    name: chunk.name,
+                                    arguments: '',
+                                };
+                            } else {
+                                // Append name if streamed in parts
+                                toolCalls[chunk.index].name += chunk.name;
+                            }
+                            break;
                         }
-                        break;
-                    }
 
-                    case 'tool_call_args': {
-                        if (toolCalls[chunk.index]) {
-                            toolCalls[chunk.index].arguments += chunk.args;
+                        case 'tool_call_args': {
+                            if (toolCalls[chunk.index]) {
+                                toolCalls[chunk.index].arguments += chunk.args;
+                            }
+                            break;
                         }
-                        break;
+
+                        case 'thinking':
+                            console.debug(`💭 [thinking] ${chunk.content.substring(0, 200)}`);
+                            break;
+
+                        case 'thinking_blocks':
+                            // Captured thinking blocks (with signatures) for multi-turn continuity
+                            thinkingBlocks = chunk.blocks;
+                            break;
+
+                        case 'usage':
+                            usageInputTokens = chunk.input_tokens;
+                            usageOutputTokens = chunk.output_tokens;
+                            break;
+
+                        case 'done':
+                            break;
                     }
-
-                    case 'thinking':
-                        console.debug(`💭 [thinking] ${chunk.content.substring(0, 200)}`);
-                        break;
-
-                    case 'thinking_blocks':
-                        // Captured thinking blocks (with signatures) for multi-turn continuity
-                        thinkingBlocks = chunk.blocks;
-                        break;
-
-                    case 'usage':
-                        usageInputTokens = chunk.input_tokens;
-                        usageOutputTokens = chunk.output_tokens;
-                        break;
-
-                    case 'done':
-                        clearInterval(updateInterval_id);
-                        break;
                 }
+            } finally {
+                clearInterval(updateInterval_id);
             }
 
             // Record AI token usage. recordAITokens double-writes: per-user AND user_id=0 (global).
@@ -268,9 +273,6 @@ export class AIService {
             } catch (err) {
                 console.warn('[used_count] inline tag scan failed:', err instanceof Error ? err.message : err);
             }
-
-            // Ensure interval is cleared even if 'done' wasn't received
-            clearInterval(updateInterval_id);
 
             console.log('🤖 AI RAW:', {
                 userId,

@@ -69,7 +69,10 @@ console.log(`📊 Found ${users.length} user(s) to migrate`);
 const insertUser = db.prepare(`INSERT INTO users (user_id, chat_id, goal, timezone) VALUES (?, ?, ?, ?)`);
 const insertRoutine = db.prepare(`INSERT INTO routines (id, user_id, name, cron, default_annoyance, requires_action, is_active, stats_completed, stats_failed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
 const insertTask = db.prepare(`INSERT INTO tasks (id, user_id, name, routine_id, due_at, requires_action, status, annoyance, ping_at, postpone_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-const insertMemory = db.prepare(`INSERT INTO memory (user_id, key, value) VALUES (?, ?, ?)`);
+// Schema declares first_recorded_at / updated_at NOT NULL DEFAULT ''.
+// Omitting them produces empty strings that downstream `new Date('')` → Invalid
+// Date, breaking ageLabel() in formatMemoryBlock. Always set both explicitly.
+const insertMemory = db.prepare(`INSERT INTO memory (user_id, key, value, first_recorded_at, updated_at) VALUES (?, ?, ?, ?, ?)`);
 const insertMessage = db.prepare(`INSERT INTO message_history (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)`);
 
 // Run migration in a single transaction
@@ -119,9 +122,11 @@ const migrate = db.transaction(() => {
         }
 
         // Insert memory — lowercase keys to match runtime normalization in
-        // userStore.updateUserMemory / getUserMemory.
+        // userStore.updateUserMemory / getUserMemory. JSON source has no
+        // per-entry timestamps, so seed both fields with migration-time now.
+        const memoryNow = new Date().toISOString();
         for (const [key, value] of Object.entries(user.memory ?? {})) {
-            insertMemory.run(user.userId, key.toLowerCase(), String(value));
+            insertMemory.run(user.userId, key.toLowerCase(), String(value), memoryNow, memoryNow);
             totalMemory++;
         }
 

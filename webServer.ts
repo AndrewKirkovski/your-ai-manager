@@ -13,14 +13,17 @@ app.use(express.json());
 // Auth gate. Set WEB_AUTH_TOKEN in env — clients must send `Authorization: Bearer <token>`
 // or include `?token=<token>` in the query. Without WEB_AUTH_TOKEN set, requests from
 // non-loopback IPs are rejected (keeps local dev easy while blocking LAN access on Docker).
-// The LuxMed webhook `/api/luxmed/monitoring-callback` is exempt (own shared-secret path
-// TBD; for now it's unauthenticated since it's Docker-network-only via service DNS).
+// The LuxMed webhook has its own shared-secret check inside the handler (X-Luxmed-Secret).
 const AUTH_TOKEN = process.env.WEB_AUTH_TOKEN || '';
+const LUXMED_WEBHOOK_SECRET = process.env.LUXMED_WEBHOOK_SECRET || '';
 if (!AUTH_TOKEN) {
     console.warn('⚠️  WEB_AUTH_TOKEN not set — /api/* is loopback-only. LAN access will be rejected.');
 }
+if (!LUXMED_WEBHOOK_SECRET) {
+    console.warn('⚠️  LUXMED_WEBHOOK_SECRET not set — LuxMed webhook will reject all requests.');
+}
 app.use((req, res, next) => {
-    // Static files and the LuxMed webhook bypass auth.
+    // Static files bypass auth; the LuxMed webhook does its own shared-secret check.
     if (!req.path.startsWith('/api/') || req.path === '/api/luxmed/monitoring-callback') {
         return next();
     }
@@ -132,14 +135,37 @@ app.patch('/api/users/:id/tasks/:taskId', async (req: Request, res: Response) =>
         const taskId = param(req, 'taskId');
         const updates = req.body;
 
+        // Validate dates up front so an invalid admin input doesn't persist as
+        // "Invalid Date" and break the routine tick comparison (`Invalid Date <=
+        // now` is always false — ping would never fire).
+        let pingAt: Date | undefined;
+        let dueAt: Date | null | undefined;
+        if (updates.pingAt !== undefined) {
+            pingAt = new Date(updates.pingAt);
+            if (Number.isNaN(pingAt.getTime())) {
+                return res.status(400).json({ error: 'Invalid pingAt (expected ISO 8601)' });
+            }
+        }
+        if (updates.dueAt !== undefined) {
+            if (updates.dueAt === null || updates.dueAt === '') {
+                dueAt = null;
+            } else {
+                const d = new Date(updates.dueAt);
+                if (Number.isNaN(d.getTime())) {
+                    return res.status(400).json({ error: 'Invalid dueAt (expected ISO 8601)' });
+                }
+                dueAt = d;
+            }
+        }
+
         await updateUserTask(userId, taskId, (task) => {
             // Symmetric with tool-call path (tools.tasks.ts:UpdateTask) — admin edits
             // must textify user-controlled name to match what the AI would write.
             if (updates.name !== undefined) task.name = textify(updates.name);
             if (updates.status !== undefined) task.status = updates.status;
             if (updates.annoyance !== undefined) task.annoyance = updates.annoyance;
-            if (updates.pingAt !== undefined) task.pingAt = new Date(updates.pingAt);
-            if (updates.dueAt !== undefined) task.dueAt = updates.dueAt ? new Date(updates.dueAt) : undefined;
+            if (pingAt !== undefined) task.pingAt = pingAt;
+            if (dueAt !== undefined) task.dueAt = dueAt ?? undefined;
         });
 
         res.json({ success: true });
@@ -185,9 +211,23 @@ app.patch('/api/users/:id/messages/:messageId', async (req: Request, res: Respon
     }
 });
 
-// LuxMed monitoring webhook — receives notifications from the sidecar
+// LuxMed monitoring webhook — receives notifications from the sidecar.
+// Reachable on 0.0.0.0 inside the Docker network; protected by a shared secret.
+// Accepts the secret either as `X-Luxmed-Secret` header (preferred) or as a
+// `?secret=` query param (fallback for the upstream sidecar, which hardcodes
+// only Content-Type and can't add custom headers — embed the secret in
+// MONITORING_WEBHOOK_URL instead). If LUXMED_WEBHOOK_SECRET is unset, all
+// requests are rejected (fail-closed).
 app.post('/api/luxmed/monitoring-callback', (req: Request, res: Response) => {
     try {
+        if (!LUXMED_WEBHOOK_SECRET) {
+            return res.status(503).json({ error: 'Webhook disabled: LUXMED_WEBHOOK_SECRET not configured' });
+        }
+        const headerSecret = req.header('X-Luxmed-Secret') || '';
+        const querySecret = typeof req.query.secret === 'string' ? req.query.secret : '';
+        if (headerSecret !== LUXMED_WEBHOOK_SECRET && querySecret !== LUXMED_WEBHOOK_SECRET) {
+            return res.status(401).json({ error: 'Invalid webhook secret' });
+        }
         const { chatId, message } = req.body as { chatId?: string; sourceSystemId?: number; message?: string };
         if (!chatId || !message) {
             res.status(400).json({ error: 'Missing chatId or message' });

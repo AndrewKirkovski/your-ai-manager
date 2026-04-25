@@ -196,10 +196,18 @@ function ageLabel(d: Date): string {
     return `${minutes}m ago`;
 }
 
+// Cap the memory block at MEMORY_BLOCK_CAP entries by recency (updatedAt desc)
+// to stop token bloat as the memory table grows unbounded over the bot's lifetime.
+// The AI can still read full memory via a tool call when it needs older facts.
+const MEMORY_BLOCK_CAP = 50;
+
 function formatMemoryBlock(memory: Record<string, { value: string; firstRecordedAt: Date; updatedAt: Date }>): string {
     const keys = Object.keys(memory);
     if (keys.length === 0) return '{}';
-    const lines = keys.map(k => {
+    const sortedKeys = keys.slice().sort((a, b) => memory[b].updatedAt.getTime() - memory[a].updatedAt.getTime());
+    const shown = sortedKeys.slice(0, MEMORY_BLOCK_CAP);
+    const truncated = keys.length - shown.length;
+    const lines = shown.map(k => {
         const rec = memory[k];
         const sameDay = Math.abs(rec.updatedAt.getTime() - rec.firstRecordedAt.getTime()) < 86_400_000;
         const stamp = sameDay
@@ -209,6 +217,9 @@ function formatMemoryBlock(memory: Record<string, { value: string; firstRecorded
         // this block can't self-inject fake system messages when spliced into the prompt.
         return `  ${stripSystemTags(k)} [${stamp}]: ${stripSystemTags(rec.value)}`;
     });
+    if (truncated > 0) {
+        lines.push(`  … ${truncated} older memory entr${truncated === 1 ? 'y' : 'ies'} hidden (use a memory-read tool for full list)`);
+    }
     return '\n' + lines.join('\n');
 }
 
@@ -423,24 +434,30 @@ cron.schedule('* * * * *', async () => {
                         });
                     }
 
-                    const memory = await getCurrentInfo(user.userId);
+                    // Serialize with the live bot.on('message') path via enqueuePerUser —
+                    // otherwise a user typing at the same minute a routine fires produces
+                    // two concurrent streams that interleave addMessageToHistory writes.
+                    await enqueuePerUser(user.userId, async () => {
+                        const memory = await getCurrentInfo(user.userId);
 
-                    // Generate AI response asking about the task
-                    const taskPrompt = task.requiresAction ? TASK_TRIGGERED_PROMPT(memory, task) : TASK_TRIGGERED_PROMPT_NO_ACTION(memory, task);
+                        const taskPrompt = task.requiresAction
+                            ? TASK_TRIGGERED_PROMPT(memory, task)
+                            : TASK_TRIGGERED_PROMPT_NO_ACTION(memory, task);
 
-                    const result = await AIService.streamAIResponse({
-                        userId: user.userId,
-                        userMessage: taskPrompt,
-                        systemPrompt: getSystemPrompt(),
-                        bot,
-                        provider,
-                        model: OPEN_AI_MODEL,
-                        addUserToHistory: false,
-                        addAssistantToHistory: true,
-                        enableToolCalls: true
+                        const result = await AIService.streamAIResponse({
+                            userId: user.userId,
+                            userMessage: taskPrompt,
+                            systemPrompt: getSystemPrompt(),
+                            bot,
+                            provider,
+                            model: OPEN_AI_MODEL,
+                            addUserToHistory: false,
+                            addAssistantToHistory: true,
+                            enableToolCalls: true
+                        });
+
+                        console.log(result);
                     });
-
-                    console.log(result);
 
 
                 } else {
