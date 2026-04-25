@@ -28,7 +28,10 @@ services:
       # Fail-closed: compose refuses to start if LUXMED_SECURITY_SECRET is unset
       # (the `:?` expansion aborts with the message).
       SECURITY_SECRET: "${LUXMED_SECURITY_SECRET:?set LUXMED_SECURITY_SECRET in .env — no default allowed}"
-      MONITORING_WEBHOOK_URL: "http://bot:3000/api/luxmed/monitoring-callback"
+      # Webhook secret embedded in URL — sidecar can't add custom headers, so
+      # the bot also accepts ?secret= as fallback. Fail-closed: compose refuses
+      # to start if LUXMED_WEBHOOK_SECRET is unset.
+      MONITORING_WEBHOOK_URL: "http://bot:3000/api/luxmed/monitoring-callback?secret=${LUXMED_WEBHOOK_SECRET:?set LUXMED_WEBHOOK_SECRET in .env — no default allowed}"
     depends_on:
       - luxmed-db
     labels:
