@@ -52,8 +52,7 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 # Expose web UI port
 EXPOSE 3000
 
-# JSON→SQLite migration is one-shot for first-time deployments. Gate behind
-# MIGRATE_FROM_JSON=1 so production cold-starts don't burn time on a no-op
-# (and a migration script crash doesn't kill the container into a restart loop).
-# Schema additions / ADD COLUMN migrations always run via database.ts on startup.
-CMD ["sh", "-c", "if [ \"$MIGRATE_FROM_JSON\" = \"1\" ]; then npx tsx migrate-to-sqlite.ts; fi && yarn start"]
+# Schema and ADD COLUMN migrations run via database.ts on bot startup.
+# (The legacy JSON→SQLite one-shot migration script was removed once Revo
+# completed its migration — no fork still has db.json data to import.)
+CMD ["yarn", "start"]

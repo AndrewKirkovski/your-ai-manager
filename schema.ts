@@ -1,10 +1,10 @@
-/** SQLite schema — single source of truth for database.ts and migrate-to-sqlite.ts */
+/** SQLite schema — single source of truth for database.ts. */
 
 import type Database from 'better-sqlite3';
 
 /** Apply idempotent ADD COLUMN migrations to an existing database. Safe to call
- * before CREATE INDEX statements that reference the new columns. Used by both
- * database.ts (bot startup) and migrate-to-sqlite.ts (pre-start migration). */
+ * before CREATE INDEX statements that reference the new columns. Called by
+ * database.ts on bot startup. */
 export function applyColumnMigrations(db: Database.Database): void {
     // sticker_cache: short_tag + used_count (added 2026-04-24)
     {
