@@ -16,14 +16,15 @@ let botInstance: TelegramBot | null = null;
 const app = express();
 app.use(express.json());
 
-// Auth gate. Set WEB_AUTH_TOKEN in env — clients must send `Authorization: Bearer <token>`
-// or include `?token=<token>` in the query. Without WEB_AUTH_TOKEN set, requests from
-// non-loopback IPs are rejected (keeps local dev easy while blocking LAN access on Docker).
+// Auth gate. Set WEB_AUTH_TOKEN in env to require `Authorization: Bearer <token>`
+// (or `?token=<token>` query param). Without WEB_AUTH_TOKEN the dashboard is OPEN to
+// any reachable network — fine for a home-LAN admin UI behind the router, dangerous
+// if port 3000 is ever exposed to the internet.
 // The LuxMed webhook has its own shared-secret check inside the handler (X-Luxmed-Secret).
 const AUTH_TOKEN = process.env.WEB_AUTH_TOKEN || '';
 const LUXMED_WEBHOOK_SECRET = process.env.LUXMED_WEBHOOK_SECRET || '';
 if (!AUTH_TOKEN) {
-    console.warn('⚠️  WEB_AUTH_TOKEN not set — /api/* is loopback-only. LAN access will be rejected.');
+    console.warn('⚠️  WEB_AUTH_TOKEN not set — /api/* is OPEN to any caller. Set the env var to require a token.');
 }
 if (!LUXMED_WEBHOOK_SECRET) {
     console.warn('⚠️  LUXMED_WEBHOOK_SECRET not set — LuxMed webhook will reject all requests.');
@@ -39,14 +40,9 @@ app.use((req, res, next) => {
         if (header !== AUTH_TOKEN && queryToken !== AUTH_TOKEN) {
             return res.status(401).json({ error: 'Unauthorized' });
         }
-        return next();
     }
-    // No token configured — allow loopback only.
-    const ip = req.ip || req.socket.remoteAddress || '';
-    const loopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
-    if (!loopback) {
-        return res.status(401).json({ error: 'Unauthorized — set WEB_AUTH_TOKEN for non-loopback access' });
-    }
+    // No token configured → no gate. The host is responsible for keeping port 3000
+    // off the public internet.
     next();
 });
 
