@@ -32,7 +32,7 @@ import {
     getAllUserMemoryRecords,
     deleteUserMemory,
 } from "./userStore";
-import {addUserTask, generateShortId, addMessageToHistory} from './userStore';
+import {addUserTask, generateShortId, addMessageToHistory, getRecentMessageHistory} from './userStore';
 import {AIService} from './aiService';
 import {safeSend, stripSystemTags, textify} from './telegramFormat';
 import {runHistoryCompaction} from './historyCompaction';
@@ -154,6 +154,18 @@ async function fireBurstReply(userId: number): Promise<void> {
     // If the timer fired but a new message arrived in the gap and reset the
     // timer with a future fire-time, bail and let the new timer fire instead.
     if (burstTimers.has(userId)) return;
+
+    // Side-effects work may have decided not to append to history: new-user
+    // greeting (dispatches its own reply, drops the user's first message),
+    // unsupported type, fatal media error (already sent "Could not process…"),
+    // or a thrown error that fired the 🐺 fallback. In those cases the most-
+    // recent row is either assistant or empty, and firing a coalesced reply
+    // would address phantom context with a non-sequitur. Skip cleanly.
+    const recent = await getRecentMessageHistory(userId, 1);
+    if (recent.length === 0 || recent[recent.length - 1].role !== 'user') {
+        console.log(`[burst] ${userId}: no fresh user msg in history, skipping coalesced reply`);
+        return;
+    }
 
     const controller = new AbortController();
     const flight: InFlightReply = { controller, hasStreamedText: false };
