@@ -99,6 +99,14 @@ export class AIService {
             appendMessagesAfterUser,
         } = options;
 
+        // Hoisted to function scope so the abort catch can salvage partial
+        // billing data. Anthropic emits `message_start` with input_tokens
+        // (and cache info) very early in the stream — well before the for-
+        // await throws on AbortError. Recording those after abort keeps
+        // internal token accounting honest about what we actually paid for.
+        let usageInputTokens = 0;
+        let usageOutputTokens = 0;
+
         try {
             let messageId: number | undefined;
             let lastSentContent: string = '';
@@ -227,8 +235,8 @@ export class AIService {
             let historyResponseAccumulated = '';
             const toolCalls: ToolCallInfo[] = [];
             let thinkingBlocks: ThinkingBlockData[] | undefined;
-            let usageInputTokens = 0;
-            let usageOutputTokens = 0;
+            // usageInputTokens/usageOutputTokens are declared at function scope
+            // above (so the catch block can read them on abort).
 
             await bot.sendChatAction(userId, 'typing');
 
@@ -428,12 +436,21 @@ export class AIService {
                 // If abort fired during the tool loop above, newAppendedMessages
                 // is missing tool_result blocks for skipped tools — sending that
                 // to the API would error (Anthropic requires every tool_use to
-                // have a paired tool_result). Bail out cleanly without recursing.
-                // The assistant-history write below is already gated on
-                // !signal.aborted, so this early return preserves a clean slate
-                // for the next coalesced reply.
+                // have a paired tool_result). Bail out cleanly without recursing,
+                // BUT first persist a partial assistant row capturing the tool
+                // calls that did run. Without this, the next coalesced reply
+                // sees no record of the work and re-issues the same tool calls
+                // — addUserTask has no dedup, so the user ends up with
+                // duplicate tasks (and duplicate sendPhoto, etc.).
                 if (options.signal?.aborted) {
                     console.log(`🛑 Skipping recursive AI call — abort signalled during tool loop`);
+                    if (addAssistantToHistory) {
+                        const safeAssistantContent = stripSystemTags(historyResponseAccumulated);
+                        if (safeAssistantContent) {
+                            await addMessageToHistory(userId, 'assistant', safeAssistantContent);
+                            console.log(`📝 Added partial (abort) assistant row to history (${safeAssistantContent.length} chars)`);
+                        }
+                    }
                     return { message: '', rawResponse: '' };
                 }
 
@@ -450,14 +467,14 @@ export class AIService {
 
             }
 
-            // Skip the history write if a burst-coalesce abort fired during tool
-            // execution: the recursive streamAIResponse swallowed the AbortError
-            // and returned an empty result, but historyResponseAccumulated still
-            // carries this call's tool-call summaries. Persisting those would
-            // leave a half-finished assistant row that the next coalesced reply
-            // reads back and gets confused by. The next reply will produce a
-            // clean, complete assistant row instead.
-            if(addAssistantToHistory && !options.signal?.aborted) {
+            // Always persist what we did, even if abort fired during the
+            // recursive call. historyResponseAccumulated reflects the actual
+            // work completed (outer text + tool summaries + recursive text);
+            // dropping it on abort caused the next coalesced reply to re-do
+            // the same tool calls (creating duplicate tasks/images). Aborts
+            // before any tool runs are caught earlier (catch block returns
+            // empty without ever reaching this line).
+            if (addAssistantToHistory) {
                 const safeAssistantContent = stripSystemTags(historyResponseAccumulated);
                 await addMessageToHistory(userId, 'assistant', safeAssistantContent);
                 const preview = safeAssistantContent.length > 100
@@ -479,9 +496,16 @@ export class AIService {
             // history — just unwind cleanly. The next coalesced reply (fired by
             // the debounce timer) will see the full updated history.
             const aborted = options.signal?.aborted
-                || (error instanceof Error && (error.name === 'AbortError' || /aborted|cancel/i.test(error.message)));
+                || (error instanceof Error && (error.name === 'AbortError' || error.name === 'APIUserAbortError' || /aborted|cancel/i.test(error.message)));
             if (aborted) {
                 console.log(`🛑 AI reply aborted for ${userId} (burst-coalesce soft cancel)`);
+                // Salvage partial token usage: Anthropic's message_start lands
+                // before the for-await throws, so usageInputTokens may be set.
+                // Record it so internal stats reflect what the provider billed.
+                if (usageInputTokens || usageOutputTokens) {
+                    recordAITokens(userId, usageInputTokens, usageOutputTokens, options.purpose ?? 'reply', model)
+                        .catch(err => console.warn('[token-stat] partial recordAITokens (abort) failed:', err instanceof Error ? err.message : err));
+                }
                 return { message: '', rawResponse: '' };
             }
 
