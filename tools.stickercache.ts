@@ -75,6 +75,55 @@ function recordLookupUsage(resp: { usage?: { prompt_tokens?: number; completion_
     void recordAITokens(userId, u.prompt_tokens ?? 0, u.completion_tokens ?? 0, purpose, model);
 }
 
+/** Condense a sticker / emoji description via the cheap lookup model. Used by
+ * the admin dashboard's "Condense" button — the human reviews the result and
+ * decides whether to keep it. Optional context (kind/emojis/setName) is folded
+ * into the prompt so the model can preserve domain hints. Tokens recorded under
+ * user_id=0 with purpose 'condense_description'. Returns null on any failure
+ * path so the caller surfaces an error instead of overwriting with garbage. */
+export async function condenseStickerDescription(
+    originalDescription: string,
+    context?: { kind?: string; emojis?: string[]; setName?: string }
+): Promise<string | null> {
+    if (!lookupClient) {
+        console.warn('[condense] no lookup client configured; returning null');
+        return null;
+    }
+    if (!originalDescription || !originalDescription.trim()) return null;
+
+    const ctxParts: string[] = [];
+    if (context?.kind) ctxParts.push(`Kind: ${context.kind}.`);
+    if (context?.emojis && context.emojis.length > 0) ctxParts.push(`Emojis: ${context.emojis.join(' ')}.`);
+    if (context?.setName) ctxParts.push(`Pack: "${context.setName}".`);
+    const ctx = ctxParts.length > 0 ? ctxParts.join(' ') + '\n' : '';
+
+    const prompt =
+        `Condense this sticker / custom emoji description so it focuses on WHAT THE STICKER MEANS — ` +
+        `the emotion, vibe, or situation a sender would use it for — not on how it visually looks. ` +
+        `Drop visual minutiae (fur colour, eye shape, exact pose) unless they ARE the meaning. ` +
+        `Drop boilerplate like "senders use this to..." / "the sender uses this to..." — express the use directly. ` +
+        `Keep it under 25 words, ideally one short sentence. Output ONLY the condensed description, no preamble, no quotes.\n\n` +
+        `${ctx}Original description:\n${originalDescription.trim()}`;
+
+    try {
+        const resp = await lookupClient.chat.completions.create({
+            model: lookupModel,
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 120,
+        });
+        // Token usage attributed to the synthetic system user (user_id=0) since
+        // condensing is a dashboard action, not tied to any chat user.
+        recordLookupUsage(resp, 'condense_description', 0, lookupModel);
+        const raw = (resp.choices[0]?.message?.content ?? '').trim();
+        if (!raw) return null;
+        // Strip surrounding quotes the model occasionally adds despite the prompt.
+        return raw.replace(/^"|"$/g, '').replace(/^'|'$/g, '').trim();
+    } catch (err) {
+        console.warn('[condense] lookup model failed:', err instanceof Error ? err.message : err);
+        return null;
+    }
+}
+
 const KIND_VALUES: StickerCacheKind[] = ['sticker', 'animated_sticker', 'video_sticker', 'custom_emoji'];
 
 function isStickerKind(s: unknown): s is StickerCacheKind {

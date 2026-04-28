@@ -420,6 +420,56 @@
             loadStickers(false);
         }
 
+        async function condenseSticker(cacheKey, btn) {
+            const card = document.getElementById(`sticker-${cssEscape(cacheKey)}`);
+            if (!card) return;
+            const ta = card.querySelector('textarea[data-field="description"]');
+            const status = card.querySelector('[data-field="status"]');
+            if (!ta) return;
+            const original = ta.value;
+            if (!original.trim()) {
+                status.textContent = 'nothing to condense';
+                status.className = 'text-xs text-yellow-400';
+                return;
+            }
+            // Disable button + textarea while we wait so the user doesn't pile
+            // up requests on the same row.
+            const wasDisabled = btn.disabled;
+            btn.disabled = true;
+            btn.textContent = '…';
+            ta.disabled = true;
+            status.textContent = 'condensing…';
+            status.className = 'text-xs text-dark-muted';
+            try {
+                const res = await fetch(`/api/stickers/${encodeURIComponent(cacheKey)}/condense`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ description: original }),
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    status.textContent = '✗ ' + (err.error || `HTTP ${res.status}`);
+                    status.className = 'text-xs text-red-400';
+                    return;
+                }
+                const data = await res.json();
+                ta.value = data.condensed;
+                // Re-fit the textarea height to the (typically much shorter) result.
+                ta.style.height = 'auto';
+                ta.style.height = Math.min(ta.scrollHeight, 192) + 'px';
+                status.textContent = `↓ ${original.length} → ${data.condensed.length} chars (review &amp; Save)`;
+                status.className = 'text-xs text-green-400';
+            } catch (e) {
+                console.error('Failed to condense sticker:', e);
+                status.textContent = '✗ ' + (e.message || 'fetch failed');
+                status.className = 'text-xs text-red-400';
+            } finally {
+                btn.disabled = wasDisabled;
+                btn.textContent = 'Condense';
+                ta.disabled = false;
+            }
+        }
+
         async function saveSticker(cacheKey) {
             const card = document.getElementById(`sticker-${cssEscape(cacheKey)}`);
             if (!card) return;
@@ -500,7 +550,7 @@
 
                     <!-- content column -->
                     <div class="flex-1 min-w-0 flex flex-col gap-1">
-                        <!-- meta row: emojis, kind, pack, badges, used, save -->
+                        <!-- meta row: emojis, kind, pack, badges, used, condense, save -->
                         <div class="flex items-center gap-2 text-xs flex-wrap">
                             <span class="text-base leading-none">${emojiCell}</span>
                             <span class="px-1.5 py-0.5 bg-dark-bg rounded text-dark-muted">${stickerKindLabel(e.kind)}</span>
@@ -508,6 +558,9 @@
                             ${correctedBadge}
                             <span class="text-dark-muted ml-auto">used ${e.usedCount}×</span>
                             <span data-field="status" class="text-dark-muted"></span>
+                            <button onclick="condenseSticker('${escKey}', this)"
+                                title="AI-condense the description focusing on meaning, not visual detail"
+                                class="bg-purple-700 hover:bg-purple-800 px-3 py-0.5 rounded">Condense</button>
                             <button onclick="saveSticker('${escKey}')"
                                 class="bg-blue-600 hover:bg-blue-700 px-3 py-0.5 rounded">Save</button>
                         </div>

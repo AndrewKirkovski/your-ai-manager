@@ -5,6 +5,7 @@ import type TelegramBot from 'node-telegram-bot-api';
 import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount, getTokenUsageStats, getDistinctTokenModels, listStickerCacheEntries, updateStickerCacheText, getStickerCacheEntry, refreshStickerCacheFileId, type TokenUsageScope, type StickerCacheKind } from './userStore';
 import { textify, stripSystemTags, safeSend } from './telegramFormat';
 import { renderTgsFrames } from './tgsRenderer';
+import { condenseStickerDescription } from './tools.stickercache';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -389,6 +390,45 @@ app.get('/api/stickers/:cacheKey/image', async (req: Request, res: Response) => 
     } catch (error) {
         console.error('Error serving sticker image:', error);
         res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to serve image' });
+    }
+});
+
+// POST /api/stickers/:cacheKey/condense - run the Haiku lookup model on the
+// supplied description (or the stored one if body.description is omitted) and
+// return a condensed version focused on what the sticker MEANS rather than how
+// it looks. The dashboard puts the result back into the textarea — admin
+// reviews and clicks Save to persist; this endpoint never writes the DB.
+// Tokens recorded under user_id=0 with purpose 'condense_description'.
+app.post('/api/stickers/:cacheKey/condense', async (req: Request, res: Response) => {
+    try {
+        const cacheKey = param(req, 'cacheKey');
+        const entry = getStickerCacheEntry(cacheKey);
+        if (!entry) {
+            return res.status(404).json({ error: 'Sticker not found' });
+        }
+        const bodyDesc = typeof req.body?.description === 'string' ? req.body.description : '';
+        // Prefer the live textarea value sent by the dashboard so admins can
+        // condense their in-flight edits. Fall back to the stored description.
+        const source = bodyDesc.trim() ? bodyDesc : entry.description;
+        if (!source || !source.trim()) {
+            return res.status(400).json({ error: 'Empty description — nothing to condense' });
+        }
+        const condensed = await condenseStickerDescription(source, {
+            kind: entry.kind,
+            emojis: entry.emojis,
+            setName: entry.setName,
+        });
+        if (!condensed) {
+            return res.status(502).json({ error: 'Condense failed (no lookup model configured or model returned empty)' });
+        }
+        res.json({
+            cacheKey: entry.cacheKey,
+            original: source,
+            condensed,
+        });
+    } catch (error) {
+        console.error('Error condensing sticker description:', error);
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to condense' });
     }
 });
 
