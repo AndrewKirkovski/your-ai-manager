@@ -155,22 +155,36 @@ async function fireBurstReply(userId: number): Promise<void> {
     // timer with a future fire-time, bail and let the new timer fire instead.
     if (burstTimers.has(userId)) return;
 
-    // Side-effects work may have decided not to append to history: new-user
-    // greeting (dispatches its own reply, drops the user's first message),
-    // unsupported type, fatal media error (already sent "Could not process…"),
-    // or a thrown error that fired the 🐺 fallback. In those cases the most-
-    // recent row is either assistant or empty, and firing a coalesced reply
-    // would address phantom context with a non-sequitur. Skip cleanly.
-    const recent = await getRecentMessageHistory(userId, 1);
-    if (recent.length === 0 || recent[recent.length - 1].role !== 'user') {
-        console.log(`[burst] ${userId}: no fresh user msg in history, skipping coalesced reply`);
-        return;
-    }
-
+    // Register the AbortController BEFORE the upcoming history-peek await.
+    // Without this, a user message arriving during the peek would call
+    // softAbortIfPretext and find no flight to abort, then schedule a NEW
+    // burst timer behind us. The result was two replies for one burst:
+    // this one running on stale state, plus the coalesced one for the new
+    // message. With the flight registered first, the incoming message can
+    // soft-abort us cleanly, and the next coalesced reply picks up the
+    // updated history.
     const controller = new AbortController();
     const flight: InFlightReply = { controller, hasStreamedText: false };
     inFlightReplies.set(userId, flight);
     try {
+        // Side-effects work may have decided not to append to history: new-user
+        // greeting (dispatches its own reply, drops the user's first message),
+        // unsupported type, fatal media error (already sent "Could not process…"),
+        // or a thrown error that fired the 🐺 fallback. In those cases the most-
+        // recent row is either assistant or empty, and firing a coalesced reply
+        // would address phantom context with a non-sequitur. Skip cleanly.
+        const recent = await getRecentMessageHistory(userId, 1);
+
+        // Re-check after the await: a message arriving during the peek may have
+        // already aborted us (softAbortIfPretext) or scheduled a fresher burst
+        // timer. In either case, bail — let the next timer fire a clean reply.
+        if (controller.signal.aborted || burstTimers.has(userId)) return;
+
+        if (recent.length === 0 || recent[recent.length - 1].role !== 'user') {
+            console.log(`[burst] ${userId}: no fresh user msg in history, skipping coalesced reply`);
+            return;
+        }
+
         await replyToUser(userId, '', {
             signal: controller.signal,
             onTextStreamed: () => { flight.hasStreamedText = true; },

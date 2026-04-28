@@ -351,6 +351,18 @@ export class AIService {
                 });
 
                 for (const toolCall of toolCalls) {
+                    // Burst-coalesce abort check: tools (DB writes, sendPhoto, addUserTask,
+                    // GoogleMaps calls, etc.) are awaited synchronously with no signal
+                    // wired through executeTool. If abort fires mid-tool-loop, the
+                    // tools that ALREADY started will run to completion, but skip
+                    // any that haven't begun — limits user-visible duplicate side-
+                    // effects (tasks created twice, images sent twice) when the next
+                    // coalesced reply re-issues the same calls.
+                    if (options.signal?.aborted) {
+                        console.log(`🛑 Skipping tool ${toolCall.name} — abort signalled`);
+                        break;
+                    }
+
                     const toolName = toolCall.name;
                     const toolArgs = toolCall.arguments;
                     let parsedArgs: Record<string, unknown> = {};
@@ -411,6 +423,18 @@ export class AIService {
 
                         historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nError: ${stripSystemTags(errorMsg)}\n`;
                     }
+                }
+
+                // If abort fired during the tool loop above, newAppendedMessages
+                // is missing tool_result blocks for skipped tools — sending that
+                // to the API would error (Anthropic requires every tool_use to
+                // have a paired tool_result). Bail out cleanly without recursing.
+                // The assistant-history write below is already gated on
+                // !signal.aborted, so this early return preserves a clean slate
+                // for the next coalesced reply.
+                if (options.signal?.aborted) {
+                    console.log(`🛑 Skipping recursive AI call — abort signalled during tool loop`);
+                    return { message: '', rawResponse: '' };
                 }
 
                 console.log(`🔄 Continuing with ${newAppendedMessages.length} tool result(s), depth: ${currentRecursionDepth + 1}`);
