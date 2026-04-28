@@ -135,14 +135,18 @@ export class AIService {
 
                     if (!messageId) {
                         if (initialSendFailed && !isFinal) return;
+                        // Flip hasStreamedText BEFORE awaiting safeSend (commit-on-attempt).
+                        // Telegram's send roundtrip is 100-300ms; if an incoming user message
+                        // races into that window, softAbortIfPretext would otherwise abort
+                        // the stream while safeSend is mid-flight, leaving an orphan first
+                        // chunk visible in Telegram + a duplicate full reply afterwards.
+                        // Flipping early means: once we've decided to push visible text, we
+                        // commit to finishing this reply.
+                        try { options.onTextStreamed?.(); } catch (e) { /* listener bug shouldn't kill stream */ }
                         const sentMessage = await safeSend(bot, userId, contentToSend);
                         if (sentMessage) {
                             messageId = sentMessage.message_id;
                             lastSentContent = aiResponseAccumulated;
-                            // First visible text just landed in Telegram. Tell
-                            // the burst-coalescer so it stops considering this
-                            // reply abortable.
-                            try { options.onTextStreamed?.(); } catch (e) { /* listener bug shouldn't kill stream */ }
                         } else {
                             initialSendFailed = true;
                         }
@@ -422,7 +426,14 @@ export class AIService {
 
             }
 
-            if(addAssistantToHistory) {
+            // Skip the history write if a burst-coalesce abort fired during tool
+            // execution: the recursive streamAIResponse swallowed the AbortError
+            // and returned an empty result, but historyResponseAccumulated still
+            // carries this call's tool-call summaries. Persisting those would
+            // leave a half-finished assistant row that the next coalesced reply
+            // reads back and gets confused by. The next reply will produce a
+            // clean, complete assistant row instead.
+            if(addAssistantToHistory && !options.signal?.aborted) {
                 const safeAssistantContent = stripSystemTags(historyResponseAccumulated);
                 await addMessageToHistory(userId, 'assistant', safeAssistantContent);
                 const preview = safeAssistantContent.length > 100
