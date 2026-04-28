@@ -143,6 +143,17 @@ export class AnthropicProvider implements AIProvider {
                         inputTokens = u.input_tokens ?? 0;
                         cacheCreationTokens = u.cache_creation_input_tokens ?? 0;
                         cacheReadTokens = u.cache_read_input_tokens ?? 0;
+                        // Emit a partial usage chunk early so the consumer can record
+                        // input-side billing even if the stream is cut short (burst-
+                        // coalesce abort). output_tokens is set to 0 here; message_delta
+                        // emits a corrected total at end-of-stream when not aborted.
+                        yield {
+                            type: 'usage',
+                            input_tokens: inputTokens,
+                            output_tokens: 0,
+                            cache_creation_tokens: cacheCreationTokens || undefined,
+                            cache_read_tokens: cacheReadTokens || undefined,
+                        };
                     }
                     break;
                 }

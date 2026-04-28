@@ -32,7 +32,7 @@ import {
     getAllUserMemoryRecords,
     deleteUserMemory,
 } from "./userStore";
-import {addUserTask, generateShortId, addMessageToHistory, getRecentMessageHistory} from './userStore';
+import {addUserTask, generateShortId, addMessageToHistory} from './userStore';
 import {AIService} from './aiService';
 import {safeSend, stripSystemTags, textify} from './telegramFormat';
 import {runHistoryCompaction} from './historyCompaction';
@@ -118,6 +118,15 @@ const inFlightReplies = new Map<number, InFlightReply>();
 const burstTimers = new Map<number, NodeJS.Timeout>();
 const BURST_DEBOUNCE_MS = Math.max(0, parseInt(process.env.BURST_DEBOUNCE_MS ?? '800', 10) || 800);
 
+// Set true by the side-effects work after a successful addMessageToHistory(user, …)
+// for this user. Cleared when fireBurstReply commits to actually streaming a reply.
+// Preferred over peeking the most-recent history role, because that approach
+// silently swallowed bursts that landed AFTER a cron task ping ran (history's
+// last row is then the cron's assistant, not the user's burst). The flag tracks
+// "is there fresh user input that hasn't been picked up by a coalesced reply",
+// which is the actual question we need to answer.
+const pendingUserInput = new Map<number, boolean>();
+
 /** Schedule (or refresh) the per-user debounce timer that fires a single
  * AI reply once `BURST_DEBOUNCE_MS` of silence elapses. Each new user message
  * resets the timer; the firing schedules the reply onto `aiReplyQueues` so it
@@ -155,36 +164,28 @@ async function fireBurstReply(userId: number): Promise<void> {
     // timer with a future fire-time, bail and let the new timer fire instead.
     if (burstTimers.has(userId)) return;
 
-    // Register the AbortController BEFORE the upcoming history-peek await.
-    // Without this, a user message arriving during the peek would call
-    // softAbortIfPretext and find no flight to abort, then schedule a NEW
-    // burst timer behind us. The result was two replies for one burst:
-    // this one running on stale state, plus the coalesced one for the new
-    // message. With the flight registered first, the incoming message can
-    // soft-abort us cleanly, and the next coalesced reply picks up the
-    // updated history.
+    // Side-effects work may have decided not to append to history: new-user
+    // greeting (dispatches its own reply, drops the user's first message),
+    // unsupported type, fatal media error (already sent "Could not process…"),
+    // or a thrown error that fired the 🐺 fallback. In those cases the
+    // pendingUserInput flag was never set; firing a coalesced reply would
+    // address phantom context with a non-sequitur. Skip cleanly.
+    if (!pendingUserInput.get(userId)) {
+        console.log(`[burst] ${userId}: no fresh user input pending, skipping coalesced reply`);
+        return;
+    }
+    // Clear the flag now that we're committing to fire. If a new user msg
+    // arrives mid-stream, its side-effects work will set the flag again,
+    // and the next coalesced reply will pick it up.
+    pendingUserInput.delete(userId);
+
+    // Register the AbortController for softAbortIfPretext to find. Done
+    // AFTER the pending-input check so we don't churn controller objects
+    // when there's nothing to do.
     const controller = new AbortController();
     const flight: InFlightReply = { controller, hasStreamedText: false };
     inFlightReplies.set(userId, flight);
     try {
-        // Side-effects work may have decided not to append to history: new-user
-        // greeting (dispatches its own reply, drops the user's first message),
-        // unsupported type, fatal media error (already sent "Could not process…"),
-        // or a thrown error that fired the 🐺 fallback. In those cases the most-
-        // recent row is either assistant or empty, and firing a coalesced reply
-        // would address phantom context with a non-sequitur. Skip cleanly.
-        const recent = await getRecentMessageHistory(userId, 1);
-
-        // Re-check after the await: a message arriving during the peek may have
-        // already aborted us (softAbortIfPretext) or scheduled a fresher burst
-        // timer. In either case, bail — let the next timer fire a clean reply.
-        if (controller.signal.aborted || burstTimers.has(userId)) return;
-
-        if (recent.length === 0 || recent[recent.length - 1].role !== 'user') {
-            console.log(`[burst] ${userId}: no fresh user msg in history, skipping coalesced reply`);
-            return;
-        }
-
         await replyToUser(userId, '', {
             signal: controller.signal,
             onTextStreamed: () => { flight.hasStreamedText = true; },
@@ -1147,6 +1148,10 @@ bot.on('message', (msg) => {
             // Append to history NOW — the burst reply path uses
             // addUserToHistory=false and reads recent history straight from DB.
             await addMessageToHistory(userId, 'user', processed.content);
+            // Mark fresh user input pending so fireBurstReply knows there's
+            // something to address (and isn't fooled by an intervening cron
+            // ping leaving an assistant row as the most-recent history entry).
+            pendingUserInput.set(userId, true);
         } catch (error) {
             console.error('❌ Error handling message side-effects:', {
                 userId: msg.from?.id,

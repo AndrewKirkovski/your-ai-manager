@@ -473,14 +473,18 @@ export class AIService {
             // dropping it on abort caused the next coalesced reply to re-do
             // the same tool calls (creating duplicate tasks/images). Aborts
             // before any tool runs are caught earlier (catch block returns
-            // empty without ever reaching this line).
+            // empty without ever reaching this line). Skip writing if the
+            // content is empty — happens when the model emits only thinking
+            // blocks then silently completes (no text, no tools, no recursion).
             if (addAssistantToHistory) {
                 const safeAssistantContent = stripSystemTags(historyResponseAccumulated);
-                await addMessageToHistory(userId, 'assistant', safeAssistantContent);
-                const preview = safeAssistantContent.length > 100
-                    ? safeAssistantContent.substring(0, 100) + '...'
-                    : safeAssistantContent;
-                console.log(`📝 Added assistant message to history: "${preview.replace(/\n/g, ' ')}"`);
+                if (safeAssistantContent) {
+                    await addMessageToHistory(userId, 'assistant', safeAssistantContent);
+                    const preview = safeAssistantContent.length > 100
+                        ? safeAssistantContent.substring(0, 100) + '...'
+                        : safeAssistantContent;
+                    console.log(`📝 Added assistant message to history: "${preview.replace(/\n/g, ' ')}"`);
+                }
             }
 
             return {
@@ -495,8 +499,17 @@ export class AIService {
             // user a 🐺 error, don't write half-finished assistant content to
             // history — just unwind cleanly. The next coalesced reply (fired by
             // the debounce timer) will see the full updated history.
+            // APIUserAbortError extends APIError without setting `this.name`, so
+            // `error.name` is just 'Error' — match against the constructor name
+            // instead. The /aborted|cancel/i regex catches the SDK's default
+            // "Request was aborted." message either way; check both for defence
+            // in depth across SDK versions and undici/node native abort errors.
             const aborted = options.signal?.aborted
-                || (error instanceof Error && (error.name === 'AbortError' || error.name === 'APIUserAbortError' || /aborted|cancel/i.test(error.message)));
+                || (error instanceof Error && (
+                    error.name === 'AbortError'
+                    || error.constructor?.name === 'APIUserAbortError'
+                    || /aborted|cancel/i.test(error.message)
+                ));
             if (aborted) {
                 console.log(`🛑 AI reply aborted for ${userId} (burst-coalesce soft cancel)`);
                 // Salvage partial token usage: Anthropic's message_start lands
