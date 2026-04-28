@@ -307,13 +307,15 @@ app.get('/api/stickers', async (req: Request, res: Response) => {
 });
 
 // GET /api/stickers/:cacheKey/image - proxy the actual image bytes
-//   - sticker, custom_emoji   → serve raw bytes (PNG/WebP), browser renders directly.
-//   - video_sticker           → serve raw bytes as video/webm.
-//   - animated_sticker (TGS)  → render middle frame via tgsRenderer, return PNG.
+// Format is detected from magic bytes, not the `kind` column — custom_emoji
+// can be any of TGS / WebM / WebP / PNG depending on the source pack, so
+// blindly trusting `kind` would mis-serve animated emojis as raw gzip.
+//   - gzip (1f 8b) → TGS Lottie. Render middle frame via tgsRenderer, return PNG.
+//   - EBML (1a 45 df a3) → WebM. Serve as video/webm.
+//   - PNG/WebP/JPEG/GIF → serve as the matching image MIME.
 //
 // 404 if no fileId on the entry. file_id is durable for ~24h server-side, so we
-// set Cache-Control max-age=3600. Browser cache + dashboard's lazy <img> means
-// re-renders don't hammer Telegram.
+// set Cache-Control max-age=3600. Browser cache + lazy <img> absorbs reloads.
 app.get('/api/stickers/:cacheKey/image', async (req: Request, res: Response) => {
     try {
         const cacheKey = param(req, 'cacheKey');
@@ -328,15 +330,20 @@ app.get('/api/stickers/:cacheKey/image', async (req: Request, res: Response) => 
             return res.status(503).json({ error: 'Bot not initialized' });
         }
 
-        // Animated stickers: served as a single static frame (PNG). Cached in-process.
-        if (entry.kind === 'animated_sticker') {
-            const cached = TGS_FRAME_CACHE.get(entry.fileId);
-            if (cached) {
-                res.setHeader('Content-Type', 'image/png');
-                res.setHeader('Cache-Control', 'public, max-age=3600');
-                return res.end(cached);
-            }
-            const buf = await downloadTelegramFile(botInstance, entry.fileId);
+        // TGS rendered output is the only path with a process-side cache (puppeteer
+        // is the expensive bit). Static images and WebM go straight through the
+        // Telegram-stream → response pipe with browser-cache absorbing the cost.
+        const cached = TGS_FRAME_CACHE.get(entry.fileId);
+        if (cached) {
+            res.setHeader('Content-Type', 'image/png');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            return res.end(cached);
+        }
+
+        const buf = await downloadTelegramFile(botInstance, entry.fileId);
+        const fmt = detectFileFormat(buf);
+
+        if (fmt === 'tgs') {
             const frames = await renderTgsFrames(buf, 1);
             const png = frames[0];
             if (!png) {
@@ -348,10 +355,7 @@ app.get('/api/stickers/:cacheKey/image', async (req: Request, res: Response) => 
             return res.end(png);
         }
 
-        // Static stickers, custom_emoji, video_sticker — stream raw bytes through.
-        const buf = await downloadTelegramFile(botInstance, entry.fileId);
-        const contentType = entry.kind === 'video_sticker' ? 'video/webm' : detectImageType(buf);
-        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Type', fmt.mime);
         res.setHeader('Cache-Control', 'public, max-age=3600');
         res.end(buf);
     } catch (error) {
@@ -404,15 +408,25 @@ async function downloadTelegramFile(bot: TelegramBot, fileId: string): Promise<B
     return Buffer.concat(chunks);
 }
 
-/** Sniff PNG vs WebP vs JPEG vs GIF from the first few bytes. Telegram stickers
- * are usually WebP or PNG; custom_emoji can be either. Default to image/webp
- * for unknown bytes — browsers handle the mismatch gracefully. */
-function detectImageType(buf: Buffer): string {
-    if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
-    if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
-    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
-    if (buf.length >= 6 && buf.subarray(0, 6).toString('ascii').startsWith('GIF8')) return 'image/gif';
-    return 'image/webp';
+/** Sniff sticker / emoji file format from magic bytes. Returns the literal
+ * `'tgs'` for gzipped Lottie (caller renders via tgsRenderer); otherwise an
+ * object with the appropriate MIME type for direct serving. Defaults to
+ * image/webp for unknown bytes — browsers handle the mismatch gracefully. */
+type FileFormat = 'tgs' | { mime: string };
+function detectFileFormat(buf: Buffer): FileFormat {
+    // Gzip → TGS (Lottie animation, gzipped JSON).
+    if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) return 'tgs';
+    // EBML → WebM (video stickers, animated WebP-like custom emojis).
+    if (buf.length >= 4 && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return { mime: 'video/webm' };
+    // PNG.
+    if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return { mime: 'image/png' };
+    // RIFF…WEBP.
+    if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') return { mime: 'image/webp' };
+    // JPEG.
+    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { mime: 'image/jpeg' };
+    // GIF.
+    if (buf.length >= 6 && buf.subarray(0, 6).toString('ascii').startsWith('GIF8')) return { mime: 'image/gif' };
+    return { mime: 'image/webp' };
 }
 
 // LuxMed monitoring webhook — receives notifications from the sidecar.

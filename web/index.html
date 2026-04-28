@@ -25,6 +25,19 @@
     </script>
     <style>
         .editing { background-color: #1e40af !important; }
+        /* Sticker thumbnail: small by default, zoom on hover so admins can spot
+           detail without clicking. transform-origin keeps the zoom anchored to
+           the left so the row beside it isn't pushed around. z-index lifts the
+           hovered thumb above neighbouring rows. */
+        .sticker-thumb {
+            transition: transform 120ms ease-out;
+            transform-origin: top left;
+        }
+        .sticker-thumb:hover {
+            transform: scale(2.5);
+            z-index: 50;
+            position: relative;
+        }
     </style>
 </head>
 <body class="bg-dark-bg text-dark-text min-h-screen">
@@ -459,36 +472,50 @@
 
         function renderStickerCard(e) {
             const id = `sticker-${cssEscape(e.cacheKey)}`;
-            // Video stickers render as <video>; the rest render as <img>. Both
-            // hit the same /image endpoint — the server picks the content type.
+            // Thumbnail: ~64px square, sticker-thumb class scales it on hover.
+            // Video kind embeds <video>; everything else uses <img>. Server
+            // chooses the content type from magic bytes regardless of kind.
+            const thumbBox = `w-16 h-16 object-contain bg-dark-bg rounded sticker-thumb`;
             let imageEl;
             if (!e.hasImage) {
-                imageEl = `<div class="w-full h-32 bg-dark-bg rounded flex items-center justify-center text-dark-muted text-xs">no file</div>`;
+                imageEl = `<div class="${thumbBox} flex items-center justify-center text-dark-muted text-[10px]">no file</div>`;
             } else if (e.kind === 'video_sticker') {
-                imageEl = `<video src="/api/stickers/${encodeURIComponent(e.cacheKey)}/image" class="w-full h-32 object-contain bg-dark-bg rounded" autoplay loop muted playsinline></video>`;
+                imageEl = `<video src="/api/stickers/${encodeURIComponent(e.cacheKey)}/image" class="${thumbBox}" autoplay loop muted playsinline></video>`;
             } else {
-                imageEl = `<img src="/api/stickers/${encodeURIComponent(e.cacheKey)}/image" alt="" loading="lazy" class="w-full h-32 object-contain bg-dark-bg rounded" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'w-full h-32 bg-dark-bg rounded flex items-center justify-center text-red-400 text-xs',textContent:'load failed'}))">`;
+                imageEl = `<img src="/api/stickers/${encodeURIComponent(e.cacheKey)}/image" alt="" loading="lazy" class="${thumbBox}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'${thumbBox} flex items-center justify-center text-red-400 text-[10px]',textContent:'load failed'}))">`;
             }
 
+            const emojiCell = (e.emojis || []).map(escapeHtml).join('') || '<span class="text-dark-muted text-[10px]">—</span>';
+            const correctedBadge = `<span data-field="corrected-badge" class="px-1.5 rounded bg-yellow-700 text-yellow-100 text-[10px] ${e.userCorrected ? '' : 'hidden'}" title="user-corrected">✎</span>`;
+            const escKey = escapeHtml(e.cacheKey).replace(/'/g, "\\'");
+
             return `
-                <div id="${id}" class="bg-dark-card border border-dark-border rounded-lg p-3 flex flex-col gap-2">
-                    ${imageEl}
-                    <div class="flex items-center justify-between text-xs">
-                        <span class="px-1.5 py-0.5 bg-dark-bg rounded text-dark-muted">${stickerKindLabel(e.kind)}</span>
-                        <span data-field="corrected-badge" class="px-1.5 py-0.5 bg-yellow-700 rounded text-yellow-100 ${e.userCorrected ? '' : 'hidden'}" title="user-corrected">✎</span>
-                    </div>
-                    <div class="text-base">${(e.emojis || []).map(escapeHtml).join('') || '<span class="text-dark-muted text-xs">no emojis</span>'}</div>
-                    ${e.setName ? `<div class="text-xs text-dark-muted truncate" title="${escapeHtml(e.setName)}">${escapeHtml(e.setName)}</div>` : ''}
-                    <textarea data-field="description"
-                        class="bg-dark-bg border border-dark-border rounded p-2 text-xs w-full resize-y min-h-[3rem]"
-                        rows="3" placeholder="description">${escapeHtml(e.description || '')}</textarea>
-                    <input data-field="shortTag" type="text" value="${escapeHtml(e.shortTag || '')}"
-                        class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs w-full" placeholder="short tag">
-                    <div class="flex items-center justify-between gap-2">
-                        <span class="text-xs text-dark-muted">used ${e.usedCount}×</span>
-                        <span data-field="status" class="text-xs text-dark-muted"></span>
-                        <button onclick="saveSticker('${escapeHtml(e.cacheKey).replace(/'/g, "\\'")}')"
-                            class="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded text-xs">Save</button>
+                <div id="${id}" class="border-b border-dark-border py-2 flex gap-3 items-start">
+                    <!-- thumbnail column, hover-zooms in place -->
+                    <div class="shrink-0 w-16">${imageEl}</div>
+
+                    <!-- content column -->
+                    <div class="flex-1 min-w-0 flex flex-col gap-1">
+                        <!-- meta row: emojis, kind, pack, badges, used, save -->
+                        <div class="flex items-center gap-2 text-xs flex-wrap">
+                            <span class="text-base leading-none">${emojiCell}</span>
+                            <span class="px-1.5 py-0.5 bg-dark-bg rounded text-dark-muted">${stickerKindLabel(e.kind)}</span>
+                            ${e.setName ? `<span class="text-dark-muted truncate max-w-[16rem]" title="${escapeHtml(e.setName)}">${escapeHtml(e.setName)}</span>` : ''}
+                            ${correctedBadge}
+                            <span class="text-dark-muted ml-auto">used ${e.usedCount}×</span>
+                            <span data-field="status" class="text-dark-muted"></span>
+                            <button onclick="saveSticker('${escKey}')"
+                                class="bg-blue-600 hover:bg-blue-700 px-3 py-0.5 rounded">Save</button>
+                        </div>
+                        <!-- description, full-width, 2 rows tall by default — auto-grows on input -->
+                        <textarea data-field="description"
+                            class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs w-full resize-y min-h-[2.25rem]"
+                            rows="2" placeholder="description"
+                            oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'">${escapeHtml(e.description || '')}</textarea>
+                        <!-- short tag row -->
+                        <input data-field="shortTag" type="text" value="${escapeHtml(e.shortTag || '')}"
+                            class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs w-full"
+                            placeholder="short tag">
                     </div>
                 </div>
             `;
@@ -535,7 +562,7 @@
             } else if (stickerState.entries.length === 0) {
                 body = `<p class="text-dark-muted text-sm">No stickers match.</p>`;
             } else {
-                body = `<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">${stickerState.entries.map(renderStickerCard).join('')}</div>`;
+                body = `<div class="flex flex-col">${stickerState.entries.map(renderStickerCard).join('')}</div>`;
             }
 
             // Preserve search input focus + caret across re-renders.
@@ -564,6 +591,13 @@
                     if (caret != null) newSearch.setSelectionRange(caret, caret);
                 }
             }
+
+            // Grow each description textarea to fit its content so admins see
+            // the whole description without scrolling within the row.
+            document.querySelectorAll('#stickerEditor textarea[data-field="description"]').forEach(ta => {
+                ta.style.height = 'auto';
+                ta.style.height = ta.scrollHeight + 'px';
+            });
         }
 
         // Load user data
