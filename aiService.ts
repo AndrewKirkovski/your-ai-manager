@@ -304,6 +304,24 @@ export class AIService {
                 clearInterval(updateInterval_id);
             }
 
+            // Both Anthropic and OpenAI SDKs SILENTLY EXIT their stream iterator
+            // on signal-triggered abort (see node_modules/@anthropic-ai/sdk/core/streaming.js:70-73
+            // — `if (isAbortError(e)) return;`). Our for-await loop above sees a
+            // clean iterator completion, NOT a thrown AbortError. Without this
+            // explicit post-loop check, control falls through to updateTelegramMessage(true)
+            // below, which would safeSend any short (<100 char) accumulated text
+            // — producing an orphan partial reply in Telegram for a burst the
+            // user already moved past. Bail here so the next coalesced reply
+            // owns the full response.
+            if (options.signal?.aborted) {
+                console.log(`🛑 AI reply aborted for ${userId} (SDK silent-exit on signal)`);
+                if (usageInputTokens || usageOutputTokens) {
+                    recordAITokens(userId, usageInputTokens, usageOutputTokens, options.purpose ?? 'reply', model)
+                        .catch(err => console.warn('[token-stat] partial recordAITokens (silent abort) failed:', err instanceof Error ? err.message : err));
+                }
+                return { message: '', rawResponse: '' };
+            }
+
             // Record AI token usage. recordAITokens double-writes: per-user AND user_id=0 (global).
             // userId is the actual user the AI is replying to or working on behalf of.
             // Catch is required: SQLite write contention can reject and we don't want
