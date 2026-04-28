@@ -476,13 +476,17 @@
             // Video kind embeds <video>; everything else uses <img>. Server
             // chooses the content type from magic bytes regardless of kind.
             const thumbBox = `w-16 h-16 object-contain bg-dark-bg rounded sticker-thumb`;
+            const imgUrl = `/api/stickers/${encodeURIComponent(e.cacheKey)}/image`;
             let imageEl;
             if (!e.hasImage) {
                 imageEl = `<div class="${thumbBox} flex items-center justify-center text-dark-muted text-[10px]">no file</div>`;
             } else if (e.kind === 'video_sticker') {
-                imageEl = `<video src="/api/stickers/${encodeURIComponent(e.cacheKey)}/image" class="${thumbBox}" autoplay loop muted playsinline></video>`;
+                imageEl = `<video src="${imgUrl}" class="${thumbBox}" autoplay loop muted playsinline></video>`;
             } else {
-                imageEl = `<img src="/api/stickers/${encodeURIComponent(e.cacheKey)}/image" alt="" loading="lazy" class="${thumbBox}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'${thumbBox} flex items-center justify-center text-red-400 text-[10px]',textContent:'load failed'}))">`;
+                // <img> handles PNG/WebP/JPEG/GIF and the server-rendered TGS-as-PNG.
+                // Custom emojis can ALSO be WebM (animated) which <img> can't decode —
+                // on error, swap to a <video> with the same src so all formats work.
+                imageEl = `<img src="${imgUrl}" alt="" loading="lazy" class="${thumbBox}" onerror="(()=>{const v=document.createElement('video');v.src=this.src;v.className=this.className;v.autoplay=true;v.loop=true;v.muted=true;v.playsInline=true;v.onerror=()=>v.replaceWith(Object.assign(document.createElement('div'),{className:this.className+' flex items-center justify-center text-red-400 text-[10px]',textContent:'load failed'}));this.replaceWith(v);})()">`;
             }
 
             const emojiCell = (e.emojis || []).map(escapeHtml).join('') || '<span class="text-dark-muted text-[10px]">—</span>';
