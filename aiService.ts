@@ -269,7 +269,7 @@ export class AIService {
             // Catch is required: SQLite write contention can reject and we don't want
             // an unhandled rejection killing the process.
             const purpose = options.purpose ?? 'reply';
-            recordAITokens(userId, usageInputTokens, usageOutputTokens, purpose)
+            recordAITokens(userId, usageInputTokens, usageOutputTokens, purpose, model)
                 .catch(err => console.warn('[token-stat] recordAITokens failed:', err instanceof Error ? err.message : err));
 
             // Detect inline custom-emoji + sticker references the AI emitted in its reply.

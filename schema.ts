@@ -16,6 +16,15 @@ export function applyColumnMigrations(db: Database.Database): void {
             db.exec(`ALTER TABLE sticker_cache ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0`);
         }
     }
+    // stat_entries: model column for AI token rows (added 2026-04-28)
+    // Nullable — non-token stats and old token rows that pre-date the column
+    // both legitimately have model=NULL.
+    {
+        const cols = db.prepare('PRAGMA table_info(stat_entries)').all() as { name: string }[];
+        if (!cols.some(c => c.name === 'model')) {
+            db.exec(`ALTER TABLE stat_entries ADD COLUMN model TEXT`);
+        }
+    }
 }
 
 export const SCHEMA_SQL = `
@@ -168,7 +177,8 @@ export const SCHEMA_SQL = `
         value     REAL NOT NULL,
         unit      TEXT,
         note      TEXT,
-        timestamp TEXT NOT NULL
+        timestamp TEXT NOT NULL,
+        model     TEXT
     );
 `;
 

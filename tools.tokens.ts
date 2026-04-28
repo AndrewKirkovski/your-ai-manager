@@ -23,10 +23,13 @@ function periodRange(period: string): { from: Date; to: Date; label: string } {
 export const GetTokenUsage: Tool = {
     name: 'GetTokenUsage',
     description:
-        "Aggregate AI token usage from stat_entries. Useful when the user asks 'how many tokens did I burn today / this week', " +
-        "or for self-reflection on cost. Supports scope=me|global and period=today|week|month|all. " +
-        "Returns input/output/total token counts, request count, per-purpose breakdown (e.g. 'reply', 'sticker_picker', 'vision_sticker', 'suggest_expressions'), " +
-        "and (for week/month/all) per-day series. " +
+        "Aggregate AI token usage and estimated USD cost from stat_entries. Useful when the user asks " +
+        "'how many tokens did I burn today / this week' or 'how much did that cost'. " +
+        "Supports scope=me|global, period=today|week|month|all, and an optional model filter. " +
+        "Returns input/output/total tokens, USD cost, request count, breakdown by purpose " +
+        "(e.g. 'reply', 'sticker_picker', 'vision_sticker', 'suggest_expressions'), breakdown by model " +
+        "(with a `priced` flag — false means we don't have a price for that model so cost contribution is 0), " +
+        "and (for week/month/all) a per-day series. " +
         "For visualizations, use GenerateStatChart({name:'ai_tokens_in', period:'week'}) or 'ai_tokens_out'.",
     parameters: {
         type: 'object',
@@ -41,9 +44,13 @@ export const GetTokenUsage: Tool = {
                 enum: ['today', 'week', 'month', 'all'],
                 description: "Time window. Default 'today'. 'week' = last 7 days, 'month' = last 30 days, 'all' = since the bot started recording.",
             },
+            model: {
+                type: 'string',
+                description: "Optional model id filter (e.g. 'claude-sonnet-4-5-20250929', 'claude-haiku-4-5-20251001'). When set, restricts the aggregation to rows recorded with that exact model id. Omit to include all models.",
+            },
         },
     },
-    execute: async (args: {userId: number; scope?: string; period?: string}) => {
+    execute: async (args: {userId: number; scope?: string; period?: string; model?: string}) => {
         const scope: TokenUsageScope = args.scope === 'global' ? 'global' : 'me';
         const period = args.period ?? 'today';
         let range: { from: Date; to: Date; label: string };
@@ -52,22 +59,28 @@ export const GetTokenUsage: Tool = {
         } catch (err) {
             return {success: false, message: err instanceof Error ? err.message : String(err)};
         }
+        // Trim+empty-coerce so an AI calling with `model: ""` doesn't filter on the empty string.
+        const modelFilter = typeof args.model === 'string' && args.model.trim() ? args.model.trim() : undefined;
         const report = getTokenUsageStats({
             scope,
             userId: scope === 'me' ? args.userId : undefined,
             from: range.from,
             to: range.to,
+            model: modelFilter,
         });
         return {
             success: true,
             scope,
             period,
             period_label: range.label,
+            model_filter: report.model_filter,
             input_tokens: report.input_tokens,
             output_tokens: report.output_tokens,
             total_tokens: report.total_tokens,
+            cost_usd: Number(report.cost_usd.toFixed(4)),
             request_count: report.request_count,
             by_purpose: report.by_purpose,
+            by_model: report.by_model,
             // by_day only useful for multi-day periods
             ...(period === 'today' ? {} : {by_day: report.by_day}),
         };

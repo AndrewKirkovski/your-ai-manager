@@ -42,6 +42,9 @@
             </div>
         </div>
 
+        <!-- Token Usage (global, independent of user selection) -->
+        <div id="tokenUsage" class="mb-6"></div>
+
         <!-- Content -->
         <div id="content" class="space-y-6">
             <p class="text-dark-muted">Select a user to view data</p>
@@ -50,6 +53,7 @@
 
     <script>
         let currentUser = null;
+        let tokenState = { scope: 'global', days: 7, model: '', knownModels: [] };
 
         // Load users on page load
         async function loadUsers() {
@@ -67,6 +71,278 @@
             } catch (e) {
                 console.error('Failed to load users:', e);
             }
+        }
+
+        // ── Token usage ─────────────────────────────────────────────────────
+
+        function fmt(n) {
+            if (n == null) return '0';
+            return Number(n).toLocaleString();
+        }
+
+        function fmtUsd(n) {
+            if (n == null || !Number.isFinite(n)) return '$0.00';
+            // 4 decimals when sub-cent so small amounts don't all collapse to $0.00
+            const abs = Math.abs(n);
+            const decimals = abs > 0 && abs < 0.01 ? 4 : 2;
+            return '$' + Number(n).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+        }
+
+        function tokenScopeBaseParams() {
+            const userId = document.getElementById('userSelect').value;
+            if (tokenState.scope === 'me' && !userId) tokenState.scope = 'global';
+            const params = new URLSearchParams({
+                scope: tokenState.scope,
+                days: String(tokenState.days),
+            });
+            if (tokenState.scope === 'me') params.set('user_id', userId);
+            return params;
+        }
+
+        async function loadKnownModels() {
+            const params = tokenScopeBaseParams();
+            try {
+                const res = await fetch(`/api/token-usage/models?${params}`);
+                if (!res.ok) return;
+                const data = await res.json();
+                if (Array.isArray(data.models)) tokenState.knownModels = data.models;
+            } catch (e) {
+                console.error('Failed to load token-usage model list:', e);
+            }
+        }
+
+        async function loadTokenUsage() {
+            const params = tokenScopeBaseParams();
+            if (tokenState.model) params.set('model', tokenState.model);
+            try {
+                const res = await fetch(`/api/token-usage?${params}`);
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    renderTokenUsage(null, err.error || `HTTP ${res.status}`);
+                    return;
+                }
+                const report = await res.json();
+                // Only refresh the dropdown when no model filter is active — otherwise
+                // by_model would only contain the filtered model and the dropdown would
+                // collapse to one option.
+                if (!tokenState.model) {
+                    const seen = new Set([
+                        ...Object.keys(report.by_model || {}),
+                        ...tokenState.knownModels,
+                    ]);
+                    seen.delete('unknown');
+                    tokenState.knownModels = [...seen].sort();
+                    if (Object.keys(report.by_model || {}).includes('unknown')) {
+                        tokenState.knownModels.push('unknown');
+                    }
+                }
+                renderTokenUsage(report, null);
+            } catch (e) {
+                console.error('Failed to load token usage:', e);
+                renderTokenUsage(null, e.message || 'fetch failed');
+            }
+        }
+
+        function renderTokenUsage(report, errMsg) {
+            const userId = document.getElementById('userSelect').value;
+            const periods = [
+                { label: 'Today', days: 1 },
+                { label: '7d', days: 7 },
+                { label: '30d', days: 30 },
+                { label: '1y', days: 365 },
+            ];
+            const periodBtns = periods.map(p => `
+                <button onclick="setTokenPeriod(${p.days})"
+                    class="px-3 py-1 rounded text-xs ${tokenState.days === p.days ? 'bg-blue-600' : 'bg-dark-bg border border-dark-border hover:bg-dark-border'}">
+                    ${p.label}
+                </button>
+            `).join('');
+
+            const scopeBtns = `
+                <button onclick="setTokenScope('global')"
+                    class="px-3 py-1 rounded text-xs ${tokenState.scope === 'global' ? 'bg-blue-600' : 'bg-dark-bg border border-dark-border hover:bg-dark-border'}">
+                    Global
+                </button>
+                <button onclick="setTokenScope('me')"
+                    ${userId ? '' : 'disabled'}
+                    class="px-3 py-1 rounded text-xs ${tokenState.scope === 'me' ? 'bg-blue-600' : 'bg-dark-bg border border-dark-border hover:bg-dark-border'} ${userId ? '' : 'opacity-50 cursor-not-allowed'}">
+                    User${userId ? ` ${userId}` : ''}
+                </button>
+            `;
+
+            const modelOptions = ['<option value="">All models</option>']
+                .concat(tokenState.knownModels.map(m => `<option value="${escapeHtml(m)}" ${tokenState.model === m ? 'selected' : ''}>${escapeHtml(m)}</option>`))
+                .join('');
+            const modelSelect = `
+                <select onchange="setTokenModel(this.value)"
+                    class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs">
+                    ${modelOptions}
+                </select>
+            `;
+
+            let body;
+            if (errMsg) {
+                body = `<p class="text-red-400 text-sm">${escapeHtml(errMsg)}</p>`;
+            } else if (!report) {
+                body = `<p class="text-dark-muted text-sm">Loading…</p>`;
+            } else {
+                const purposeRows = Object.entries(report.by_purpose || {})
+                    .sort(([, a], [, b]) => (b.input + b.output) - (a.input + a.output))
+                    .map(([name, v]) => `
+                        <tr class="border-b border-dark-border">
+                            <td class="py-1 px-2 font-mono text-xs">${escapeHtml(name)}</td>
+                            <td class="py-1 px-2 text-right">${fmt(v.input)}</td>
+                            <td class="py-1 px-2 text-right">${fmt(v.output)}</td>
+                            <td class="py-1 px-2 text-right">${fmt(v.input + v.output)}</td>
+                            <td class="py-1 px-2 text-right text-green-400">${fmtUsd(v.cost_usd)}</td>
+                            <td class="py-1 px-2 text-right text-dark-muted">${fmt(v.count)}</td>
+                        </tr>
+                    `).join('');
+
+                const modelRows = Object.entries(report.by_model || {})
+                    .sort(([, a], [, b]) => (b.input + b.output) - (a.input + a.output))
+                    .map(([name, v]) => `
+                        <tr class="border-b border-dark-border">
+                            <td class="py-1 px-2 font-mono text-xs">
+                                ${escapeHtml(name)}
+                                ${v.priced ? '' : '<span class="ml-1 text-yellow-400 text-xs" title="No price entry in pricing.ts — cost = 0">⚠</span>'}
+                            </td>
+                            <td class="py-1 px-2 text-right">${fmt(v.input)}</td>
+                            <td class="py-1 px-2 text-right">${fmt(v.output)}</td>
+                            <td class="py-1 px-2 text-right">${fmt(v.input + v.output)}</td>
+                            <td class="py-1 px-2 text-right text-green-400">${fmtUsd(v.cost_usd)}</td>
+                            <td class="py-1 px-2 text-right text-dark-muted">${fmt(v.count)}</td>
+                        </tr>
+                    `).join('');
+
+                // Per-day bars: only meaningful for >1 day windows
+                let daySection = '';
+                if (tokenState.days > 1 && report.by_day && report.by_day.length) {
+                    const maxTotal = Math.max(1, ...report.by_day.map(d => d.input + d.output));
+                    const dayBars = report.by_day.map(d => {
+                        const total = d.input + d.output;
+                        const inPct = (d.input / maxTotal) * 100;
+                        const outPct = (d.output / maxTotal) * 100;
+                        return `
+                            <div class="flex items-center gap-2 text-xs">
+                                <span class="font-mono text-dark-muted w-20 shrink-0">${d.date}</span>
+                                <div class="flex-1 h-4 bg-dark-bg rounded overflow-hidden flex">
+                                    <div class="bg-blue-500" style="width:${inPct}%" title="in: ${fmt(d.input)}"></div>
+                                    <div class="bg-purple-500" style="width:${outPct}%" title="out: ${fmt(d.output)}"></div>
+                                </div>
+                                <span class="font-mono w-24 text-right shrink-0">${fmt(total)}</span>
+                                <span class="font-mono w-12 text-right text-dark-muted shrink-0">${fmt(d.count)}</span>
+                            </div>
+                        `;
+                    }).join('');
+                    daySection = `
+                        <div class="mt-4">
+                            <div class="text-xs text-dark-muted mb-2 flex items-center gap-3">
+                                <span>Per day</span>
+                                <span class="flex items-center gap-1"><span class="inline-block w-2 h-2 bg-blue-500 rounded"></span>input</span>
+                                <span class="flex items-center gap-1"><span class="inline-block w-2 h-2 bg-purple-500 rounded"></span>output</span>
+                            </div>
+                            <div class="space-y-1">${dayBars}</div>
+                        </div>
+                    `;
+                }
+
+                body = `
+                    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 mb-4">
+                        <div class="bg-dark-bg rounded p-3">
+                            <div class="text-xs text-dark-muted">Input</div>
+                            <div class="text-lg font-semibold text-blue-400">${fmt(report.input_tokens)}</div>
+                        </div>
+                        <div class="bg-dark-bg rounded p-3">
+                            <div class="text-xs text-dark-muted">Output</div>
+                            <div class="text-lg font-semibold text-purple-400">${fmt(report.output_tokens)}</div>
+                        </div>
+                        <div class="bg-dark-bg rounded p-3">
+                            <div class="text-xs text-dark-muted">Total</div>
+                            <div class="text-lg font-semibold">${fmt(report.total_tokens)}</div>
+                        </div>
+                        <div class="bg-dark-bg rounded p-3">
+                            <div class="text-xs text-dark-muted">Cost (≈)</div>
+                            <div class="text-lg font-semibold text-green-400">${fmtUsd(report.cost_usd)}</div>
+                        </div>
+                        <div class="bg-dark-bg rounded p-3">
+                            <div class="text-xs text-dark-muted">Requests</div>
+                            <div class="text-lg font-semibold">${fmt(report.request_count)}</div>
+                        </div>
+                    </div>
+                    ${purposeRows ? `
+                        <div class="overflow-x-auto mb-4">
+                            <div class="text-xs text-dark-muted mb-1">By purpose</div>
+                            <table class="w-full text-sm">
+                                <thead>
+                                    <tr class="text-left text-dark-muted border-b border-dark-border">
+                                        <th class="py-1 px-2">Purpose</th>
+                                        <th class="py-1 px-2 text-right">Input</th>
+                                        <th class="py-1 px-2 text-right">Output</th>
+                                        <th class="py-1 px-2 text-right">Total</th>
+                                        <th class="py-1 px-2 text-right w-24">Cost</th>
+                                        <th class="py-1 px-2 text-right w-16">Reqs</th>
+                                    </tr>
+                                </thead>
+                                <tbody>${purposeRows}</tbody>
+                            </table>
+                        </div>
+                    ` : '<p class="text-dark-muted text-sm">No token usage in this window.</p>'}
+                    ${modelRows ? `
+                        <div class="overflow-x-auto">
+                            <div class="text-xs text-dark-muted mb-1">By model <span class="text-yellow-400">⚠</span> = unpriced (no entry in pricing.ts)</div>
+                            <table class="w-full text-sm">
+                                <thead>
+                                    <tr class="text-left text-dark-muted border-b border-dark-border">
+                                        <th class="py-1 px-2">Model</th>
+                                        <th class="py-1 px-2 text-right">Input</th>
+                                        <th class="py-1 px-2 text-right">Output</th>
+                                        <th class="py-1 px-2 text-right">Total</th>
+                                        <th class="py-1 px-2 text-right w-24">Cost</th>
+                                        <th class="py-1 px-2 text-right w-16">Reqs</th>
+                                    </tr>
+                                </thead>
+                                <tbody>${modelRows}</tbody>
+                            </table>
+                        </div>
+                    ` : ''}
+                    ${daySection}
+                `;
+            }
+
+            document.getElementById('tokenUsage').innerHTML = `
+                <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                    <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+                        <h2 class="text-lg font-semibold">🔥 Token Usage</h2>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <div class="flex gap-1">${scopeBtns}</div>
+                            <div class="flex gap-1">${periodBtns}</div>
+                            ${modelSelect}
+                        </div>
+                    </div>
+                    ${body}
+                </div>
+            `;
+        }
+
+        async function setTokenPeriod(days) {
+            tokenState.days = days;
+            // Period change can change which models exist in the window — refresh dropdown.
+            await loadKnownModels();
+            loadTokenUsage();
+        }
+
+        async function setTokenScope(scope) {
+            const userId = document.getElementById('userSelect').value;
+            if (scope === 'me' && !userId) return;
+            tokenState.scope = scope;
+            await loadKnownModels();
+            loadTokenUsage();
+        }
+
+        function setTokenModel(model) {
+            tokenState.model = model || '';
+            loadTokenUsage();
         }
 
         // Load user data
@@ -458,8 +734,14 @@
         }
 
         // Initialize
-        document.getElementById('userSelect').addEventListener('change', loadUserData);
+        document.getElementById('userSelect').addEventListener('change', async () => {
+            loadUserData();
+            // Scope-affecting change → refresh model list + token report.
+            await loadKnownModels();
+            loadTokenUsage();
+        });
         loadUsers();
+        loadKnownModels().then(loadTokenUsage);
     </script>
 </body>
 </html>

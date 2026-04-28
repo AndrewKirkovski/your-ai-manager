@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import type TelegramBot from 'node-telegram-bot-api';
-import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount, getTokenUsageStats, type TokenUsageScope } from './userStore';
+import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount, getTokenUsageStats, getDistinctTokenModels, type TokenUsageScope } from './userStore';
 import { textify, stripSystemTags, safeSend } from './telegramFormat';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -107,9 +107,10 @@ app.get('/api/users/:id', async (req: Request, res: Response) => {
 });
 
 // GET /api/token-usage - aggregated AI token usage stats
-//   ?scope=me|global|system  (default 'global'; 'me' requires user_id query param)
+//   ?scope=me|global         (default 'global'; 'me' requires user_id query param)
 //   ?user_id=N               (required when scope='me')
 //   ?days=N                  (default 30; window of last N days ending now)
+//   ?model=<id>              (optional; filter to a single model id)
 app.get('/api/token-usage', async (req: Request, res: Response) => {
     try {
         const scopeRaw = (typeof req.query.scope === 'string' ? req.query.scope : 'global');
@@ -121,16 +122,45 @@ app.get('/api/token-usage', async (req: Request, res: Response) => {
         const days = Math.max(1, Math.min(365, parseInt(typeof req.query.days === 'string' ? req.query.days : '30', 10) || 30));
         const to = new Date();
         const from = new Date(to.getTime() - days * 86400000);
+        const model = typeof req.query.model === 'string' && req.query.model.trim() ? req.query.model.trim() : undefined;
         const report = getTokenUsageStats({
             scope,
             userId: scope === 'me' ? userIdRaw : undefined,
             from,
             to,
+            model,
         });
         res.json(report);
     } catch (error) {
         console.error('Error fetching token usage:', error);
         res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to fetch token usage' });
+    }
+});
+
+// GET /api/token-usage/models - distinct model ids that appear in the period.
+// Used by the dashboard to populate the model filter dropdown without forcing
+// the caller to fetch the full report.
+app.get('/api/token-usage/models', async (req: Request, res: Response) => {
+    try {
+        const scopeRaw = (typeof req.query.scope === 'string' ? req.query.scope : 'global');
+        const scope: TokenUsageScope = (scopeRaw === 'me' || scopeRaw === 'global') ? scopeRaw : 'global';
+        const userIdRaw = typeof req.query.user_id === 'string' ? parseInt(req.query.user_id, 10) : undefined;
+        if (scope === 'me' && (userIdRaw === undefined || !Number.isFinite(userIdRaw))) {
+            return res.status(400).json({ error: "scope='me' requires user_id query param" });
+        }
+        const days = Math.max(1, Math.min(365, parseInt(typeof req.query.days === 'string' ? req.query.days : '30', 10) || 30));
+        const to = new Date();
+        const from = new Date(to.getTime() - days * 86400000);
+        const models = getDistinctTokenModels({
+            scope,
+            userId: scope === 'me' ? userIdRaw : undefined,
+            from,
+            to,
+        });
+        res.json({ models });
+    } catch (error) {
+        console.error('Error fetching token-usage models:', error);
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to fetch token-usage models' });
     }
 });
 

@@ -135,10 +135,10 @@ export const __TEST_ONLY__ = { cleanStickerDescription, parseStickerDescription 
 /** Record token usage from a Vision response. Attributed to the user whose
  * incoming message triggered the analysis. recordAITokens double-writes to
  * the user AND user_id=0 (denormalized global). Fire-and-forget. */
-function recordVisionUsage(response: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string, userId: number): void {
+function recordVisionUsage(response: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string, userId: number, model: string): void {
     const u = response.usage;
     if (!u) return;
-    void recordAITokens(userId, u.prompt_tokens ?? 0, u.completion_tokens ?? 0, purpose);
+    void recordAITokens(userId, u.prompt_tokens ?? 0, u.completion_tokens ?? 0, purpose, model);
 }
 
 // ============== MAIN CLASS ==============
@@ -400,7 +400,7 @@ export class MediaParser {
             }],
             max_tokens: maxTokens ?? this.maxImageTokens
         });
-        recordVisionUsage(response, purpose, userId);
+        recordVisionUsage(response, purpose, userId, this.visionModel);
         return response.choices[0]?.message?.content || 'Unable to analyze image';
     }
 
@@ -704,7 +704,7 @@ export class MediaParser {
             }],
             max_tokens: this.maxStickerTokens,
         });
-        recordVisionUsage(response, 'vision_sticker', userId);
+        recordVisionUsage(response, 'vision_sticker', userId, this.visionModel);
         return response.choices[0]?.message?.content || 'Unable to analyze sticker';
     }
 
@@ -731,7 +731,7 @@ export class MediaParser {
             }],
             max_tokens: Math.max(this.maxStickerTokens, 350),
         });
-        recordVisionUsage(response, isVideo ? 'vision_video_sticker' : 'vision_animated_sticker', userId);
+        recordVisionUsage(response, isVideo ? 'vision_video_sticker' : 'vision_animated_sticker', userId, this.visionModel);
         return response.choices[0]?.message?.content || 'Unable to analyze animated sticker';
     }
 

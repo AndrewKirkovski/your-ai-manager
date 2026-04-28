@@ -1,5 +1,6 @@
 import db from './database';
 import {DateTime} from 'luxon';
+import {estimateCostUsd, pricingFor} from './pricing';
 
 // Generate shorter IDs (8 characters)
 function generateShortId(): string {
@@ -153,6 +154,7 @@ interface StatRow {
     unit: string | null;
     note: string | null;
     timestamp: string;
+    model: string | null;
 }
 
 interface StatNameRow {
@@ -306,7 +308,7 @@ const stmts = {
     getStickerCacheByIds: db.prepare<[string], StickerCacheRow>('SELECT * FROM sticker_cache WHERE cache_key = ?'),
 
     // Stat Entries
-    insertStat: db.prepare('INSERT INTO stat_entries (user_id, name, value, unit, note, timestamp) VALUES (?, ?, ?, ?, ?, ?)'),
+    insertStat: db.prepare('INSERT INTO stat_entries (user_id, name, value, unit, note, timestamp, model) VALUES (?, ?, ?, ?, ?, ?, ?)'),
     getStatEntries: db.prepare<[number, string, string, string], StatRow>('SELECT * FROM stat_entries WHERE user_id = ? AND name = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC'),
     getStatById: db.prepare<[number, number], StatRow>('SELECT * FROM stat_entries WHERE user_id = ? AND id = ?'),
     getStatNames: db.prepare<[number], StatNameRow>('SELECT DISTINCT name, unit FROM stat_entries WHERE user_id = ?'),
@@ -832,8 +834,8 @@ export function normalizeStatName(name: string): string {
     return name.trim().toLowerCase().replace(/\s+/g, '_');
 }
 
-export async function addStatEntry(userId: number, name: string, value: number, unit?: string, note?: string, timestamp?: Date): Promise<number> {
-    const result = stmts.insertStat.run(userId, normalizeStatName(name), value, unit ?? null, note ?? null, (timestamp ?? new Date()).toISOString());
+export async function addStatEntry(userId: number, name: string, value: number, unit?: string, note?: string, timestamp?: Date, model?: string): Promise<number> {
+    const result = stmts.insertStat.run(userId, normalizeStatName(name), value, unit ?? null, note ?? null, (timestamp ?? new Date()).toISOString(), model ?? null);
     return Number(result.lastInsertRowid);
 }
 
@@ -841,7 +843,7 @@ export type StatEntry = { id: number; name: string; value: number; unit?: string
 
 export async function addStatEntriesBatch(
     userId: number,
-    entries: Array<{ name: string; value: number; unit?: string; note?: string; timestamp?: Date }>
+    entries: Array<{ name: string; value: number; unit?: string; note?: string; timestamp?: Date; model?: string }>
 ): Promise<Array<{ id: number; timestamp: string }>> {
     const inserted: Array<{ id: number; timestamp: string }> = [];
     const tx = db.transaction(() => {
@@ -853,7 +855,8 @@ export async function addStatEntriesBatch(
                 e.value,
                 e.unit ?? null,
                 e.note ?? null,
-                ts
+                ts,
+                e.model ?? null
             );
             inserted.push({ id: Number(result.lastInsertRowid), timestamp: ts });
         }
@@ -966,22 +969,27 @@ export async function getTodayStats(userId: number, timezone?: string): Promise<
  * always pass a real userId. The user_id=0 row is the global aggregate view that
  * lets queries skip per-user SUMs.
  *
+ * `model` is the Anthropic model id (e.g. 'claude-sonnet-4-5-20250929'). Stored
+ * on the row so cost can be computed at read time using pricing.ts. Required —
+ * an empty string is allowed but will leave the row "unpriced".
+ *
  * Fire-and-forget: failures never block the AI path.
  * No-op if both token counts are 0. */
-export async function recordAITokens(userId: number, inputTokens: number, outputTokens: number, purpose: string): Promise<void> {
+export async function recordAITokens(userId: number, inputTokens: number, outputTokens: number, purpose: string, model: string): Promise<void> {
+    const m = model || undefined;
     if (inputTokens > 0) {
-        addStatEntry(userId, 'ai_tokens_in', inputTokens, undefined, purpose).catch(err =>
+        addStatEntry(userId, 'ai_tokens_in', inputTokens, undefined, purpose, undefined, m).catch(err =>
             console.warn('[token-stat] in (per-user) failed:', err instanceof Error ? err.message : err));
         if (userId !== 0) {
-            addStatEntry(0, 'ai_tokens_in', inputTokens, undefined, purpose).catch(err =>
+            addStatEntry(0, 'ai_tokens_in', inputTokens, undefined, purpose, undefined, m).catch(err =>
                 console.warn('[token-stat] in (global) failed:', err instanceof Error ? err.message : err));
         }
     }
     if (outputTokens > 0) {
-        addStatEntry(userId, 'ai_tokens_out', outputTokens, undefined, purpose).catch(err =>
+        addStatEntry(userId, 'ai_tokens_out', outputTokens, undefined, purpose, undefined, m).catch(err =>
             console.warn('[token-stat] out (per-user) failed:', err instanceof Error ? err.message : err));
         if (userId !== 0) {
-            addStatEntry(0, 'ai_tokens_out', outputTokens, undefined, purpose).catch(err =>
+            addStatEntry(0, 'ai_tokens_out', outputTokens, undefined, purpose, undefined, m).catch(err =>
                 console.warn('[token-stat] out (global) failed:', err instanceof Error ? err.message : err));
         }
     }
@@ -989,26 +997,33 @@ export async function recordAITokens(userId: number, inputTokens: number, output
 
 export type TokenUsageScope = 'me' | 'global';
 
+export type TokenBucket = { input: number; output: number; count: number; cost_usd: number };
+export type TokenModelBucket = TokenBucket & { priced: boolean };
+
 export type TokenUsageReport = {
     scope: TokenUsageScope;
     user_id?: number;
     date_from: string;
     date_to: string;
+    model_filter?: string;
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
+    cost_usd: number;
     request_count: number;
-    by_purpose: Record<string, { input: number; output: number; count: number }>;
-    by_day: Array<{ date: string; input: number; output: number; count: number }>;
+    by_purpose: Record<string, TokenBucket>;
+    by_model: Record<string, TokenModelBucket>;
+    by_day: Array<{ date: string; input: number; output: number; count: number; cost_usd: number }>;
 };
 
 /** Aggregate ai_tokens_in / ai_tokens_out from stat_entries for a scope + date range.
- * Returns totals, per-purpose breakdown (from `note` column), and per-day series. */
+ * Returns totals, per-purpose, per-model, and per-day series with USD cost. */
 export function getTokenUsageStats(filter: {
     scope: TokenUsageScope;
     userId?: number;          // required if scope='me'
     from: Date;
     to: Date;
+    model?: string;           // optional model filter; '' or undefined → all models
 }): TokenUsageReport {
     // user_id=0 holds the denormalized global total (every per-user write also writes to 0).
     // 'me'     → filter to the specific user.
@@ -1024,15 +1039,27 @@ export function getTokenUsageStats(filter: {
         userClause = 'AND user_id = 0';
     }
 
+    // 'unknown' is the bucket name we surface for NULL-model rows in by_model and
+    // in getDistinctTokenModels(). When the dashboard or AI tool filters to that
+    // sentinel, translate it to `model IS NULL` so legacy rows are reachable.
+    // Any other value goes through as a literal equality match.
+    let modelClause = '';
+    if (filter.model === 'unknown') {
+        modelClause = 'AND model IS NULL';
+    } else if (filter.model) {
+        modelClause = 'AND model = ?';
+        params.push(filter.model);
+    }
+
     const fromIso = filter.from.toISOString();
     const toIso = filter.to.toISOString();
 
-    type Row = { name: string; note: string | null; day: string; total: number; cnt: number };
+    type Row = { name: string; note: string | null; model: string | null; day: string; total: number; cnt: number };
     const rows = db.prepare<unknown[], Row>(
-        `SELECT name, note, substr(timestamp, 1, 10) AS day, SUM(value) AS total, COUNT(*) AS cnt
+        `SELECT name, note, model, substr(timestamp, 1, 10) AS day, SUM(value) AS total, COUNT(*) AS cnt
          FROM stat_entries
-         WHERE name IN ('ai_tokens_in','ai_tokens_out') AND timestamp >= ? AND timestamp <= ? ${userClause}
-         GROUP BY name, note, day
+         WHERE name IN ('ai_tokens_in','ai_tokens_out') AND timestamp >= ? AND timestamp <= ? ${userClause} ${modelClause}
+         GROUP BY name, note, model, day
          ORDER BY day ASC`
     ).all(fromIso, toIso, ...params);
 
@@ -1041,19 +1068,23 @@ export function getTokenUsageStats(filter: {
         user_id: filter.scope === 'me' ? filter.userId : undefined,
         date_from: fromIso,
         date_to: toIso,
+        model_filter: filter.model || undefined,
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
+        cost_usd: 0,
         request_count: 0,
         by_purpose: {},
+        by_model: {},
         by_day: [],
     };
 
-    const dayMap = new Map<string, { input: number; output: number; count: number }>();
-    const purposeMap = new Map<string, { input: number; output: number; count: number }>();
+    const dayMap = new Map<string, { input: number; output: number; count: number; cost_usd: number }>();
+    const purposeMap = new Map<string, TokenBucket>();
+    const modelMap = new Map<string, TokenModelBucket>();
 
-    // Track count by (purpose, day) and pick MAX(in_count, out_count) so two stat rows per AI call don't double-count.
-    type CountKey = string; // `${purpose}|${day}`
+    // Track count by (purpose, model, day) and pick MAX(in_count, out_count) so two stat rows per AI call don't double-count.
+    type CountKey = string; // `${purpose}|${model}|${day}`
     const inCount = new Map<CountKey, number>();
     const outCount = new Map<CountKey, number>();
 
@@ -1061,45 +1092,85 @@ export function getTokenUsageStats(filter: {
         const isIn = r.name === 'ai_tokens_in';
         const purpose = r.note || 'unknown';
         const day = r.day;
+        const modelKey = r.model || 'unknown';
+        const cost = estimateCostUsd(r.model, isIn ? r.total : 0, isIn ? 0 : r.total);
 
         if (isIn) report.input_tokens += r.total;
         else report.output_tokens += r.total;
+        report.cost_usd += cost;
 
         // by_day
         let d = dayMap.get(day);
-        if (!d) { d = { input: 0, output: 0, count: 0 }; dayMap.set(day, d); }
+        if (!d) { d = { input: 0, output: 0, count: 0, cost_usd: 0 }; dayMap.set(day, d); }
         if (isIn) d.input += r.total; else d.output += r.total;
+        d.cost_usd += cost;
 
         // by_purpose
         let p = purposeMap.get(purpose);
-        if (!p) { p = { input: 0, output: 0, count: 0 }; purposeMap.set(purpose, p); }
+        if (!p) { p = { input: 0, output: 0, count: 0, cost_usd: 0 }; purposeMap.set(purpose, p); }
         if (isIn) p.input += r.total; else p.output += r.total;
+        p.cost_usd += cost;
+
+        // by_model
+        let m = modelMap.get(modelKey);
+        if (!m) { m = { input: 0, output: 0, count: 0, cost_usd: 0, priced: pricingFor(r.model) !== null }; modelMap.set(modelKey, m); }
+        if (isIn) m.input += r.total; else m.output += r.total;
+        m.cost_usd += cost;
 
         // request count tracking
-        const ck: CountKey = `${purpose}|${day}`;
+        const ck: CountKey = `${purpose}|${modelKey}|${day}`;
         if (isIn) inCount.set(ck, (inCount.get(ck) ?? 0) + r.cnt);
         else outCount.set(ck, (outCount.get(ck) ?? 0) + r.cnt);
     }
 
-    // Reconcile per-day and per-purpose request counts: max(in, out) per (purpose, day) bucket
+    // Reconcile per-day, per-purpose, and per-model request counts: max(in, out) per bucket.
     const allCountKeys = new Set([...inCount.keys(), ...outCount.keys()]);
     for (const ck of allCountKeys) {
-        const [purpose, day] = ck.split('|');
+        const [purpose, modelKey, day] = ck.split('|');
         const reqs = Math.max(inCount.get(ck) ?? 0, outCount.get(ck) ?? 0);
         report.request_count += reqs;
         const d = dayMap.get(day);
         if (d) d.count += reqs;
         const p = purposeMap.get(purpose);
         if (p) p.count += reqs;
+        const m = modelMap.get(modelKey);
+        if (m) m.count += reqs;
     }
 
     report.total_tokens = report.input_tokens + report.output_tokens;
     report.by_purpose = Object.fromEntries(purposeMap);
+    report.by_model = Object.fromEntries(modelMap);
     report.by_day = [...dayMap.entries()]
         .sort(([a], [b]) => a.localeCompare(b))
-        .map(([date, v]) => ({ date, input: v.input, output: v.output, count: v.count }));
+        .map(([date, v]) => ({ date, input: v.input, output: v.output, count: v.count, cost_usd: v.cost_usd }));
 
     return report;
+}
+
+/** Distinct model ids that appear on token stat rows in the given period.
+ * Used by the dashboard to populate the model filter dropdown without forcing
+ * the caller to fetch the full report. */
+export function getDistinctTokenModels(filter: {
+    scope: TokenUsageScope;
+    userId?: number;
+    from: Date;
+    to: Date;
+}): string[] {
+    let userClause = '';
+    const params: unknown[] = [];
+    if (filter.scope === 'me') {
+        if (filter.userId == null) throw new Error("getDistinctTokenModels: userId required for scope='me'");
+        userClause = 'AND user_id = ?';
+        params.push(filter.userId);
+    } else {
+        userClause = 'AND user_id = 0';
+    }
+    const rows = db.prepare<unknown[], { model: string | null }>(
+        `SELECT DISTINCT model FROM stat_entries
+         WHERE name IN ('ai_tokens_in','ai_tokens_out') AND timestamp >= ? AND timestamp <= ? ${userClause}
+         ORDER BY model ASC`
+    ).all(filter.from.toISOString(), filter.to.toISOString(), ...params);
+    return rows.map(r => r.model || 'unknown');
 }
 
 // ============== LUXMED FUNCTIONS ==============

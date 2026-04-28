@@ -54,7 +54,7 @@ async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEnt
             messages: [{role: 'user', content: prompt}],
             max_tokens: 10,
         });
-        recordLookupUsage(resp, 'sticker_picker', userId);
+        recordLookupUsage(resp, 'sticker_picker', userId, lookupModel);
         const raw = resp.choices[0]?.message?.content?.trim() ?? '';
         const idx = parseInt(raw.match(/\d+/)?.[0] ?? '', 10);
         if (Number.isFinite(idx) && idx >= 1 && idx <= candidates.length) {
@@ -69,10 +69,10 @@ async function pickStickerByVibe(vibe_query: string, candidates: StickerCacheEnt
 
 /** Record token usage from a Haiku lookup-model call. Attributed to the user the
  * AI is currently replying to. recordAITokens double-writes per-user + global. */
-function recordLookupUsage(resp: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string, userId: number): void {
+function recordLookupUsage(resp: { usage?: { prompt_tokens?: number; completion_tokens?: number } }, purpose: string, userId: number, model: string): void {
     const u = resp.usage;
     if (!u) return;
-    void recordAITokens(userId, u.prompt_tokens ?? 0, u.completion_tokens ?? 0, purpose);
+    void recordAITokens(userId, u.prompt_tokens ?? 0, u.completion_tokens ?? 0, purpose, model);
 }
 
 const KIND_VALUES: StickerCacheKind[] = ['sticker', 'animated_sticker', 'video_sticker', 'custom_emoji'];
@@ -352,7 +352,7 @@ export const SuggestExpressions: Tool = {
                 messages: [{role: 'user', content: prompt}],
                 max_tokens: Math.max(50, intents.length * 25),
             });
-            recordLookupUsage(resp, 'suggest_expressions', args.userId);
+            recordLookupUsage(resp, 'suggest_expressions', args.userId, lookupModel);
             const raw = resp.choices[0]?.message?.content?.trim() ?? '';
 
             const out: Record<string, Array<{cache_key: string; kind: string; emoji: string; short_tag: string; snippet: string}>> = {};

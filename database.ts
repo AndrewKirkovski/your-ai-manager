@@ -72,6 +72,44 @@ db.prepare(
     }
 }
 
+// --- One-shot backfill of stat_entries.model for AI token rows ---
+// The `model` column was added 2026-04-28. Token rows written before that date
+// have model=NULL. Backfill them by mapping the `note` (purpose) column to the
+// model that the corresponding code path would use today (read from env). This
+// is best-effort: if the user changed OPENAI_MODEL/VISION_MODEL recently, the
+// backfill will mis-attribute history. We only update model IS NULL rows so it
+// remains idempotent across restarts.
+{
+    const replyModel = process.env.OPENAI_MODEL || '';
+    const visionModel = process.env.VISION_MODEL || replyModel;
+    const lookupModel = 'claude-haiku-4-5-20251001';
+    const mapping: Array<{ purposes: string[]; model: string }> = [
+        { purposes: ['reply'], model: replyModel },
+        { purposes: ['vision_photo', 'vision_sticker', 'vision_animated_sticker', 'vision_video_sticker'], model: visionModel },
+        { purposes: ['sticker_picker', 'suggest_expressions'], model: lookupModel },
+    ];
+    const updateStmt = db.prepare(
+        `UPDATE stat_entries SET model = ?
+         WHERE name IN ('ai_tokens_in','ai_tokens_out')
+           AND model IS NULL
+           AND note = ?`
+    );
+    let totalUpdated = 0;
+    const tx = db.transaction(() => {
+        for (const { purposes, model } of mapping) {
+            if (!model) continue;
+            for (const p of purposes) {
+                const r = updateStmt.run(model, p);
+                totalUpdated += r.changes;
+            }
+        }
+    });
+    tx();
+    if (totalUpdated > 0) {
+        console.log(`[migrate] Backfilled stat_entries.model for ${totalUpdated} legacy token rows`);
+    }
+}
+
 {
     type ClinicRow = { id: number; name: string; lat: number | null; lng: number | null; geocoded_at: string | null };
     const mixedClinics = db.prepare(
