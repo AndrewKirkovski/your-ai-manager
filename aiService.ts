@@ -502,6 +502,12 @@ export class AIService {
                         ? safeAssistantContent.substring(0, 100) + '...'
                         : safeAssistantContent;
                     console.log(`📝 Added assistant message to history: "${preview.replace(/\n/g, ' ')}"`);
+                } else {
+                    // Thinking-only completion — model emitted thinking blocks
+                    // but no text, no tool calls, no recursion. User sees
+                    // nothing in Telegram and history has no record. Surface
+                    // it so we can spot the pattern in production logs.
+                    console.warn(`⚠️ AI emitted thinking-only response for ${userId} — no visible output, no history row written`);
                 }
             }
 

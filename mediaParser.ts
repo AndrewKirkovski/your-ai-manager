@@ -57,6 +57,12 @@ export interface MediaParserConfig {
     maxStickerTokens?: number;      // Default: 200
 }
 
+// Vision call timeout. The OpenAI SDK defaults to 10 minutes, which is far too
+// long when a single hung request blocks the per-user side-effects queue (and
+// therefore every coalesced reply) for that duration. 60s is generous for
+// vision — typical calls finish in 5-15s — but firmly bounds worst-case wedge.
+const VISION_TIMEOUT_MS = 60_000;
+
 // ============== STICKER DESCRIPTION PROMPTS + CLEANUP ==============
 
 /** Strict prompt for static-sticker Vision analysis. Optimized for compact output:
@@ -399,7 +405,7 @@ export class MediaParser {
                 ]
             }],
             max_tokens: maxTokens ?? this.maxImageTokens
-        });
+        }, { timeout: VISION_TIMEOUT_MS });
         recordVisionUsage(response, purpose, userId, this.visionModel);
         return response.choices[0]?.message?.content || 'Unable to analyze image';
     }
@@ -703,7 +709,7 @@ export class MediaParser {
                 ],
             }],
             max_tokens: this.maxStickerTokens,
-        });
+        }, { timeout: VISION_TIMEOUT_MS });
         recordVisionUsage(response, 'vision_sticker', userId, this.visionModel);
         return response.choices[0]?.message?.content || 'Unable to analyze sticker';
     }
@@ -730,7 +736,7 @@ export class MediaParser {
                 ],
             }],
             max_tokens: Math.max(this.maxStickerTokens, 350),
-        });
+        }, { timeout: VISION_TIMEOUT_MS });
         recordVisionUsage(response, isVideo ? 'vision_video_sticker' : 'vision_animated_sticker', userId, this.visionModel);
         return response.choices[0]?.message?.content || 'Unable to analyze animated sticker';
     }
