@@ -58,7 +58,14 @@ export class AnthropicProvider implements AIProvider {
             params.tool_choice = { type: 'auto' };
         }
 
-        const stream = await this.client.messages.create(params);
+        // Forward the AbortSignal from the burst-coalescing layer down to the
+        // SDK's underlying fetch. When the signal aborts, the for-await loop
+        // below throws AbortError; the try/finally still runs and closes the
+        // socket. Anthropic SDK reads `signal` from the second arg's options.
+        const stream = await this.client.messages.create(
+            params,
+            request.signal ? { signal: request.signal } : undefined,
+        );
 
         // Track tool call indices — Anthropic uses content_block index, we map to sequential tool index
         let toolIndex = -1;

@@ -54,6 +54,13 @@ export interface StreamRequest {
     tools?: ToolDefinition[];
     maxTokens: number;
     model: string;
+    /**
+     * Optional AbortSignal — when fired, the provider's underlying SDK aborts
+     * the in-flight stream and the for-await loop in the consumer throws an
+     * AbortError. Used by the burst-coalescing layer to soft-cancel a reply
+     * that hasn't yet streamed visible text.
+     */
+    signal?: AbortSignal;
 }
 
 export interface CompletionRequest {

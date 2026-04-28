@@ -57,8 +57,12 @@ export class OpenAIProvider implements AIProvider {
             }
         }
 
+        // Forward the burst-coalescer's AbortSignal to the SDK so an in-flight
+        // stream can be cancelled when a new user message arrives in the
+        // pre-text phase. OpenAI SDK accepts `signal` as a request-options field.
         const stream = await this.client.chat.completions.create(
-            requestOptions as unknown as OpenAI.ChatCompletionCreateParamsStreaming
+            requestOptions as unknown as OpenAI.ChatCompletionCreateParamsStreaming,
+            request.signal ? { signal: request.signal } : undefined,
         );
 
         let pendingDone = false;

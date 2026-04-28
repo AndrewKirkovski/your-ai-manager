@@ -32,7 +32,7 @@ import {
     getAllUserMemoryRecords,
     deleteUserMemory,
 } from "./userStore";
-import {addUserTask, generateShortId} from './userStore';
+import {addUserTask, generateShortId, addMessageToHistory} from './userStore';
 import {AIService} from './aiService';
 import {safeSend, stripSystemTags, textify} from './telegramFormat';
 import {runHistoryCompaction} from './historyCompaction';
@@ -76,20 +76,103 @@ function isAllowedUser(userId: number | undefined): boolean {
     return ALLOWED_USER_IDS.has(userId);
 }
 
-// Per-user serialization. Without this, double-tap voice messages or rapid text
-// bursts spawn parallel streams that race on history reads/writes (each sees
-// stale context and both call addMessageToHistory out of order). Queue per-user
-// so the second message waits for the first response to finish.
-const userQueues = new Map<number, Promise<void>>();
-function enqueuePerUser(userId: number, work: () => Promise<void>): Promise<void> {
-    const prev = userQueues.get(userId) ?? Promise.resolve();
+// Per-user serialization split into two concerns so a long Vision call on
+// message N doesn't block side-effect processing on message N+1, and so a
+// rapid burst of user messages produces ONE coalesced AI reply instead of N.
+//
+// 1. sideEffectsQueue — chains parseMedia + addMessageToHistory in arrival
+//    order so history rows land in the right sequence even if the AI reply
+//    is still streaming.
+// 2. aiReplyQueue — chains the actual streamAIResponse calls so two replies
+//    for the same user never run in parallel (would race on history reads).
+// 3. burstTimer + inFlightReply — debounce the AI reply 800ms after the last
+//    incoming message, and soft-abort an in-flight reply that hasn't yet
+//    streamed visible text to Telegram.
+const sideEffectsQueues = new Map<number, Promise<void>>();
+const aiReplyQueues = new Map<number, Promise<void>>();
+
+function enqueueChained(map: Map<number, Promise<void>>, userId: number, work: () => Promise<void>): Promise<void> {
+    const prev = map.get(userId) ?? Promise.resolve();
     const next = prev.catch(() => { /* swallow prior error so chain continues */ }).then(work);
-    userQueues.set(userId, next);
-    // Cleanup map entry when chain settles so it doesn't leak.
+    map.set(userId, next);
     next.finally(() => {
-        if (userQueues.get(userId) === next) userQueues.delete(userId);
+        if (map.get(userId) === next) map.delete(userId);
     });
     return next;
+}
+
+function enqueueSideEffects(userId: number, work: () => Promise<void>): Promise<void> {
+    return enqueueChained(sideEffectsQueues, userId, work);
+}
+
+// Back-compat alias for legacy call sites (cron, /command handlers). These
+// already produce single replies and don't need the burst-debounce — they
+// go straight onto the AI-reply queue.
+function enqueuePerUser(userId: number, work: () => Promise<void>): Promise<void> {
+    return enqueueChained(aiReplyQueues, userId, work);
+}
+
+// Burst-coalescing state per user.
+type InFlightReply = { controller: AbortController; hasStreamedText: boolean };
+const inFlightReplies = new Map<number, InFlightReply>();
+const burstTimers = new Map<number, NodeJS.Timeout>();
+const BURST_DEBOUNCE_MS = Math.max(0, parseInt(process.env.BURST_DEBOUNCE_MS ?? '800', 10) || 800);
+
+/** Schedule (or refresh) the per-user debounce timer that fires a single
+ * AI reply once `BURST_DEBOUNCE_MS` of silence elapses. Each new user message
+ * resets the timer; the firing schedules the reply onto `aiReplyQueues` so it
+ * still serializes behind any in-flight reply. */
+function refreshBurstTimer(userId: number): void {
+    const existing = burstTimers.get(userId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+        burstTimers.delete(userId);
+        void enqueuePerUser(userId, () => fireBurstReply(userId));
+    }, BURST_DEBOUNCE_MS);
+    burstTimers.set(userId, timer);
+}
+
+/** Soft-abort the current in-flight reply if it hasn't yet pushed visible text
+ * to Telegram. Called whenever a new user message arrives — gives us the
+ * "softly stop" behaviour the user asked for: pre-text phase aborts cleanly,
+ * post-text phase finishes naturally and the next coalesced reply addresses
+ * the new messages. */
+function softAbortIfPretext(userId: number): void {
+    const flight = inFlightReplies.get(userId);
+    if (flight && !flight.hasStreamedText) {
+        flight.controller.abort();
+        inFlightReplies.delete(userId);
+    }
+}
+
+async function fireBurstReply(userId: number): Promise<void> {
+    // Make sure every queued side-effect (parseMedia + history append) has
+    // landed before we fire the AI — otherwise the AI sees stale history.
+    const sideEffectsTail = sideEffectsQueues.get(userId);
+    if (sideEffectsTail) await sideEffectsTail.catch(() => {});
+
+    // If the timer fired but a new message arrived in the gap and reset the
+    // timer with a future fire-time, bail and let the new timer fire instead.
+    if (burstTimers.has(userId)) return;
+
+    const controller = new AbortController();
+    const flight: InFlightReply = { controller, hasStreamedText: false };
+    inFlightReplies.set(userId, flight);
+    try {
+        await replyToUser(userId, '', {
+            signal: controller.signal,
+            onTextStreamed: () => { flight.hasStreamedText = true; },
+            addUserToHistory: false, // history is already current — appended per-message in side-effects queue
+        });
+    } catch (err) {
+        if (controller.signal.aborted) {
+            console.log(`[burst] reply for ${userId} aborted (new burst arrived)`);
+            return;
+        }
+        throw err;
+    } finally {
+        if (inFlightReplies.get(userId) === flight) inFlightReplies.delete(userId);
+    }
 }
 
 // Wrapper for bot.onText handlers: auth gate + per-user serialization.
@@ -276,7 +359,11 @@ Today's stats: ${todayStatsStr}
     return Memory;
 }
 
-async function replyToUser(userId: number, userMessage: string): Promise<string> {
+async function replyToUser(
+    userId: number,
+    userMessage: string,
+    opts?: { signal?: AbortSignal; onTextStreamed?: () => void; addUserToHistory?: boolean }
+): Promise<string> {
     try {
         const user = await getUser(userId);
         if (!user) return 'Ошибка: пользователь не найден';
@@ -294,9 +381,11 @@ async function replyToUser(userId: number, userMessage: string): Promise<string>
             provider,
             model: OPEN_AI_MODEL,
             shouldUpdateTelegram: true,
-            addUserToHistory: true,
+            addUserToHistory: opts?.addUserToHistory ?? true,
             addAssistantToHistory: true,
             enableToolCalls: true,
+            signal: opts?.signal,
+            onTextStreamed: opts?.onTextStreamed,
             // Send images from search results as a gallery (not in history)
             onImageResults: async (images: string[]) => {
                 const imagesToSend = images.slice(0, 5); // Max 5 images in gallery
@@ -898,170 +987,167 @@ bot.onText(/\/help/, serialTextHandler(async (msg) => {
 
 
 // Handle regular messages (now with AI command processing AND media support)
-bot.on('message', async (msg) => {
+/** Process the side-effects of a single incoming message: custom-emoji
+ * resolution, media parsing (Vision, sticker analysis), photo cache, caption
+ * folding, and <system>-tag stripping. Returns the formatted content ready
+ * for history append, or null if the message should be ignored / handled
+ * specially (greeting on new user, unsupported type, fatal media error). */
+async function processIncomingMessage(
+    msg: TelegramBot.Message,
+    userId: number,
+): Promise<{ content: string; logIndicator: string } | null> {
+    // Resolve any custom (premium) emoji entities in the user's text/caption
+    // through the sticker_cache, so the AI sees descriptions of unfamiliar
+    // emojis instead of just unicode fallback chars.
+    const customEmojiBlock = await buildCustomEmojiContextBlock(msg, userId);
+
+    const mediaParser = getMediaParser();
+    const hasMedia = mediaParser.hasParseableMedia(msg);
+
+    let processedContent: string;
+    let logIndicator: string;
+
+    if (hasMedia) {
+        // Show typing indicator while processing media
+        await bot.sendChatAction(msg.chat.id, 'typing');
+
+        const parsed = await mediaParser.parseMedia(msg, userId);
+
+        if (parsed.error && !parsed.content) {
+            await safeSend(bot, msg.chat.id, 'Could not process this media. Please try sending text instead.');
+            return null;
+        }
+
+        processedContent = mediaParser.formatForAI(parsed);
+        logIndicator = mediaParser.getMediaIndicator(parsed);
+
+        // Cache photo for re-analysis via AnalyzeImage tool. Strip <system> at the
+        // write boundary so a user-supplied caption or vision-model description
+        // containing our prompt marker can't escape the wrapper when AnalyzeImage
+        // later surfaces this data back through tool results.
+        if (parsed.type === 'photo' && parsed.metadata?.fileId) {
+            await addImageToCache(userId, parsed.metadata.fileId,
+                msg.caption != null ? stripSystemTags(msg.caption) : undefined,
+                stripSystemTags(parsed.content));
+        }
+
+        if (msg.caption) {
+            processedContent = `${msg.caption}\n\n${processedContent}`;
+        }
+    } else if (msg.text) {
+        processedContent = msg.text;
+        logIndicator = '[Text]';
+    } else {
+        return null;
+    }
+
+    // Prepend custom-emoji descriptions (if any). Goes before stripSystemTags
+    // so any cached description containing a stray </system> is neutralized.
+    if (customEmojiBlock) {
+        processedContent = `${customEmojiBlock}\n\n${processedContent}`;
+    }
+
+    // Real-user-ingress trust boundary: strip <system> so a user typing
+    // `</system>evil<system>` can't escape our prompt wrappers. Bot-synthesized
+    // prompts (TASK_TRIGGERED_PROMPT, GREETING_PROMPT, …) bypass this — they
+    // INTENTIONALLY wrap in <system> and go directly to streamAIResponse.
+    processedContent = stripSystemTags(processedContent);
+
+    return { content: processedContent, logIndicator };
+}
+
+bot.on('message', (msg) => {
     const userId = msg.from?.id;
     if (!userId) return;
     if (!isAllowedUser(userId)) {
         console.warn(`[auth] Rejected message from non-allowlisted userId=${userId}`);
         return;
     }
+    // Commands have their own dispatch path (serialTextHandler) and bypass burst.
+    if (msg.text?.startsWith('/')) return;
 
-    // Serialize per user — rapid bursts otherwise spawn parallel streams
-    // that race on history reads/writes.
-    await enqueuePerUser(userId, async () => {
-    try {
-        // Skip commands - they have their own handlers
-        if (msg.text?.startsWith('/')) return;
+    // Acknowledge receipt with a typing action immediately so the user gets
+    // visual feedback during the 800ms debounce window (otherwise pure-text
+    // messages would feel unresponsive). Telegram auto-clears after ~5s.
+    bot.sendChatAction(msg.chat.id, 'typing').catch(() => { /* non-fatal */ });
 
-        // Resolve any custom (premium) emoji entities in the user's text/caption
-        // through the sticker_cache, so the AI sees descriptions of unfamiliar
-        // emojis instead of just unicode fallback chars.
-        const customEmojiBlock = await buildCustomEmojiContextBlock(msg, userId);
-
-        // Detect message type and parse content
-        const mediaParser = getMediaParser();
-        const hasMedia = mediaParser.hasParseableMedia(msg);
-
-        let processedContent: string;
-        let logIndicator: string;
-
-        if (hasMedia) {
-            // Show typing indicator while processing media
-            await bot.sendChatAction(msg.chat.id, 'typing');
-
-            // Parse the media
-            const parsed = await mediaParser.parseMedia(msg, userId);
-
-            if (parsed.error && !parsed.content) {
-                // Complete failure - notify user
-                await safeSend(
-                    bot,
-                    msg.chat.id,
-                    'Could not process this media. Please try sending text instead.'
-                );
+    // 1) Side-effects (parseMedia, history append) — chained per user so they
+    //    land in arrival order, but independent of any in-flight AI reply.
+    void enqueueSideEffects(userId, async () => {
+        try {
+            // New-user greeting: handled inline, fires immediately, no debounce.
+            // We dispatch from inside the side-effects queue so it serializes
+            // with any subsequent message processing for this brand-new user.
+            const existing = await getUser(userId);
+            if (!existing) {
+                console.log('👤 New user detected, creating profile:', {
+                    userId, chatId: msg.chat.id, timestamp: new Date().toISOString(),
+                });
+                await setUser({
+                    userId, chatId: msg.chat.id,
+                    preferences: { goal: '' },
+                    tasks: [], routines: [], memory: {}, messageHistory: [],
+                });
+                // Fire greeting immediately on the AI-reply queue (bypasses burst).
+                void enqueuePerUser(userId, () => AIService.streamAIResponse({
+                    userId,
+                    userMessage: GREETING_PROMPT,
+                    systemPromptCachePrefix: getSystemPrompt(),
+                    systemPrompt: '',
+                    bot, provider, model: OPEN_AI_MODEL,
+                    shouldUpdateTelegram: false,
+                    addUserToHistory: true,
+                    addAssistantToHistory: true,
+                    enableToolCalls: true,
+                }).then(() => {}));
                 return;
             }
 
-            // Format for AI conversation
-            processedContent = mediaParser.formatForAI(parsed);
-            logIndicator = mediaParser.getMediaIndicator(parsed);
+            // Ensure chatId and messageHistory are set
+            if (!existing.chatId) existing.chatId = msg.chat.id;
+            if (!existing.messageHistory) existing.messageHistory = [];
+            await setUser(existing);
 
-            // Cache photo for re-analysis via AnalyzeImage tool. Strip <system> at the
-            // write boundary so a user-supplied caption or vision-model description
-            // containing our prompt marker can't escape the wrapper when AnalyzeImage
-            // later surfaces this data back through tool results.
-            if (parsed.type === 'photo' && parsed.metadata?.fileId) {
-                await addImageToCache(userId, parsed.metadata.fileId,
-                    msg.caption != null ? stripSystemTags(msg.caption) : undefined,
-                    stripSystemTags(parsed.content));
-            }
+            const processed = await processIncomingMessage(msg, userId);
+            if (!processed) return; // unsupported type or fatal media error already-notified
 
-            // Include any caption with photos/stickers
-            if (msg.caption) {
-                processedContent = `${msg.caption}\n\n${processedContent}`;
-            }
-        } else if (msg.text) {
-            processedContent = msg.text;
-            logIndicator = '[Text]';
-        } else {
-            // Unsupported message type (documents, animations, etc.)
-            return;
-        }
-
-        // Prepend custom-emoji descriptions (if any). Goes before stripSystemTags
-        // so any cached description containing a stray </system> is neutralized.
-        if (customEmojiBlock) {
-            processedContent = `${customEmojiBlock}\n\n${processedContent}`;
-        }
-
-        // Real-user-ingress trust boundary: strip <system> so a user typing
-        // `</system>evil<system>` can't escape our prompt wrappers. Bot-synthesized
-        // prompts (TASK_TRIGGERED_PROMPT, GREETING_PROMPT, …) bypass this — they
-        // INTENTIONALLY wrap in <system> and go directly to streamAIResponse.
-        processedContent = stripSystemTags(processedContent);
-
-        console.log('📨 Received user message:', {
-            userId,
-            type: logIndicator,
-            contentPreview: processedContent.substring(0, 100) + (processedContent.length > 100 ? '...' : ''),
-            timestamp: new Date().toISOString()
-        });
-
-        let existing = await getUser(userId);
-
-        if (!existing) {
-            console.log('👤 New user detected, creating profile:', {
+            console.log('📨 Received user message:', {
                 userId,
-                chatId: msg.chat.id,
-                timestamp: new Date().toISOString()
+                type: processed.logIndicator,
+                contentPreview: processed.content.substring(0, 100) + (processed.content.length > 100 ? '...' : ''),
+                timestamp: new Date().toISOString(),
             });
 
-            const newUser = {
+            // Append to history NOW — the burst reply path uses
+            // addUserToHistory=false and reads recent history straight from DB.
+            await addMessageToHistory(userId, 'user', processed.content);
+        } catch (error) {
+            console.error('❌ Error handling message side-effects:', {
+                userId: msg.from?.id,
+                error: error instanceof Error ? error.message : String(error),
+                timestamp: new Date().toISOString(),
+            });
+            // Run the user-facing 🐺 error fallback OUTSIDE the side-effects
+            // queue so we don't block subsequent messages on it.
+            void enqueuePerUser(userId, () => AIService.streamAIResponse({
                 userId,
-                chatId: msg.chat.id,
-                preferences: {
-                    goal: ''
-                },
-                tasks: [],
-                routines: [],
-                memory: {},
-                messageHistory: []
-            };
-            await setUser(newUser);
-
-            const result = await AIService.streamAIResponse({
-                userId,
-                userMessage: GREETING_PROMPT,
+                userMessage: ERROR_MESSAGE_PROMPT,
                 systemPromptCachePrefix: getSystemPrompt(),
-            systemPrompt: '',
-                bot,
-                provider,
-                model: OPEN_AI_MODEL,
+                systemPrompt: '',
+                bot, provider, model: OPEN_AI_MODEL,
                 shouldUpdateTelegram: false,
-                addUserToHistory: true,
-                addAssistantToHistory: true,
-                enableToolCalls: true
-            });
-
-            console.log(result);
-
-            return;
+                addUserToHistory: false,
+                addAssistantToHistory: false,
+            }).then(() => {}));
         }
-
-        // Ensure chatId and messageHistory are set
-        if (!existing.chatId) {
-            existing.chatId = msg.chat.id;
-        }
-        if (!existing.messageHistory) {
-            existing.messageHistory = [];
-        }
-        await setUser(existing);
-
-        // Use AI to respond with command processing
-        await replyToUser(userId, processedContent);
-
-    } catch (error) {
-        console.error('❌ Error handling message:', {
-            userId: msg.from?.id,
-            error: error instanceof Error ? error.message : String(error),
-            timestamp: new Date().toISOString()
-        });
-        const result = await AIService.streamAIResponse({
-            userId: msg.from?.id || 0,
-            userMessage: ERROR_MESSAGE_PROMPT,
-            systemPromptCachePrefix: getSystemPrompt(),
-            systemPrompt: '',
-            bot,
-            provider,
-            model: OPEN_AI_MODEL,
-            shouldUpdateTelegram: false,
-            addUserToHistory: false,
-            addAssistantToHistory: false,
-        });
-
-        console.log(result);
-    }
     });
+
+    // 2) Soft-abort the in-flight reply if it hasn't shown text yet, then
+    //    refresh the debounce timer. Both are synchronous; no awaits — this
+    //    means the new message can reset the timer while prior parseMedia is
+    //    still running, which is exactly what we want.
+    softAbortIfPretext(userId);
+    refreshBurstTimer(userId);
 });
 
 // Handle bot errors

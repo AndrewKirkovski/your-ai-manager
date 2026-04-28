@@ -29,6 +29,20 @@ export interface AIStreamOptions {
     onImageResults?: (images: string[]) => Promise<void>;
     /** Recorded into stat_entries.note for the token-usage stat. Default 'reply'. */
     purpose?: string;
+    /**
+     * Optional AbortSignal — cancels the underlying provider stream. Used by
+     * the burst-coalescer in index.ts to soft-cancel a reply that hasn't yet
+     * pushed visible text into Telegram (the `hasStreamedText` gate). Aborts
+     * recurse into any tool-call sub-call so the whole chain unwinds.
+     */
+    signal?: AbortSignal;
+    /**
+     * Fires once, when the FIRST safeSend successfully creates a Telegram
+     * message for this reply (i.e. the moment visible text becomes user-
+     * facing). The burst-coalescer flips a flag here so subsequent incoming
+     * user messages know not to abort an already-visible stream.
+     */
+    onTextStreamed?: () => void;
 }
 
 export interface AIStreamResult {
@@ -125,6 +139,10 @@ export class AIService {
                         if (sentMessage) {
                             messageId = sentMessage.message_id;
                             lastSentContent = aiResponseAccumulated;
+                            // First visible text just landed in Telegram. Tell
+                            // the burst-coalescer so it stops considering this
+                            // reply abortable.
+                            try { options.onTextStreamed?.(); } catch (e) { /* listener bug shouldn't kill stream */ }
                         } else {
                             initialSendFailed = true;
                         }
@@ -163,10 +181,17 @@ export class AIService {
             // Get recent message history for context
             const recentMessages = await this.getRecentMessages(userId, 30);
 
-            // Build messages for provider
+            // Build messages for provider. When userMessage is empty (burst-
+            // coalesce path: the bursted messages are already in history and
+            // we don't have a single fresh "current" turn to wrap), skip the
+            // synthetic stub — otherwise the model sees N user msgs followed
+            // by an empty-bodied wrapper and can get confused about what to
+            // answer. The most-recent history row IS the "current" turn.
             const messages: ProviderMessage[] = [
                 ...recentMessages,
-                { role: 'user', content: `<system>At ${new Date().toISOString()}</system>\n${userMessage}` },
+                ...(userMessage
+                    ? [{ role: 'user' as const, content: `<system>At ${new Date().toISOString()}</system>\n${userMessage}` }]
+                    : []),
                 ...(appendMessagesAfterUser || []),
             ];
 
@@ -181,7 +206,9 @@ export class AIService {
 
             console.debug('💬 AI request via', provider.name, { model, maxTokens, toolCount: toolDefs?.length ?? 0 });
 
-            // Stream from provider
+            // Stream from provider. options.signal is forwarded so the burst-
+            // coalescer can abort an in-flight reply that hasn't yet shown
+            // visible text.
             const stream = provider.streamChat({
                 systemPrompt,
                 systemPromptCachePrefix,
@@ -189,6 +216,7 @@ export class AIService {
                 tools: toolDefs,
                 maxTokens,
                 model,
+                signal: options.signal,
             });
 
             let aiResponseAccumulated = '';
@@ -410,6 +438,18 @@ export class AIService {
             };
 
         } catch (error) {
+            // Abort: the burst-coalescer cancelled this reply on purpose because
+            // a new user message arrived in the pre-text phase. Don't show the
+            // user a 🐺 error, don't write half-finished assistant content to
+            // history — just unwind cleanly. The next coalesced reply (fired by
+            // the debounce timer) will see the full updated history.
+            const aborted = options.signal?.aborted
+                || (error instanceof Error && (error.name === 'AbortError' || /aborted|cancel/i.test(error.message)));
+            if (aborted) {
+                console.log(`🛑 AI reply aborted for ${userId} (burst-coalesce soft cancel)`);
+                return { message: '', rawResponse: '' };
+            }
+
             console.error('❌ Error generating AI response:', {
                 userId,
                 userMessage: userMessage.substring(0, 50) + '...',
