@@ -155,10 +155,23 @@ function softAbortIfPretext(userId: number): void {
 }
 
 async function fireBurstReply(userId: number): Promise<void> {
-    // Make sure every queued side-effect (parseMedia + history append) has
-    // landed before we fire the AI — otherwise the AI sees stale history.
-    const sideEffectsTail = sideEffectsQueues.get(userId);
-    if (sideEffectsTail) await sideEffectsTail.catch(() => {});
+    // Drain the entire side-effects chain — including any extensions queued
+    // DURING our awaits. Capturing the tail once misses work added later:
+    // e.g., user sends sticker 1, burst timer fires while parseSticker's
+    // 5-10s Vision call is still running, sticker 2/3 arrive and chain new
+    // work onto the extending tail, but our captured snapshot doesn't see
+    // them. We'd then read history with only sticker 1 in it and fire a
+    // partial reply, leaving the queued fireBurstReply behind us to fire a
+    // SECOND reply for stickers 2/3. The loop re-reads the current tail
+    // after each await and keeps going until the chain stabilizes (same
+    // tail two iterations in a row, or empty).
+    let prev: Promise<void> | undefined;
+    while (true) {
+        const tail = sideEffectsQueues.get(userId);
+        if (!tail || tail === prev) break;
+        prev = tail;
+        await tail.catch(() => {});
+    }
 
     // If the timer fired but a new message arrived in the gap and reset the
     // timer with a future fire-time, bail and let the new timer fire instead.
