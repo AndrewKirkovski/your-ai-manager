@@ -770,6 +770,71 @@ export function refreshStickerCacheFileId(cacheKey: string, fileId: string | nul
     stmts.refreshStickerCacheFileId.run(fileId, cacheKey);
 }
 
+/** Paginated list for the dashboard editor. `q` is a free-text needle matched
+ * against description, set_name, emojis, or short_tag (LIKE %q% on each). */
+export function listStickerCacheEntries(filter: {
+    kind?: StickerCacheKind;
+    q?: string;
+    limit?: number;
+    offset?: number;
+}): { entries: StickerCacheEntry[]; total: number } {
+    const conds: string[] = [];
+    const params: unknown[] = [];
+    if (filter.kind) {
+        conds.push('kind = ?');
+        params.push(filter.kind);
+    }
+    if (filter.q && filter.q.trim()) {
+        const needle = `%${filter.q.trim()}%`;
+        conds.push('(description LIKE ? OR set_name LIKE ? OR emojis LIKE ? OR short_tag LIKE ?)');
+        params.push(needle, needle, needle, needle);
+    }
+    const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    const totalRow = db.prepare<unknown[], { c: number }>(
+        `SELECT COUNT(*) AS c FROM sticker_cache ${where}`
+    ).get(...params);
+    const total = totalRow?.c ?? 0;
+
+    const limit = Math.max(1, Math.min(filter.limit ?? 30, 100));
+    const offset = Math.max(0, filter.offset ?? 0);
+    const sql = `SELECT * FROM sticker_cache ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`;
+    const rows = db.prepare<unknown[], StickerCacheRow>(sql).all(...params, limit, offset);
+    return { entries: rows.map(rowToStickerCache), total };
+}
+
+/** Manual edit from the admin dashboard. Updates description and/or short_tag,
+ * always flags `user_corrected = 1` so future automated re-analysis can defer
+ * to the human-reviewed value. Returns the updated entry, or undefined if the
+ * cacheKey doesn't exist. */
+export function updateStickerCacheText(
+    cacheKey: string,
+    patch: { description?: string; shortTag?: string }
+): StickerCacheEntry | undefined {
+    const existing = stmts.getStickerCache.get(cacheKey);
+    if (!existing) return undefined;
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    if (patch.description !== undefined) {
+        sets.push('description = ?');
+        params.push(patch.description);
+    }
+    if (patch.shortTag !== undefined) {
+        sets.push('short_tag = ?');
+        params.push(patch.shortTag);
+    }
+    if (sets.length === 0) {
+        // Nothing to update — return the existing row unchanged.
+        return rowToStickerCache(existing);
+    }
+    sets.push('user_corrected = 1');
+    sets.push('updated_at = ?');
+    params.push(new Date().toISOString());
+    params.push(cacheKey);
+    db.prepare(`UPDATE sticker_cache SET ${sets.join(', ')} WHERE cache_key = ?`).run(...params);
+    const updated = stmts.getStickerCache.get(cacheKey);
+    return updated ? rowToStickerCache(updated) : undefined;
+}
+
 export function findStickerCacheEntries(filter: {
     emojiContains?: string;
     descriptionContains?: string;

@@ -2,8 +2,9 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import type TelegramBot from 'node-telegram-bot-api';
-import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount, getTokenUsageStats, getDistinctTokenModels, type TokenUsageScope } from './userStore';
+import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount, getTokenUsageStats, getDistinctTokenModels, listStickerCacheEntries, updateStickerCacheText, getStickerCacheEntry, type TokenUsageScope, type StickerCacheKind } from './userStore';
 import { textify, stripSystemTags, safeSend } from './telegramFormat';
+import { renderTgsFrames } from './tgsRenderer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -242,6 +243,177 @@ app.patch('/api/users/:id/messages/:messageId', async (req: Request, res: Respon
         res.status(500).json({ error: 'Failed to update message' });
     }
 });
+
+// ─── Sticker / emoji editor ─────────────────────────────────────────────────
+// The dashboard surfaces every cached sticker + custom_emoji so a human can
+// audit and overwrite the AI-generated description/short_tag when Vision missed
+// something. PATCH always flags user_corrected = 1.
+
+const STICKER_KINDS: ReadonlyArray<StickerCacheKind> = ['sticker', 'animated_sticker', 'video_sticker', 'custom_emoji'];
+
+function isStickerKind(s: unknown): s is StickerCacheKind {
+    return typeof s === 'string' && (STICKER_KINDS as readonly string[]).includes(s);
+}
+
+// In-memory cache for animated_sticker rendered frames. Puppeteer rendering is
+// expensive (~500ms per call), so we cache the PNG buffer keyed by file_id.
+// Bounded LRU; entries evict in insertion order once the cap is hit.
+const TGS_FRAME_CACHE = new Map<string, Buffer>();
+const TGS_FRAME_CACHE_MAX = 200;
+
+function rememberTgsFrame(fileId: string, png: Buffer): void {
+    if (TGS_FRAME_CACHE.size >= TGS_FRAME_CACHE_MAX) {
+        const oldest = TGS_FRAME_CACHE.keys().next().value;
+        if (oldest !== undefined) TGS_FRAME_CACHE.delete(oldest);
+    }
+    TGS_FRAME_CACHE.set(fileId, png);
+}
+
+// GET /api/stickers - paginated cache list
+//   ?kind=sticker|animated_sticker|video_sticker|custom_emoji
+//   ?q=<text>            (matches description/set_name/emojis/short_tag)
+//   ?limit=N             (default 30, max 100)
+//   ?offset=N            (default 0)
+app.get('/api/stickers', async (req: Request, res: Response) => {
+    try {
+        const kindRaw = typeof req.query.kind === 'string' ? req.query.kind : '';
+        const kind = isStickerKind(kindRaw) ? kindRaw : undefined;
+        const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+        const limit = Math.max(1, Math.min(100, parseInt(typeof req.query.limit === 'string' ? req.query.limit : '30', 10) || 30));
+        const offset = Math.max(0, parseInt(typeof req.query.offset === 'string' ? req.query.offset : '0', 10) || 0);
+        const { entries, total } = listStickerCacheEntries({ kind, q, limit, offset });
+        res.json({
+            entries: entries.map(e => ({
+                cacheKey: e.cacheKey,
+                kind: e.kind,
+                emojis: e.emojis,
+                setName: e.setName,
+                description: e.description,
+                shortTag: e.shortTag,
+                hasImage: !!e.fileId,
+                userCorrected: e.userCorrected,
+                usedCount: e.usedCount,
+                updatedAt: e.updatedAt.toISOString(),
+            })),
+            total,
+            limit,
+            offset,
+            hasMore: offset + entries.length < total,
+        });
+    } catch (error) {
+        console.error('Error listing stickers:', error);
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to list stickers' });
+    }
+});
+
+// GET /api/stickers/:cacheKey/image - proxy the actual image bytes
+//   - sticker, custom_emoji   → serve raw bytes (PNG/WebP), browser renders directly.
+//   - video_sticker           → serve raw bytes as video/webm.
+//   - animated_sticker (TGS)  → render middle frame via tgsRenderer, return PNG.
+//
+// 404 if no fileId on the entry. file_id is durable for ~24h server-side, so we
+// set Cache-Control max-age=3600. Browser cache + dashboard's lazy <img> means
+// re-renders don't hammer Telegram.
+app.get('/api/stickers/:cacheKey/image', async (req: Request, res: Response) => {
+    try {
+        const cacheKey = param(req, 'cacheKey');
+        const entry = getStickerCacheEntry(cacheKey);
+        if (!entry) {
+            return res.status(404).json({ error: 'Sticker not found' });
+        }
+        if (!entry.fileId) {
+            return res.status(404).json({ error: 'No file_id stored for this entry' });
+        }
+        if (!botInstance) {
+            return res.status(503).json({ error: 'Bot not initialized' });
+        }
+
+        // Animated stickers: served as a single static frame (PNG). Cached in-process.
+        if (entry.kind === 'animated_sticker') {
+            const cached = TGS_FRAME_CACHE.get(entry.fileId);
+            if (cached) {
+                res.setHeader('Content-Type', 'image/png');
+                res.setHeader('Cache-Control', 'public, max-age=3600');
+                return res.end(cached);
+            }
+            const buf = await downloadTelegramFile(botInstance, entry.fileId);
+            const frames = await renderTgsFrames(buf, 1);
+            const png = frames[0];
+            if (!png) {
+                return res.status(500).json({ error: 'TGS render produced no frames' });
+            }
+            rememberTgsFrame(entry.fileId, png);
+            res.setHeader('Content-Type', 'image/png');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            return res.end(png);
+        }
+
+        // Static stickers, custom_emoji, video_sticker — stream raw bytes through.
+        const buf = await downloadTelegramFile(botInstance, entry.fileId);
+        const contentType = entry.kind === 'video_sticker' ? 'video/webm' : detectImageType(buf);
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.end(buf);
+    } catch (error) {
+        console.error('Error serving sticker image:', error);
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to serve image' });
+    }
+});
+
+// PATCH /api/stickers/:cacheKey - manual description/short_tag override
+app.patch('/api/stickers/:cacheKey', async (req: Request, res: Response) => {
+    try {
+        const cacheKey = param(req, 'cacheKey');
+        const { description, shortTag } = req.body as { description?: string; shortTag?: string };
+        // textify both fields — same defense the AI tool path uses against
+        // <system> wrapping and the like in user-supplied free text.
+        const patch: { description?: string; shortTag?: string } = {};
+        if (typeof description === 'string') patch.description = textify(description);
+        if (typeof shortTag === 'string') patch.shortTag = textify(shortTag);
+        const updated = updateStickerCacheText(cacheKey, patch);
+        if (!updated) {
+            return res.status(404).json({ error: 'Sticker not found' });
+        }
+        res.json({
+            cacheKey: updated.cacheKey,
+            kind: updated.kind,
+            emojis: updated.emojis,
+            setName: updated.setName,
+            description: updated.description,
+            shortTag: updated.shortTag,
+            hasImage: !!updated.fileId,
+            userCorrected: updated.userCorrected,
+            usedCount: updated.usedCount,
+            updatedAt: updated.updatedAt.toISOString(),
+        });
+    } catch (error) {
+        console.error('Error updating sticker:', error);
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update sticker' });
+    }
+});
+
+/** Drain a Telegram file stream into a Buffer. Mirrors mediaParser's
+ * downloadFile (kept here so webServer doesn't need to import the bot's
+ * MediaParser instance just for this). */
+async function downloadTelegramFile(bot: TelegramBot, fileId: string): Promise<Buffer> {
+    const stream = bot.getFileStream(fileId);
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+        chunks.push(chunk as Buffer);
+    }
+    return Buffer.concat(chunks);
+}
+
+/** Sniff PNG vs WebP vs JPEG vs GIF from the first few bytes. Telegram stickers
+ * are usually WebP or PNG; custom_emoji can be either. Default to image/webp
+ * for unknown bytes — browsers handle the mismatch gracefully. */
+function detectImageType(buf: Buffer): string {
+    if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
+    if (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+    if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+    if (buf.length >= 6 && buf.subarray(0, 6).toString('ascii').startsWith('GIF8')) return 'image/gif';
+    return 'image/webp';
+}
 
 // LuxMed monitoring webhook — receives notifications from the sidecar.
 // Reachable on 0.0.0.0 inside the Docker network; protected by a shared secret.

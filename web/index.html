@@ -45,6 +45,9 @@
         <!-- Token Usage (global, independent of user selection) -->
         <div id="tokenUsage" class="mb-6"></div>
 
+        <!-- Sticker / Emoji editor (global, independent of user selection) -->
+        <div id="stickerEditor" class="mb-6"></div>
+
         <!-- Content -->
         <div id="content" class="space-y-6">
             <p class="text-dark-muted">Select a user to view data</p>
@@ -54,6 +57,7 @@
     <script>
         let currentUser = null;
         let tokenState = { scope: 'global', days: 7, model: '', knownModels: [] };
+        let stickerState = { kind: '', q: '', limit: 24, offset: 0, total: 0, entries: [], loading: false };
 
         // Load users on page load
         async function loadUsers() {
@@ -343,6 +347,223 @@
         function setTokenModel(model) {
             tokenState.model = model || '';
             loadTokenUsage();
+        }
+
+        // ── Sticker / emoji editor ──────────────────────────────────────────
+
+        async function loadStickers(reset) {
+            if (reset) stickerState.offset = 0;
+            stickerState.loading = true;
+            renderStickerEditor();
+            const params = new URLSearchParams({
+                limit: String(stickerState.limit),
+                offset: String(stickerState.offset),
+            });
+            if (stickerState.kind) params.set('kind', stickerState.kind);
+            if (stickerState.q) params.set('q', stickerState.q);
+            try {
+                const res = await fetch(`/api/stickers?${params}`);
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    stickerState.entries = [];
+                    stickerState.total = 0;
+                    stickerState.loading = false;
+                    renderStickerEditor(err.error || `HTTP ${res.status}`);
+                    return;
+                }
+                const data = await res.json();
+                stickerState.entries = data.entries || [];
+                stickerState.total = data.total || 0;
+                stickerState.loading = false;
+                renderStickerEditor(null);
+            } catch (e) {
+                console.error('Failed to load stickers:', e);
+                stickerState.entries = [];
+                stickerState.total = 0;
+                stickerState.loading = false;
+                renderStickerEditor(e.message || 'fetch failed');
+            }
+        }
+
+        function setStickerKind(kind) {
+            stickerState.kind = kind || '';
+            loadStickers(true);
+        }
+
+        function setStickerSearch(q) {
+            stickerState.q = q || '';
+            loadStickers(true);
+        }
+
+        function stickerPrev() {
+            if (stickerState.offset === 0) return;
+            stickerState.offset = Math.max(0, stickerState.offset - stickerState.limit);
+            loadStickers(false);
+        }
+
+        function stickerNext() {
+            if (stickerState.offset + stickerState.limit >= stickerState.total) return;
+            stickerState.offset += stickerState.limit;
+            loadStickers(false);
+        }
+
+        async function saveSticker(cacheKey) {
+            const card = document.getElementById(`sticker-${cssEscape(cacheKey)}`);
+            if (!card) return;
+            const desc = card.querySelector('[data-field="description"]').value;
+            const tag = card.querySelector('[data-field="shortTag"]').value;
+            const status = card.querySelector('[data-field="status"]');
+            status.textContent = 'saving…';
+            status.className = 'text-xs text-dark-muted';
+            try {
+                const res = await fetch(`/api/stickers/${encodeURIComponent(cacheKey)}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ description: desc, shortTag: tag }),
+                });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    status.textContent = '✗ ' + (err.error || `HTTP ${res.status}`);
+                    status.className = 'text-xs text-red-400';
+                    return;
+                }
+                const updated = await res.json();
+                // Update local state so the corrected badge appears immediately.
+                const idx = stickerState.entries.findIndex(e => e.cacheKey === cacheKey);
+                if (idx >= 0) stickerState.entries[idx] = updated;
+                status.textContent = '✓ saved';
+                status.className = 'text-xs text-green-400';
+                // Update the corrected badge in-place without redrawing the image.
+                const badge = card.querySelector('[data-field="corrected-badge"]');
+                if (badge) badge.classList.remove('hidden');
+            } catch (e) {
+                console.error('Failed to save sticker:', e);
+                status.textContent = '✗ ' + (e.message || 'fetch failed');
+                status.className = 'text-xs text-red-400';
+            }
+        }
+
+        // CSS-safe id slug for cacheKey (cacheKey may contain colons/slashes).
+        function cssEscape(s) {
+            return String(s).replace(/[^a-zA-Z0-9_-]/g, c => '_' + c.charCodeAt(0).toString(16));
+        }
+
+        function stickerKindLabel(k) {
+            return ({
+                sticker: 'static',
+                animated_sticker: 'animated',
+                video_sticker: 'video',
+                custom_emoji: 'emoji',
+            })[k] || k;
+        }
+
+        function renderStickerCard(e) {
+            const id = `sticker-${cssEscape(e.cacheKey)}`;
+            // Video stickers render as <video>; the rest render as <img>. Both
+            // hit the same /image endpoint — the server picks the content type.
+            let imageEl;
+            if (!e.hasImage) {
+                imageEl = `<div class="w-full h-32 bg-dark-bg rounded flex items-center justify-center text-dark-muted text-xs">no file</div>`;
+            } else if (e.kind === 'video_sticker') {
+                imageEl = `<video src="/api/stickers/${encodeURIComponent(e.cacheKey)}/image" class="w-full h-32 object-contain bg-dark-bg rounded" autoplay loop muted playsinline></video>`;
+            } else {
+                imageEl = `<img src="/api/stickers/${encodeURIComponent(e.cacheKey)}/image" alt="" loading="lazy" class="w-full h-32 object-contain bg-dark-bg rounded" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'w-full h-32 bg-dark-bg rounded flex items-center justify-center text-red-400 text-xs',textContent:'load failed'}))">`;
+            }
+
+            return `
+                <div id="${id}" class="bg-dark-card border border-dark-border rounded-lg p-3 flex flex-col gap-2">
+                    ${imageEl}
+                    <div class="flex items-center justify-between text-xs">
+                        <span class="px-1.5 py-0.5 bg-dark-bg rounded text-dark-muted">${stickerKindLabel(e.kind)}</span>
+                        <span data-field="corrected-badge" class="px-1.5 py-0.5 bg-yellow-700 rounded text-yellow-100 ${e.userCorrected ? '' : 'hidden'}" title="user-corrected">✎</span>
+                    </div>
+                    <div class="text-base">${(e.emojis || []).map(escapeHtml).join('') || '<span class="text-dark-muted text-xs">no emojis</span>'}</div>
+                    ${e.setName ? `<div class="text-xs text-dark-muted truncate" title="${escapeHtml(e.setName)}">${escapeHtml(e.setName)}</div>` : ''}
+                    <textarea data-field="description"
+                        class="bg-dark-bg border border-dark-border rounded p-2 text-xs w-full resize-y min-h-[3rem]"
+                        rows="3" placeholder="description">${escapeHtml(e.description || '')}</textarea>
+                    <input data-field="shortTag" type="text" value="${escapeHtml(e.shortTag || '')}"
+                        class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs w-full" placeholder="short tag">
+                    <div class="flex items-center justify-between gap-2">
+                        <span class="text-xs text-dark-muted">used ${e.usedCount}×</span>
+                        <span data-field="status" class="text-xs text-dark-muted"></span>
+                        <button onclick="saveSticker('${escapeHtml(e.cacheKey).replace(/'/g, "\\'")}')"
+                            class="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded text-xs">Save</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderStickerEditor(errMsg) {
+            const kindOpts = [
+                { value: '', label: 'All kinds' },
+                { value: 'sticker', label: 'Static' },
+                { value: 'animated_sticker', label: 'Animated' },
+                { value: 'video_sticker', label: 'Video' },
+                { value: 'custom_emoji', label: 'Custom emoji' },
+            ];
+            const kindSelect = `
+                <select onchange="setStickerKind(this.value)"
+                    class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs">
+                    ${kindOpts.map(o => `<option value="${o.value}" ${stickerState.kind === o.value ? 'selected' : ''}>${o.label}</option>`).join('')}
+                </select>
+            `;
+            const searchInput = `
+                <input type="text" id="stickerSearch" value="${escapeHtml(stickerState.q)}"
+                    placeholder="search description / pack / emoji…"
+                    class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs w-64"
+                    oninput="if(this._t)clearTimeout(this._t);this._t=setTimeout(()=>setStickerSearch(this.value),250)">
+            `;
+
+            const pageStart = stickerState.total === 0 ? 0 : stickerState.offset + 1;
+            const pageEnd = Math.min(stickerState.total, stickerState.offset + stickerState.entries.length);
+            const pager = `
+                <div class="flex items-center gap-2 text-xs text-dark-muted">
+                    <span>${pageStart}–${pageEnd} of ${stickerState.total}</span>
+                    <button onclick="stickerPrev()" ${stickerState.offset === 0 ? 'disabled' : ''}
+                        class="bg-dark-bg border border-dark-border rounded px-2 py-1 ${stickerState.offset === 0 ? 'opacity-50 cursor-not-allowed' : 'hover:bg-dark-border'}">←</button>
+                    <button onclick="stickerNext()" ${(stickerState.offset + stickerState.limit) >= stickerState.total ? 'disabled' : ''}
+                        class="bg-dark-bg border border-dark-border rounded px-2 py-1 ${(stickerState.offset + stickerState.limit) >= stickerState.total ? 'opacity-50 cursor-not-allowed' : 'hover:bg-dark-border'}">→</button>
+                </div>
+            `;
+
+            let body;
+            if (errMsg) {
+                body = `<p class="text-red-400 text-sm">${escapeHtml(errMsg)}</p>`;
+            } else if (stickerState.loading && stickerState.entries.length === 0) {
+                body = `<p class="text-dark-muted text-sm">Loading…</p>`;
+            } else if (stickerState.entries.length === 0) {
+                body = `<p class="text-dark-muted text-sm">No stickers match.</p>`;
+            } else {
+                body = `<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">${stickerState.entries.map(renderStickerCard).join('')}</div>`;
+            }
+
+            // Preserve search input focus + caret across re-renders.
+            const prevSearch = document.getElementById('stickerSearch');
+            const wasFocused = prevSearch && document.activeElement === prevSearch;
+            const caret = wasFocused ? prevSearch.selectionStart : null;
+
+            document.getElementById('stickerEditor').innerHTML = `
+                <div class="bg-dark-card border border-dark-border rounded-lg p-4">
+                    <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+                        <h2 class="text-lg font-semibold">🎴 Stickers &amp; Emoji</h2>
+                        <div class="flex flex-wrap items-center gap-2">
+                            ${kindSelect}
+                            ${searchInput}
+                            ${pager}
+                        </div>
+                    </div>
+                    ${body}
+                </div>
+            `;
+
+            if (wasFocused) {
+                const newSearch = document.getElementById('stickerSearch');
+                if (newSearch) {
+                    newSearch.focus();
+                    if (caret != null) newSearch.setSelectionRange(caret, caret);
+                }
+            }
         }
 
         // Load user data
@@ -742,6 +963,7 @@
         });
         loadUsers();
         loadKnownModels().then(loadTokenUsage);
+        loadStickers(true);
     </script>
 </body>
 </html>
