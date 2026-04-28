@@ -509,9 +509,9 @@
                         </div>
                         <!-- description, full-width, 2 rows tall by default — auto-grows on input -->
                         <textarea data-field="description"
-                            class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs w-full resize-y min-h-[2.25rem]"
+                            class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs w-full resize-y min-h-[2.25rem] max-h-48 overflow-y-auto"
                             rows="2" placeholder="description"
-                            oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'">${escapeHtml(e.description || '')}</textarea>
+                            oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,192)+'px'">${escapeHtml(e.description || '')}</textarea>
                         <!-- short tag row -->
                         <input data-field="shortTag" type="text" value="${escapeHtml(e.shortTag || '')}"
                             class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs w-full"
@@ -592,11 +592,16 @@
                 }
             }
 
-            // Grow each description textarea to fit its content so admins see
-            // the whole description without scrolling within the row.
-            document.querySelectorAll('#stickerEditor textarea[data-field="description"]').forEach(ta => {
-                ta.style.height = 'auto';
-                ta.style.height = ta.scrollHeight + 'px';
+            // Grow each description textarea to fit its content (capped at
+            // max-h-48 so a runaway description can't blow up the page).
+            // Defer to rAF so flex layout has settled before scrollHeight is
+            // measured — measuring during the same tick as the innerHTML write
+            // gives bogus heights because the column width hasn't computed yet.
+            requestAnimationFrame(() => {
+                document.querySelectorAll('#stickerEditor textarea[data-field="description"]').forEach(ta => {
+                    ta.style.height = 'auto';
+                    ta.style.height = Math.min(ta.scrollHeight, 192) + 'px';
+                });
             });
         }
 
