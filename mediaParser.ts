@@ -57,11 +57,14 @@ export interface MediaParserConfig {
     maxStickerTokens?: number;      // Default: 200
 }
 
-// Vision call timeout. The OpenAI SDK defaults to 10 minutes, which is far too
-// long when a single hung request blocks the per-user side-effects queue (and
-// therefore every coalesced reply) for that duration. 60s is generous for
-// vision — typical calls finish in 5-15s — but firmly bounds worst-case wedge.
+// Vision and Whisper call timeouts. The OpenAI SDK defaults to 10 minutes,
+// which is far too long when a single hung request blocks the per-user side-
+// effects queue (and therefore every coalesced reply) for that duration.
+// 60s is generous — typical Vision finishes in 5-15s, Whisper in 3-10s —
+// but firmly bounds worst-case wedge. Failures route through the existing
+// parsed.error → ERROR_MESSAGE_PROMPT fallback so the user still gets a 🐺.
 const VISION_TIMEOUT_MS = 60_000;
+const WHISPER_TIMEOUT_MS = 60_000;
 
 // ============== STICKER DESCRIPTION PROMPTS + CLEANUP ==============
 
@@ -287,7 +290,7 @@ export class MediaParser {
                 file: createReadStream(tempFilePath),
                 model: this.whisperModel,
                 language: this.language,
-            });
+            }, { timeout: WHISPER_TIMEOUT_MS });
 
             return {
                 type: 'voice',
