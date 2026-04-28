@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import type TelegramBot from 'node-telegram-bot-api';
-import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount, getTokenUsageStats, getDistinctTokenModels, listStickerCacheEntries, updateStickerCacheText, getStickerCacheEntry, type TokenUsageScope, type StickerCacheKind } from './userStore';
+import { getAllUsers, getUser, updateUserTask, updateUserMemory, updateMessageById, getRecentImages, getTrackedStatNames, getLatestStat, getStatCount, getTokenUsageStats, getDistinctTokenModels, listStickerCacheEntries, updateStickerCacheText, getStickerCacheEntry, refreshStickerCacheFileId, type TokenUsageScope, type StickerCacheKind } from './userStore';
 import { textify, stripSystemTags, safeSend } from './telegramFormat';
 import { renderTgsFrames } from './tgsRenderer';
 
@@ -290,7 +290,11 @@ app.get('/api/stickers', async (req: Request, res: Response) => {
                 setName: e.setName,
                 description: e.description,
                 shortTag: e.shortTag,
-                hasImage: !!e.fileId,
+                // custom_emoji rows commonly arrive with no file_id but the
+                // image endpoint resolves them on demand via getCustomEmojiStickers,
+                // so the dashboard should still attempt the fetch and show the
+                // result. For other kinds, file_id absence is terminal.
+                hasImage: !!e.fileId || e.kind === 'custom_emoji',
                 userCorrected: e.userCorrected,
                 usedCount: e.usedCount,
                 updatedAt: e.updatedAt.toISOString(),
@@ -323,24 +327,48 @@ app.get('/api/stickers/:cacheKey/image', async (req: Request, res: Response) => 
         if (!entry) {
             return res.status(404).json({ error: 'Sticker not found' });
         }
-        if (!entry.fileId) {
-            return res.status(404).json({ error: 'No file_id stored for this entry' });
-        }
         if (!botInstance) {
             return res.status(503).json({ error: 'Bot not initialized' });
+        }
+
+        // Custom emojis often arrive with no file_id (the AI sees the emoji_id
+        // inline before any media is downloaded). Resolve on demand via the
+        // Telegram getCustomEmojiStickers API and persist the file_id so future
+        // dashboard loads skip the lookup. Note: cache_key for custom emojis
+        // is the custom_emoji_id; for regular stickers it's the file_unique_id
+        // which can't be reverse-resolved, so this only applies to that kind.
+        let resolvedFileId: string;
+        if (entry.fileId) {
+            resolvedFileId = entry.fileId;
+        } else {
+            if (entry.kind !== 'custom_emoji') {
+                return res.status(404).json({ error: 'No file_id stored for this entry' });
+            }
+            try {
+                const stickers = await botInstance.getCustomEmojiStickers([entry.cacheKey]);
+                const fresh = stickers?.[0];
+                if (!fresh?.file_id) {
+                    return res.status(404).json({ error: 'Custom emoji could not be resolved on Telegram' });
+                }
+                resolvedFileId = fresh.file_id;
+                refreshStickerCacheFileId(entry.cacheKey, resolvedFileId);
+            } catch (err) {
+                console.error('[stickers] getCustomEmojiStickers failed for', entry.cacheKey, ':', err);
+                return res.status(502).json({ error: 'Failed to resolve custom emoji from Telegram' });
+            }
         }
 
         // TGS rendered output is the only path with a process-side cache (puppeteer
         // is the expensive bit). Static images and WebM go straight through the
         // Telegram-stream → response pipe with browser-cache absorbing the cost.
-        const cached = TGS_FRAME_CACHE.get(entry.fileId);
+        const cached = TGS_FRAME_CACHE.get(resolvedFileId);
         if (cached) {
             res.setHeader('Content-Type', 'image/png');
             res.setHeader('Cache-Control', 'public, max-age=3600');
             return res.end(cached);
         }
 
-        const buf = await downloadTelegramFile(botInstance, entry.fileId);
+        const buf = await downloadTelegramFile(botInstance, resolvedFileId);
         const fmt = detectFileFormat(buf);
 
         if (fmt === 'tgs') {
@@ -349,7 +377,7 @@ app.get('/api/stickers/:cacheKey/image', async (req: Request, res: Response) => 
             if (!png) {
                 return res.status(500).json({ error: 'TGS render produced no frames' });
             }
-            rememberTgsFrame(entry.fileId, png);
+            rememberTgsFrame(resolvedFileId, png);
             res.setHeader('Content-Type', 'image/png');
             res.setHeader('Cache-Control', 'public, max-age=3600');
             return res.end(png);
