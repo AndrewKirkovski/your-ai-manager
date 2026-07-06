@@ -278,12 +278,21 @@ Ask what they want help with. Keep it casual and SHORT. No bullet-point feature 
 </system>
 `;
 
-export const TASK_TRIGGERED_PROMPT = (memory: string, task: {id: string, name: string}) => `
+/** Context block injected into a task-trigger prompt when another reminder
+ * went out to this user only minutes ago (same-minute stagger, or a routine
+ * that spawned a task right after an ad-hoc reminder). Tells the AI to build
+ * on the just-sent message instead of firing a dry back-to-back reminder. */
+export const RECENT_REMINDER_NOTE = (taskName: string, minAgo: number) => `
+NOTE: A reminder about "${taskName}" was sent just ${minAgo} min ago — it's in recent history.
+Don't fire a dry back-to-back reminder: reference the previous one / weave this task in naturally,
+or — if this task allows tools and stacking reminders feels spammy — postpone it via UpdateTask(ping_at="...") and write NOTHING to the user.`;
+
+export const TASK_TRIGGERED_PROMPT = (memory: string, task: {id: string, name: string}, recentReminderNote = '') => `
 <system>
 ${memory}
 
 SITUATION: Time to remind user about task "${task.name}" (ID: ${task.id}).
-
+${recentReminderNote}
 YOUR TASK:
 1. If execution time (dueAt) hasn't expired yet OR dueAt is not set → schedule next reminder using UpdateTask tool
 2. If dueAt has already passed OR task is severely overdue OR a new task from the same routine is starting/has started → fail the task using MarkTaskFailed tool
@@ -298,14 +307,37 @@ MANDATORY:
 </system>
 `;
 
-export const TASK_TRIGGERED_PROMPT_NO_ACTION = (memory: string, task: {id: string, name: string}) => `
+export const TASK_TRIGGERED_PROMPT_NO_ACTION = (memory: string, task: {id: string, name: string}, recentReminderNote = '') => `
 <system>
 ${memory}
 
 Remind user about "${task.name}" (ID: ${task.id}). This is a no-action reminder — just a heads-up.
-
+${recentReminderNote}
 DO NOT USE ANY TOOLS — just write a brief message.
 Vary your phrasing. Check history for what you said last time about this task and say something different.
+</system>
+`;
+
+/** Silent background maintenance prompt for the reminder-collision fixer cron.
+ * Runs with shouldUpdateTelegram=false — the user never sees the output; the
+ * AI's job is purely to spread colliding ping times apart via tools. */
+export const COLLISION_FIX_PROMPT = (memory: string, clustersText: string) => `
+<system>
+${memory}
+
+BACKGROUND MAINTENANCE RUN — the user will NOT see anything you write. Do not address the user.
+You are deconflicting the reminder schedule. Upcoming collisions were detected (events within 5 minutes of each other):
+
+${clustersText}
+
+RULES:
+- "predicted routine fire" entries are FIXED points — they come from a routine's cron and cannot be moved by editing tasks. Move ad-hoc tasks AWAY from them.
+- Fix each cluster with UpdateTask(task_id, ping_at="...") so events end up at least 10 minutes apart.
+- Prefer moving low-annoyance tasks; keep high-annoyance / urgent (dueAt soon) tasks where they are.
+- NEVER move ping_at into the past or within the next 15 minutes. NEVER move ping_at past the task's dueAt.
+- If the user explicitly asked for a specific reminder time recently (check history), keep that task in place and move the other one.
+- If a cluster consists ONLY of routine fires, you may nudge ONE routine's cron by 5-15 minutes via UpdateRoutine — same hour, same meaning, minimal shift. At most one such change per run.
+- After the tool calls, write a one-line log summary of what you changed (or "no safe fix" and why). This goes to logs only.
 </system>
 `;
 

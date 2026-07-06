@@ -19,6 +19,11 @@ export interface AIStreamOptions {
     provider: AIProvider;
     model: string;
     maxTokens?: number;
+    /**
+     * Default true. Set false for fully-silent background runs (e.g. the
+     * collision fixer): no streaming message, no typing indicator, and no
+     * user-facing 🐺 error on failure — tool calls still execute.
+     */
     shouldUpdateTelegram?: boolean;
     addUserToHistory?: boolean;
     addAssistantToHistory?: boolean;
@@ -92,6 +97,7 @@ export class AIService {
             provider,
             model,
             maxTokens = 1500,
+            shouldUpdateTelegram = true,
             addUserToHistory = true,
             addAssistantToHistory = true,
             enableToolCalls = false,
@@ -130,6 +136,7 @@ export class AIService {
 
             // Function to update Telegram message during streaming
             async function updateTelegramMessage(isFinal = false) {
+                if (!shouldUpdateTelegram) return;
                 try {
                     const stripped = stripInternalMarkers(aiResponseAccumulated).trim();
                     const contentToSend = isFinal ? stripped : stripped + ' ...';
@@ -238,10 +245,13 @@ export class AIService {
             // usageInputTokens/usageOutputTokens are declared at function scope
             // above (so the catch block can read them on abort).
 
-            await bot.sendChatAction(userId, 'typing');
+            if (shouldUpdateTelegram) {
+                await bot.sendChatAction(userId, 'typing');
+            }
 
-            // Set up periodic updates during streaming
-            const updateInterval_id = setInterval(async () => {
+            // Set up periodic updates during streaming (skipped entirely in
+            // silent mode — updateTelegramMessage would be a no-op anyway)
+            const updateInterval_id = shouldUpdateTelegram ? setInterval(async () => {
                 if (aiResponseAccumulated.length > lastSentContent.length + 100) {
                     try {
                         await updateTelegramMessage();
@@ -249,7 +259,7 @@ export class AIService {
                         console.error('Failed to update message during streaming:', error);
                     }
                 }
-            }, 500);
+            }, 500) : undefined;
 
             // try/finally guarantees clearInterval on stream throw — without it
             // a mid-stream provider error (429, reset) leaks the 500ms timer for
@@ -559,7 +569,10 @@ export class AIService {
 ${error instanceof Error ? error.message : String(error)}
 \`\`\`
             `;
-            await safeSend(bot, userId, errorMessage);
+            // Silent background runs (collision fixer) must not surface errors in chat.
+            if (shouldUpdateTelegram) {
+                await safeSend(bot, userId, errorMessage);
+            }
 
             return {
                 message: errorMessage,

@@ -17,7 +17,8 @@ import {
     GOAL_SET_PROMPT,
     GOAL_CLEAR_PROMPT,
     ERROR_MESSAGE_PROMPT,
-    DEFAULT_HELP_PROMPT, TASK_TRIGGERED_PROMPT, TASK_TRIGGERED_PROMPT_NO_ACTION
+    DEFAULT_HELP_PROMPT, TASK_TRIGGERED_PROMPT, TASK_TRIGGERED_PROMPT_NO_ACTION,
+    RECENT_REMINDER_NOTE,
 } from './constants';
 import {
     getUser,
@@ -37,6 +38,7 @@ import {AIService} from './aiService';
 import {safeSend, stripSystemTags, textify} from './telegramFormat';
 import {runHistoryCompaction} from './historyCompaction';
 import {runStyleScan} from './styleScan';
+import {runCollisionFixer} from './taskCollisionFixer';
 import {CronExpressionParser} from 'cron-parser';
 import {formatDateHuman, formatCronHuman, getCurrentTime} from './dateUtils';
 import {initializeMediaParser, getMediaParser} from './mediaParser';
@@ -420,7 +422,6 @@ async function replyToUser(
             bot,
             provider,
             model: OPEN_AI_MODEL,
-            shouldUpdateTelegram: true,
             addUserToHistory: opts?.addUserToHistory ?? true,
             addAssistantToHistory: true,
             enableToolCalls: true,
@@ -474,6 +475,16 @@ async function replyToUser(
         return 'Извини, проблемы с генерацией ответа 🐺';
     }
 }
+
+// Last task-reminder dispatch per user: timestamp + task name. Feeds the
+// recent-reminder note so the AI weaves a new reminder into the just-sent one
+// instead of firing dry back-to-back messages — covers routine tasks spawning
+// one tick after an ad-hoc reminder, and staggered tasks firing minutes later.
+// In-memory: a restart loses it, but the same-tick stagger below still
+// guarantees message spacing.
+const lastReminderAt = new Map<number, { at: number; taskName: string }>();
+const RECENT_REMINDER_WINDOW_MS = 15 * 60_000;
+const STAGGER_STEP_MS = 5 * 60_000;
 
 // Check routines and tasks every minute. `isRunning` guard prevents overlap
 // if a slow AI call from a previous tick hasn't finished yet (otherwise two
@@ -555,38 +566,51 @@ cron.schedule('* * * * *', async () => {
             }
         }
 
-        // 2. Check pending tasks for pinging users
-        const pendingTasks = user.tasks.filter(t => t.status === 'pending');
-        for (const task of pendingTasks) {
+        // 2. Check pending tasks for pinging users. Never two reminder
+        //    messages at once: the FIRST (most overdue) due task is reminded
+        //    normally; the rest are silently staggered +5/+10/… min so each
+        //    fires alone on a later tick. A staggered task then carries a
+        //    recent-reminder note so the AI builds on the message that just
+        //    went out (or postpones again) instead of pinging back-to-back.
+        const nowDate = now.toJSDate();
+        const dueTasks = user.tasks
+            .filter(t => t.status === 'pending' && t.pingAt <= nowDate)
+            .sort((a, b) => a.pingAt.getTime() - b.pingAt.getTime());
+        const [dueTask, ...staggeredTasks] = dueTasks;
+
+        if (dueTask) {
             try {
-                // Check if task should ping user
-                if (task.pingAt <= now.toJSDate()) {
-                    console.log('📱 Pinging user about pending task:', task);
+                console.log('📱 Pinging user about pending task:', dueTask);
 
-                    if (!task.requiresAction) {
-                        await updateUserTask(user.userId, task.id, (t) => {
-                            t.status = 'completed';
-                        })
-                    } else {
-                        await updateUserTask(user.userId, task.id, (t) => {
-                            t.status = 'needs_replanning'
-                        });
-                    }
+                await updateUserTask(user.userId, dueTask.id, (t) => {
+                    t.status = dueTask.requiresAction ? 'needs_replanning' : 'completed';
+                });
 
-                    // Serialize with the live bot.on('message') path via enqueuePerUser —
-                    // otherwise a user typing at the same minute a routine fires produces
-                    // two concurrent streams that interleave addMessageToHistory writes.
-                    // Fire-and-forget: the queue itself enforces per-user serialization,
-                    // so this tick can return immediately and other users' tasks can run
-                    // in parallel. Awaiting here would block the whole tick on one user's
-                    // AI roundtrip and cause routineTickRunning to skip the next minute
-                    // for everyone.
-                    void enqueuePerUser(user.userId, async () => {
+                // Snapshot the PREVIOUS reminder before recording our own —
+                // the note must reference the reminder that preceded this one.
+                const prevReminder = lastReminderAt.get(user.userId);
+                lastReminderAt.set(user.userId, { at: nowDate.getTime(), taskName: dueTask.name });
+
+                // Serialize with the live bot.on('message') path via enqueuePerUser —
+                // otherwise a user typing at the same minute a routine fires produces
+                // two concurrent streams that interleave addMessageToHistory writes.
+                // Fire-and-forget: the queue itself enforces per-user serialization,
+                // so this tick can return immediately and other users' tasks can run
+                // in parallel. Awaiting here would block the whole tick on one user's
+                // AI roundtrip and cause routineTickRunning to skip the next minute
+                // for everyone.
+                void enqueuePerUser(user.userId, async () => {
+                    try {
                         const memory = await getCurrentInfo(user.userId);
 
-                        const taskPrompt = task.requiresAction
-                            ? TASK_TRIGGERED_PROMPT(memory, task)
-                            : TASK_TRIGGERED_PROMPT_NO_ACTION(memory, task);
+                        const sinceMs = prevReminder ? Date.now() - prevReminder.at : Infinity;
+                        const note = prevReminder && sinceMs <= RECENT_REMINDER_WINDOW_MS
+                            ? RECENT_REMINDER_NOTE(prevReminder.taskName, Math.max(1, Math.round(sinceMs / 60_000)))
+                            : '';
+
+                        const taskPrompt = dueTask.requiresAction
+                            ? TASK_TRIGGERED_PROMPT(memory, dueTask, note)
+                            : TASK_TRIGGERED_PROMPT_NO_ACTION(memory, dueTask, note);
 
                         const result = await AIService.streamAIResponse({
                             userId: user.userId,
@@ -598,23 +622,46 @@ cron.schedule('* * * * *', async () => {
                             model: OPEN_AI_MODEL,
                             addUserToHistory: false,
                             addAssistantToHistory: true,
-                            enableToolCalls: true
+                            enableToolCalls: true,
+                            purpose: 'task-reminder',
                         });
 
                         console.log(result);
-                    });
-
-
-                } else {
-                    /* console.log('⏳ Task not ready for ping yet:', {
-                        userId: user.userId,
-                        taskId: task.id,
-                        pingAt: task.pingAt.toISOString(),
-                        now: now.toISO()
-                    }); */
-                }
+                    } catch (error) {
+                        // Recoverable: the needs_replanning mark already landed, and
+                        // getCurrentInfo re-surfaces it to every subsequent AI call.
+                        console.error('❌ Task reminder failed:', {
+                            userId: user.userId,
+                            taskId: dueTask.id,
+                            error: error instanceof Error ? error.message : String(error),
+                        });
+                    }
+                });
             } catch (error) {
                 console.error('❌ Error pinging task:', {
+                    userId: user.userId,
+                    taskId: dueTask.id,
+                    error: error instanceof Error ? error.message : String(error),
+                    timestamp: now.toISO()
+                });
+            }
+        }
+
+        for (let i = 0; i < staggeredTasks.length; i++) {
+            const task = staggeredTasks[i];
+            const newPingAt = new Date(nowDate.getTime() + STAGGER_STEP_MS * (i + 1));
+            try {
+                await updateUserTask(user.userId, task.id, (t) => {
+                    t.pingAt = newPingAt;
+                });
+                console.log('⏭️ Staggered reminder (another task due same tick):', {
+                    userId: user.userId,
+                    taskId: task.id,
+                    name: task.name,
+                    newPingAt: newPingAt.toISOString(),
+                });
+            } catch (error) {
+                console.error('❌ Error staggering task:', {
                     userId: user.userId,
                     taskId: task.id,
                     error: error instanceof Error ? error.message : String(error),
@@ -657,6 +704,24 @@ cron.schedule('*/10 * * * *', async () => {
         await runLuxmedMonitoringCycle();
     } catch (error) {
         console.error('[LuxMed Monitor] Cron error:', error instanceof Error ? error.message : error);
+    }
+}, { timezone: BOT_TZ });
+
+// Look-ahead reminder-collision fixer: silently spreads task pings that would
+// land within 5 min of each other (or of a predicted routine fire) via a
+// no-Telegram AI call. Minutes 7/37 — offset from :00 where most routines
+// fire and history compaction runs.
+cron.schedule(process.env.COLLISION_FIXER_CRON || '7,37 * * * *', async () => {
+    try {
+        await runCollisionFixer({
+            bot,
+            provider,
+            model: OPEN_AI_MODEL,
+            enqueue: enqueuePerUser,
+            getCurrentInfo,
+        });
+    } catch (error) {
+        console.error('🧭 Collision fixer cron error:', error instanceof Error ? error.message : String(error));
     }
 }, { timezone: BOT_TZ });
 
@@ -771,7 +836,6 @@ bot.onText(/\/cleargoal/, serialTextHandler(async (msg) => {
             bot,
             provider,
             model: OPEN_AI_MODEL,
-            shouldUpdateTelegram: false,
             addUserToHistory: false,
             addAssistantToHistory: true,
         });
@@ -788,7 +852,6 @@ bot.onText(/\/cleargoal/, serialTextHandler(async (msg) => {
             bot,
             provider,
             model: OPEN_AI_MODEL,
-            shouldUpdateTelegram: false,
             addUserToHistory: false,
             addAssistantToHistory: false,
         });
@@ -835,7 +898,6 @@ bot.onText(/\/routines/, serialTextHandler(async (msg) => {
             bot,
             provider,
             model: OPEN_AI_MODEL,
-            shouldUpdateTelegram: false,
             addUserToHistory: false,
             addAssistantToHistory: false,
         });
@@ -877,7 +939,6 @@ bot.onText(/\/tasks/, serialTextHandler(async (msg) => {
             bot,
             provider,
             model: OPEN_AI_MODEL,
-            shouldUpdateTelegram: false,
             addUserToHistory: false,
             addAssistantToHistory: false,
         });
@@ -923,7 +984,6 @@ bot.onText(/\/memory/, serialTextHandler(async (msg) => {
             bot,
             provider,
             model: OPEN_AI_MODEL,
-            shouldUpdateTelegram: false,
             addUserToHistory: false,
             addAssistantToHistory: false,
         });
@@ -1004,7 +1064,6 @@ bot.onText(/\/help/, serialTextHandler(async (msg) => {
             bot,
             provider,
             model: OPEN_AI_MODEL,
-            shouldUpdateTelegram: false,
             addUserToHistory: false,
             addAssistantToHistory: true,
         });
@@ -1135,7 +1194,6 @@ bot.on('message', (msg) => {
                     systemPromptCachePrefix: getSystemPrompt(),
                     systemPrompt: '',
                     bot, provider, model: OPEN_AI_MODEL,
-                    shouldUpdateTelegram: false,
                     addUserToHistory: true,
                     addAssistantToHistory: true,
                     enableToolCalls: true,
@@ -1179,7 +1237,6 @@ bot.on('message', (msg) => {
                 systemPromptCachePrefix: getSystemPrompt(),
                 systemPrompt: '',
                 bot, provider, model: OPEN_AI_MODEL,
-                shouldUpdateTelegram: false,
                 addUserToHistory: false,
                 addAssistantToHistory: false,
             }).then(() => {}));
