@@ -70,7 +70,7 @@
     <script>
         let currentUser = null;
         let tokenState = { scope: 'global', days: 7, model: '', knownModels: [] };
-        let stickerState = { kind: '', q: '', limit: 24, offset: 0, total: 0, entries: [], loading: false };
+        let stickerState = { kind: '', q: '', limit: 24, offset: 0, total: 0, entries: [], loading: false, error: null };
         // Sticker editor collapses to a one-line header while a user is selected —
         // the full grid otherwise pushes the user sections a screen-height down.
         let stickerCollapsed = false;
@@ -384,20 +384,23 @@
                     stickerState.entries = [];
                     stickerState.total = 0;
                     stickerState.loading = false;
-                    renderStickerEditor(err.error || `HTTP ${res.status}`);
+                    stickerState.error = err.error || `HTTP ${res.status}`;
+                    renderStickerEditor();
                     return;
                 }
                 const data = await res.json();
                 stickerState.entries = data.entries || [];
                 stickerState.total = data.total || 0;
                 stickerState.loading = false;
-                renderStickerEditor(null);
+                stickerState.error = null;
+                renderStickerEditor();
             } catch (e) {
                 console.error('Failed to load stickers:', e);
                 stickerState.entries = [];
                 stickerState.total = 0;
                 stickerState.loading = false;
-                renderStickerEditor(e.message || 'fetch failed');
+                stickerState.error = e.message || 'fetch failed';
+                renderStickerEditor();
             }
         }
 
@@ -456,11 +459,21 @@
                     return;
                 }
                 const data = await res.json();
+                // The grid may have been re-rendered while we waited (collapse on
+                // user select, pagination) — the captured card is then detached and
+                // writing into it silently discards the paid-for condensation.
+                // Persist into state instead so the next expanded render shows it.
+                const liveCard = document.getElementById(`sticker-${cssEscape(cacheKey)}`);
+                if (liveCard !== card) {
+                    const idx = stickerState.entries.findIndex(e => e.cacheKey === cacheKey);
+                    if (idx >= 0) stickerState.entries[idx].description = data.condensed;
+                    return;
+                }
                 ta.value = data.condensed;
                 // Re-fit the textarea height to the (typically much shorter) result.
                 ta.style.height = 'auto';
                 ta.style.height = Math.min(ta.scrollHeight, 192) + 'px';
-                status.textContent = `↓ ${original.length} → ${data.condensed.length} chars (review &amp; Save)`;
+                status.textContent = `↓ ${original.length} → ${data.condensed.length} chars (review & Save)`;
                 status.className = 'text-xs text-green-400';
             } catch (e) {
                 console.error('Failed to condense sticker:', e);
@@ -583,14 +596,35 @@
 
         function toggleStickerEditor() {
             stickerCollapsed = !stickerCollapsed;
-            renderStickerEditor(null);
+            renderStickerEditor();
         }
 
-        function renderStickerEditor(errMsg) {
+        /** Copy unsaved description/shortTag edits from the live grid back into
+         * stickerState.entries so an innerHTML re-render (collapse on user
+         * select, Hide, pagination) doesn't silently destroy them — the next
+         * expanded render rebuilds cards from entries. */
+        function syncStickerEditsToState() {
+            document.querySelectorAll('#stickerEditor [id^="sticker-"]').forEach(card => {
+                const desc = card.querySelector('textarea[data-field="description"]');
+                const tag = card.querySelector('input[data-field="shortTag"]');
+                if (!desc && !tag) return;
+                const entry = stickerState.entries.find(e => `sticker-${cssEscape(e.cacheKey)}` === card.id);
+                if (!entry) return; // page already flipped under this card
+                if (desc) entry.description = desc.value;
+                if (tag) entry.shortTag = tag.value;
+            });
+        }
+
+        function renderStickerEditor() {
+            syncStickerEditsToState();
+            const errMsg = stickerState.error;
             if (stickerCollapsed) {
+                const errChip = errMsg
+                    ? `<span class="text-xs text-red-400">load failed</span>`
+                    : `<span class="text-xs text-dark-muted font-normal">(${stickerState.total})</span>`;
                 document.getElementById('stickerEditor').innerHTML = `
                     <div class="bg-dark-card border border-dark-border rounded-lg px-4 py-2 flex items-center justify-between">
-                        <h2 class="text-lg font-semibold">🎴 Stickers &amp; Emoji <span class="text-xs text-dark-muted font-normal">(${stickerState.total})</span></h2>
+                        <h2 class="text-lg font-semibold">🎴 Stickers &amp; Emoji ${errChip}</h2>
                         <button onclick="toggleStickerEditor()"
                             class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs hover:bg-dark-border">Show</button>
                     </div>
@@ -1076,7 +1110,7 @@
             // (goal, tasks, history) isn't a full screen of scrolling away;
             // expand it back when the user is deselected.
             stickerCollapsed = !!document.getElementById('userSelect').value;
-            renderStickerEditor(null);
+            renderStickerEditor();
             loadUserData();
             // Scope-affecting change → refresh model list + token report.
             await loadKnownModels();
