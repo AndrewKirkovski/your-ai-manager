@@ -419,6 +419,12 @@ app.post('/api/stickers/:cacheKey/condense', async (req: Request, res: Response)
         const direction = req.body?.direction;
         let refine: { current: string; direction: 'shorter' | 'longer' } | undefined;
         if (current && (direction === 'shorter' || direction === 'longer')) {
+            // Refines must carry the pre-condense original explicitly. Falling
+            // back to the stored description would silently anchor "pull nuance
+            // back from the original" to an already-condensed saved text.
+            if (!bodyDesc.trim()) {
+                return res.status(400).json({ error: 'Refine requires description (the pre-condense original text)' });
+            }
             refine = { current, direction };
         } else if (current || direction !== undefined) {
             return res.status(400).json({ error: 'Refine requires both current (non-empty string) and direction ("shorter" | "longer")' });

@@ -431,6 +431,33 @@
         // model can pull nuance back in, not just paraphrase the paraphrase.
         // Transient by design (page-lifetime); survives grid re-renders.
         const condenseOriginals = new Map();
+        // Last AI suggestion per cacheKey — lets plain Condense distinguish a
+        // re-roll (textarea still holds our own suggestion → keep the true
+        // original) from a hand-rewritten description (→ becomes the new original).
+        const lastSuggestions = new Map();
+
+        /** Write a condense/refine result into a card: textarea value + re-fit,
+         * status line with length arrow, and reveal the Shorter/Longer buttons.
+         * `card` may be the originally captured card or a re-rendered live one. */
+        function applyCondenseResult(card, condensed, prevLen) {
+            const ta = card.querySelector('textarea[data-field="description"]');
+            const status = card.querySelector('[data-field="status"]');
+            const refineSpan = card.querySelector('[data-field="refine"]');
+            if (ta) {
+                ta.value = condensed;
+                ta.style.height = 'auto';
+                ta.style.height = Math.min(ta.scrollHeight, 192) + 'px';
+            }
+            if (status) {
+                const arrow = condensed.length < prevLen ? '↓' : condensed.length > prevLen ? '↑' : '→';
+                status.textContent = `${arrow} ${prevLen} → ${condensed.length} chars (review & Save)`;
+                status.className = 'text-xs text-green-400';
+            }
+            if (refineSpan) {
+                refineSpan.classList.remove('hidden');
+                refineSpan.classList.add('inline-flex');
+            }
+        }
 
         async function condenseSticker(cacheKey, btn, direction) {
             const card = document.getElementById(`sticker-${cssEscape(cacheKey)}`);
@@ -439,6 +466,11 @@
             const status = card.querySelector('[data-field="status"]');
             const refineSpan = card.querySelector('[data-field="refine"]');
             if (!ta) return;
+            // In-flight guard: ta is disabled for the duration of a condense
+            // request on this card — a second click (Condense during a refine or
+            // vice versa) would race two responses (last-writer-wins on the
+            // textarea) and clobber the originals map.
+            if (ta.disabled) return;
             const taValue = ta.value;
             if (!taValue.trim()) {
                 status.textContent = 'nothing to condense';
@@ -446,20 +478,26 @@
                 return;
             }
 
-            // Plain condense: current textarea text IS the original — remember it.
+            // Plain condense: current textarea text IS the original — remember it,
+            // UNLESS it's just our own previous suggestion (re-roll): overwriting
+            // then would make later "Longer" pull nuance from a paraphrase instead
+            // of the true original. A hand-rewritten description (differs from the
+            // last suggestion) legitimately becomes the new original.
             // Refine: send the remembered original + the current suggestion.
-            // (Fallback to taValue covers a refine after page reload lost the map.)
+            // (Fallback to taValue covers a refine whose original was never mapped.)
             let body;
             if (direction) {
                 body = { description: condenseOriginals.get(cacheKey) ?? taValue, current: taValue, direction };
             } else {
-                condenseOriginals.set(cacheKey, taValue);
-                body = { description: taValue };
+                if (taValue !== lastSuggestions.get(cacheKey)) {
+                    condenseOriginals.set(cacheKey, taValue);
+                }
+                body = { description: condenseOriginals.get(cacheKey) ?? taValue };
             }
 
             // Disable ALL condense-family buttons on this card + the textarea
             // while we wait, so the user doesn't pile up requests on the same row.
-            const condenseButtons = [btn, ...(refineSpan ? refineSpan.querySelectorAll('button') : [])]
+            const condenseButtons = [btn, ...card.querySelectorAll('[data-field="condense"], [data-field="refine"] button')]
                 .filter((b, i, arr) => arr.indexOf(b) === i);
             condenseButtons.forEach(b => { b.disabled = true; });
             const btnLabel = btn.textContent;
@@ -480,28 +518,27 @@
                     return;
                 }
                 const data = await res.json();
+                lastSuggestions.set(cacheKey, data.condensed);
                 // The grid may have been re-rendered while we waited (collapse on
-                // user select, pagination) — the captured card is then detached and
+                // user select, Hide/Show) — the captured card is then detached and
                 // writing into it silently discards the paid-for condensation.
-                // Persist into state instead so the next expanded render shows it.
                 const liveCard = document.getElementById(`sticker-${cssEscape(cacheKey)}`);
                 if (liveCard !== card) {
-                    const idx = stickerState.entries.findIndex(e => e.cacheKey === cacheKey);
-                    if (idx >= 0) stickerState.entries[idx].description = data.condensed;
+                    if (liveCard) {
+                        // A re-rendered card is visible: write into IT, not just
+                        // state — otherwise the next syncStickerEditsToState would
+                        // copy its stale textarea back over the state entry and
+                        // revert the result before it was ever displayed.
+                        applyCondenseResult(liveCard, data.condensed, taValue.length);
+                    } else {
+                        // Grid collapsed: state is the only place; the next
+                        // expanded render shows it.
+                        const idx = stickerState.entries.findIndex(e => e.cacheKey === cacheKey);
+                        if (idx >= 0) stickerState.entries[idx].description = data.condensed;
+                    }
                     return;
                 }
-                ta.value = data.condensed;
-                // Re-fit the textarea height to the (typically much shorter) result.
-                ta.style.height = 'auto';
-                ta.style.height = Math.min(ta.scrollHeight, 192) + 'px';
-                const arrow = data.condensed.length <= taValue.length ? '↓' : '↑';
-                status.textContent = `${arrow} ${taValue.length} → ${data.condensed.length} chars (review & Save)`;
-                status.className = 'text-xs text-green-400';
-                // A suggestion now exists — offer Shorter/Longer refines.
-                if (refineSpan) {
-                    refineSpan.classList.remove('hidden');
-                    refineSpan.classList.add('inline-flex');
-                }
+                applyCondenseResult(card, data.condensed, taValue.length);
             } catch (e) {
                 console.error('Failed to condense sticker:', e);
                 status.textContent = '✗ ' + (e.message || 'fetch failed');
@@ -584,7 +621,12 @@
 
             const emojiCell = (e.emojis || []).map(escapeHtml).join('') || '<span class="text-dark-muted text-[10px]">—</span>';
             const correctedBadge = `<span data-field="corrected-badge" class="px-1.5 rounded bg-yellow-700 text-yellow-100 text-[10px] ${e.userCorrected ? '' : 'hidden'}" title="user-corrected">✎</span>`;
-            const escKey = escapeHtml(e.cacheKey).replace(/'/g, "\\'");
+            // JS-escape FIRST, HTML-escape second: the browser HTML-decodes the
+            // onclick attribute before parsing it as JS, so escaping ' after
+            // escapeHtml (which turns it into &#39;) was a provable no-op — a
+            // quote in a cacheKey would break out of the JS string literal.
+            // Telegram cacheKeys are base64url in practice; defense-in-depth.
+            const escKey = escapeHtml(String(e.cacheKey).replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
 
             return `
                 <div id="${id}" class="border-b border-dark-border py-2 flex gap-3 items-start">
@@ -601,8 +643,10 @@
                             ${correctedBadge}
                             <span class="text-dark-muted ml-auto">used ${e.usedCount}×</span>
                             <span data-field="status" class="text-dark-muted"></span>
-                            <!-- refine buttons: hidden until a condense suggestion exists -->
-                            <span data-field="refine" class="hidden items-center gap-1">
+                            <!-- refine buttons: hidden until a condense suggestion exists.
+                                 Visibility survives re-renders via condenseOriginals (the
+                                 map lookup runs at template-build time, not in HTML). -->
+                            <span data-field="refine" class="${condenseOriginals.has(e.cacheKey) ? 'inline-flex' : 'hidden'} items-center gap-1">
                                 <button onclick="condenseSticker('${escKey}', this, 'shorter')"
                                     title="Re-ask AI: make the suggestion shorter"
                                     class="bg-purple-900 hover:bg-purple-800 px-2 py-0.5 rounded">Shorter</button>
@@ -610,7 +654,7 @@
                                     title="Re-ask AI: make the suggestion longer (pull nuance back from the original)"
                                     class="bg-purple-900 hover:bg-purple-800 px-2 py-0.5 rounded">Longer</button>
                             </span>
-                            <button onclick="condenseSticker('${escKey}', this)"
+                            <button data-field="condense" onclick="condenseSticker('${escKey}', this)"
                                 title="AI-condense the description focusing on meaning, not visual detail"
                                 class="bg-purple-700 hover:bg-purple-800 px-3 py-0.5 rounded">Condense</button>
                             <button onclick="saveSticker('${escKey}')"

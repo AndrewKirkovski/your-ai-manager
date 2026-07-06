@@ -134,6 +134,11 @@ export async function condenseStickerDescription(
         // Token usage attributed to the synthetic system user (user_id=0) since
         // condensing is a dashboard action, not tied to any chat user.
         recordLookupUsage(resp, 'condense_description', 0, lookupModel);
+        // Truncated completions come back mid-sentence with no other signal —
+        // surface it in logs; the admin reviews the text either way.
+        if (resp.choices[0]?.finish_reason === 'length') {
+            console.warn('[condense] response truncated at max_tokens — result may end mid-sentence');
+        }
         const raw = (resp.choices[0]?.message?.content ?? '').trim();
         if (!raw) return null;
         // Strip surrounding quotes the model occasionally adds despite the prompt.
