@@ -71,6 +71,9 @@
         let currentUser = null;
         let tokenState = { scope: 'global', days: 7, model: '', knownModels: [] };
         let stickerState = { kind: '', q: '', limit: 24, offset: 0, total: 0, entries: [], loading: false };
+        // Sticker editor collapses to a one-line header while a user is selected —
+        // the full grid otherwise pushes the user sections a screen-height down.
+        let stickerCollapsed = false;
 
         // Load users on page load
         async function loadUsers() {
@@ -578,7 +581,22 @@
             `;
         }
 
+        function toggleStickerEditor() {
+            stickerCollapsed = !stickerCollapsed;
+            renderStickerEditor(null);
+        }
+
         function renderStickerEditor(errMsg) {
+            if (stickerCollapsed) {
+                document.getElementById('stickerEditor').innerHTML = `
+                    <div class="bg-dark-card border border-dark-border rounded-lg px-4 py-2 flex items-center justify-between">
+                        <h2 class="text-lg font-semibold">🎴 Stickers &amp; Emoji <span class="text-xs text-dark-muted font-normal">(${stickerState.total})</span></h2>
+                        <button onclick="toggleStickerEditor()"
+                            class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs hover:bg-dark-border">Show</button>
+                    </div>
+                `;
+                return;
+            }
             const kindOpts = [
                 { value: '', label: 'All kinds' },
                 { value: 'sticker', label: 'Static' },
@@ -635,6 +653,8 @@
                             ${kindSelect}
                             ${searchInput}
                             ${pager}
+                            <button onclick="toggleStickerEditor()"
+                                class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs hover:bg-dark-border">Hide</button>
                         </div>
                     </div>
                     ${body}
@@ -1052,6 +1072,11 @@
 
         // Initialize
         document.getElementById('userSelect').addEventListener('change', async () => {
+            // Collapse the sticker grid while a user is selected so their data
+            // (goal, tasks, history) isn't a full screen of scrolling away;
+            // expand it back when the user is deselected.
+            stickerCollapsed = !!document.getElementById('userSelect').value;
+            renderStickerEditor(null);
             loadUserData();
             // Scope-affecting change → refresh model list + token report.
             await loadKnownModels();
