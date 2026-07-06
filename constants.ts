@@ -1,4 +1,4 @@
-import { tgEmojiPromptBlock } from './telegramFormat';
+import { stripSystemTags, tgEmojiPromptBlock } from './telegramFormat';
 
 export const CHARACTER_PROMPT = `
 CRITICAL: ONLY OUTPUT YOUR MESSAGE AS IF SPEAKING ALOUD, NEVER SPEAK FOR THE USER
@@ -283,7 +283,7 @@ Ask what they want help with. Keep it casual and SHORT. No bullet-point feature 
  * that spawned a task right after an ad-hoc reminder). Tells the AI to build
  * on the just-sent message instead of firing a dry back-to-back reminder. */
 export const RECENT_REMINDER_NOTE = (taskName: string, minAgo: number) => `
-NOTE: A reminder about "${taskName}" was sent just ${minAgo} min ago — it's in recent history.
+NOTE: A reminder about "${stripSystemTags(taskName)}" was sent just ${minAgo} min ago — it's in recent history.
 Don't fire a dry back-to-back reminder: reference the previous one / weave this task in naturally,
 or — if this task allows tools and stacking reminders feels spammy — postpone it via UpdateTask(ping_at="...") and write NOTHING to the user.`;
 
@@ -291,7 +291,7 @@ export const TASK_TRIGGERED_PROMPT = (memory: string, task: {id: string, name: s
 <system>
 ${memory}
 
-SITUATION: Time to remind user about task "${task.name}" (ID: ${task.id}).
+SITUATION: Time to remind user about task "${stripSystemTags(task.name)}" (ID: ${task.id}).
 ${recentReminderNote}
 YOUR TASK:
 1. If execution time (dueAt) hasn't expired yet OR dueAt is not set → schedule next reminder using UpdateTask tool
@@ -311,7 +311,7 @@ export const TASK_TRIGGERED_PROMPT_NO_ACTION = (memory: string, task: {id: strin
 <system>
 ${memory}
 
-Remind user about "${task.name}" (ID: ${task.id}). This is a no-action reminder — just a heads-up.
+Remind user about "${stripSystemTags(task.name)}" (ID: ${task.id}). This is a no-action reminder — just a heads-up.
 ${recentReminderNote}
 DO NOT USE ANY TOOLS — just write a brief message.
 Vary your phrasing. Check history for what you said last time about this task and say something different.
@@ -331,6 +331,7 @@ You are deconflicting the reminder schedule. Upcoming collisions were detected (
 ${clustersText}
 
 RULES:
+- Use ONLY schedule tools: UpdateTask, UpdateRoutine, and read-only task/routine getters. NEVER call tools that contact the user (SendStickerToUser, stat/chart tools, image tools, web search) — this is an invisible maintenance run.
 - "predicted routine fire" entries are FIXED points — they come from a routine's cron and cannot be moved by editing tasks. Move ad-hoc tasks AWAY from them.
 - Fix each cluster with UpdateTask(task_id, ping_at="...") so events end up at least 10 minutes apart.
 - Prefer moving low-annoyance tasks; keep high-annoyance / urgent (dueAt soon) tasks where they are.

@@ -1,6 +1,15 @@
 // Define the GetTaskById tool
 import {Tool} from "./tool.types";
 import {textify} from "./telegramFormat";
+
+/** Throw if a date-time tool arg doesn't parse. Without this, `new Date(garbage)`
+ * silently yields Invalid Date and the task never fires again — invisible in
+ * silent background runs (collision fixer) where nobody reads the reply. */
+function assertParseableDate(value: string, field: string): void {
+    if (isNaN(new Date(value).getTime())) {
+        throw new Error(`Invalid ${field}: "${value}" is not a parseable ISO date-time`);
+    }
+}
 import {
     addUserTask,
     generateShortId,
@@ -128,6 +137,8 @@ export const AddTask: Tool = {
         if (args.annoyance && !['low', 'med', 'high'].includes(args.annoyance)) {
             throw new Error(`Invalid annoyance level: ${args.annoyance}. Must be one of: low, med, high`);
         }
+        assertParseableDate(args.ping_at, 'ping_at');
+        if (args.due_at) assertParseableDate(args.due_at, 'due_at');
         const cleanName = textify(args.name);
 
         const newTask: Task = {
@@ -250,6 +261,9 @@ export const UpdateTask: Tool = {
         if (args.annoyance && !['low', 'med', 'high'].includes(args.annoyance)) {
             throw new Error(`Invalid annoyance level: ${args.annoyance}. Must be one of: low, med, high`);
         }
+
+        if (args.ping_at) assertParseableDate(args.ping_at, 'ping_at');
+        if (args.due_at) assertParseableDate(args.due_at, 'due_at');
 
         // Check if task exists
         const existingTask = await getTask(userId, taskId);

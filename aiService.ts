@@ -20,9 +20,12 @@ export interface AIStreamOptions {
     model: string;
     maxTokens?: number;
     /**
-     * Default true. Set false for fully-silent background runs (e.g. the
-     * collision fixer): no streaming message, no typing indicator, and no
-     * user-facing 🐺 error on failure — tool calls still execute.
+     * Default true. Set false for silent background runs (e.g. the collision
+     * fixer): aiService itself sends nothing — no streaming message, no typing
+     * indicator, no image gallery, no user-facing 🐺 error on failure. Tool
+     * calls still execute, and tools with their own Telegram side effects
+     * (SendStickerToUser, stat charts) are NOT blocked here — silent callers
+     * must steer the model away from those in the prompt.
      */
     shouldUpdateTelegram?: boolean;
     addUserToHistory?: boolean;
@@ -421,7 +424,10 @@ export class AIService {
                         if ((toolName === 'WebSearch' || toolName === 'SearchImages') &&
                             result && typeof result === 'object' && 'images' in result) {
                             const images = (result as { images?: string[] }).images;
-                            if (images && images.length > 0 && options.onImageResults) {
+                            // shouldUpdateTelegram gate: the gallery is user-facing
+                            // output — silent runs must not send it even if the
+                            // caller wired the callback.
+                            if (images && images.length > 0 && options.onImageResults && shouldUpdateTelegram) {
                                 console.log(`   🖼️ Sending ${images.length} images separately`);
                                 await options.onImageResults(images);
                             }

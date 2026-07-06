@@ -2,10 +2,11 @@ import type TelegramBot from 'node-telegram-bot-api';
 import { CronExpressionParser } from 'cron-parser';
 import type { AIProvider } from './aiProvider';
 import type { Routine } from './userStore';
-import { getAllUsers } from './userStore';
+import { getAllUsers, getAllTasks } from './userStore';
 import { AIService } from './aiService';
 import { getSystemPrompt, COLLISION_FIX_PROMPT } from './constants';
 import { getCurrentTime, formatDateHuman } from './dateUtils';
+import { stripSystemTags } from './telegramFormat';
 
 // Mirrors index.ts — single bot-wide timezone.
 const BOT_TZ = process.env.TZ || 'Europe/Warsaw';
@@ -62,13 +63,18 @@ export function predictRoutineFires(routines: Routine[], windowStart: Date, wind
     return events;
 }
 
-/** A cluster whose only members are one task and its own parent routine's
- * fire is already handled at trigger time (TASK_TRIGGERED_PROMPT: "new task
- * from same routine started → MarkTaskFailed") — not actionable here. */
+/** Two cluster shapes are by-design and NOT actionable:
+ * - one task + its own parent routine's fire (trigger-time prompt handles it:
+ *   "new task from same routine started → MarkTaskFailed");
+ * - fires of a SINGLE routine with no tasks (e.g. cron "0,3 12 * * *" — an
+ *   intentional double-reminder schedule; "fixing" it would silently rewrite
+ *   the user's cron, and declining would re-spend an AI call every run since
+ *   sliding fire times produce fresh signatures). */
 function isActionable(cluster: ScheduleEvent[]): boolean {
     const tasks = cluster.filter(e => e.kind === 'task');
     const routines = cluster.filter(e => e.kind === 'routine');
     if (tasks.length === 1 && routines.length === 1 && tasks[0].routineId === routines[0].id) return false;
+    if (tasks.length === 0 && new Set(routines.map(r => r.id)).size === 1) return false;
     return tasks.length > 0 || routines.length >= 2;
 }
 
@@ -108,7 +114,9 @@ function formatClusters(clusters: ScheduleEvent[][]): string {
                 const extra = e.kind === 'routine'
                     ? `routine_id: ${e.id}`
                     : `task_id: ${e.id}${e.routineId ? `, from routine ${e.routineId}` : ''}${e.dueAt ? `, dueAt: ${e.dueAt.toISOString()}` : ', no dueAt'}`;
-                return `  - [${kindLabel}] "${e.name}" at ${e.at.toISOString()} (${formatDateHuman(e.at)}) — ${extra}, annoyance: ${e.annoyance}`;
+                // Names are textified at write, but strip <system> at read too
+                // (legacy rows / defense-in-depth, same as getCurrentInfo).
+                return `  - [${kindLabel}] "${stripSystemTags(e.name)}" at ${e.at.toISOString()} (${formatDateHuman(e.at)}) — ${extra}, annoyance: ${e.annoyance}`;
             });
             return `Cluster ${i + 1}:\n${lines.join('\n')}`;
         })
@@ -176,15 +184,39 @@ export async function runCollisionFixer(deps: CollisionFixerDeps): Promise<void>
             // Awaited: bounds the cycle to one silent AI call at a time and
             // serializes with any in-flight chat reply for this user.
             await deps.enqueue(user.userId, async () => {
+                // Re-validate against fresh DB state: the queue may have delayed
+                // us behind a long chat reply, during which cluster tasks can
+                // fire (minute tick marks them completed/needs_replanning) or be
+                // moved/completed by the user's own tool calls. Prompting the AI
+                // with stale members would make its UpdateTask reset an already-
+                // handled task back to 'pending' — a resurrected duplicate ping.
+                const freshTasks = await getAllTasks(user.userId);
+                const freshClusters = clusters
+                    .map(c => c.filter(e => {
+                        if (e.kind === 'routine') return true;
+                        const t = freshTasks.find(ft => ft.id === e.id);
+                        return !!t && t.status === 'pending'
+                            && Math.abs(t.pingAt.getTime() - e.at.getTime()) < 60_000;
+                    }))
+                    .filter(c => c.length >= 2 && isActionable(c));
+                if (freshClusters.length === 0) {
+                    console.log('🧭 [collision-fix] clusters went stale in queue, skipping:', { userId: user.userId });
+                    return;
+                }
+
                 const memory = await deps.getCurrentInfo(user.userId);
                 const result = await AIService.streamAIResponse({
                     userId: user.userId,
-                    userMessage: COLLISION_FIX_PROMPT(memory, formatClusters(clusters)),
+                    userMessage: COLLISION_FIX_PROMPT(memory, formatClusters(freshClusters)),
                     systemPromptCachePrefix: getSystemPrompt(),
                     systemPrompt: '', // memory inlined into the prompt
                     bot: deps.bot,
                     provider: deps.provider,
                     model: deps.model,
+                    // Above the 1500 default: a many-cluster run needs room for
+                    // several tool calls (+ adaptive-thinking models spend from
+                    // the same budget); truncation mid-tool-call wastes the run.
+                    maxTokens: 4000,
                     shouldUpdateTelegram: false,
                     addUserToHistory: false,
                     addAssistantToHistory: false,

@@ -97,7 +97,11 @@ function enqueueChained(map: Map<number, Promise<void>>, userId: number, work: (
     const prev = map.get(userId) ?? Promise.resolve();
     const next = prev.catch(() => { /* swallow prior error so chain continues */ }).then(work);
     map.set(userId, next);
-    next.finally(() => {
+    // .catch before .finally: the finally-derived promise would otherwise
+    // re-raise work's rejection as an unhandledRejection (logged noise —
+    // the global handler catches it, but awaiting callers already see the
+    // rejection through the returned `next`).
+    next.catch(() => {}).finally(() => {
         if (map.get(userId) === next) map.delete(userId);
     });
     return next;
@@ -582,14 +586,16 @@ cron.schedule('* * * * *', async () => {
             try {
                 console.log('📱 Pinging user about pending task:', dueTask);
 
+                // Re-check status inside the fresh read: an in-flight chat
+                // reply's tool call (MarkTaskComplete, UpdateTask) can land
+                // between the tick's snapshot and this write — don't resurrect
+                // a task the user just completed.
+                let marked = false;
                 await updateUserTask(user.userId, dueTask.id, (t) => {
+                    if (t.status !== 'pending') return;
                     t.status = dueTask.requiresAction ? 'needs_replanning' : 'completed';
+                    marked = true;
                 });
-
-                // Snapshot the PREVIOUS reminder before recording our own —
-                // the note must reference the reminder that preceded this one.
-                const prevReminder = lastReminderAt.get(user.userId);
-                lastReminderAt.set(user.userId, { at: nowDate.getTime(), taskName: dueTask.name });
 
                 // Serialize with the live bot.on('message') path via enqueuePerUser —
                 // otherwise a user typing at the same minute a routine fires produces
@@ -599,12 +605,23 @@ cron.schedule('* * * * *', async () => {
                 // in parallel. Awaiting here would block the whole tick on one user's
                 // AI roundtrip and cause routineTickRunning to skip the next minute
                 // for everyone.
-                void enqueuePerUser(user.userId, async () => {
+                if (marked) void enqueuePerUser(user.userId, async () => {
                     try {
                         const memory = await getCurrentInfo(user.userId);
 
+                        // lastReminderAt is read AND written inside this queued
+                        // closure (per-user serialized, so no race): reading at
+                        // dispatch time would understate queue delay, and writing
+                        // at dispatch time would record reminders that never
+                        // reached the user (AI failure, or the AI obeying the
+                        // note's "postpone silently" branch). Same-task re-pings
+                        // get no note — high-annoyance nagging about one task is
+                        // deliberate, and there's no other message to weave into.
+                        const prevReminder = lastReminderAt.get(user.userId);
                         const sinceMs = prevReminder ? Date.now() - prevReminder.at : Infinity;
-                        const note = prevReminder && sinceMs <= RECENT_REMINDER_WINDOW_MS
+                        const note = prevReminder
+                            && prevReminder.taskName !== dueTask.name
+                            && sinceMs <= RECENT_REMINDER_WINDOW_MS
                             ? RECENT_REMINDER_NOTE(prevReminder.taskName, Math.max(1, Math.round(sinceMs / 60_000)))
                             : '';
 
@@ -612,6 +629,7 @@ cron.schedule('* * * * *', async () => {
                             ? TASK_TRIGGERED_PROMPT(memory, dueTask, note)
                             : TASK_TRIGGERED_PROMPT_NO_ACTION(memory, dueTask, note);
 
+                        let streamedText = false;
                         const result = await AIService.streamAIResponse({
                             userId: user.userId,
                             userMessage: taskPrompt,
@@ -624,12 +642,21 @@ cron.schedule('* * * * *', async () => {
                             addAssistantToHistory: true,
                             enableToolCalls: true,
                             purpose: 'task-reminder',
+                            onTextStreamed: () => { streamedText = true; },
                         });
+
+                        // Record only reminders the user actually saw.
+                        if (streamedText) {
+                            lastReminderAt.set(user.userId, { at: Date.now(), taskName: dueTask.name });
+                        }
 
                         console.log(result);
                     } catch (error) {
-                        // Recoverable: the needs_replanning mark already landed, and
-                        // getCurrentInfo re-surfaces it to every subsequent AI call.
+                        // Action tasks are recoverable: the needs_replanning mark
+                        // already landed and getCurrentInfo re-surfaces them to every
+                        // subsequent AI call. No-action tasks were marked completed —
+                        // a failure here silently drops that heads-up (accepted; same
+                        // as pre-stagger behavior).
                         console.error('❌ Task reminder failed:', {
                             userId: user.userId,
                             taskId: dueTask.id,
@@ -649,9 +676,20 @@ cron.schedule('* * * * *', async () => {
 
         for (let i = 0; i < staggeredTasks.length; i++) {
             const task = staggeredTasks[i];
-            const newPingAt = new Date(nowDate.getTime() + STAGGER_STEP_MS * (i + 1));
+            // Clamp at dueAt so our own collision-avoidance never pushes a task
+            // past its deadline (the trigger prompt would then auto-fail a task
+            // the user was never reminded about). Floor at +1 min keeps it off
+            // this tick; a dueAt-clamped task fires next tick with the note.
+            let pingMs = nowDate.getTime() + STAGGER_STEP_MS * (i + 1);
+            if (task.dueAt) pingMs = Math.min(pingMs, task.dueAt.getTime());
+            pingMs = Math.max(pingMs, nowDate.getTime() + 60_000);
+            const newPingAt = new Date(pingMs);
             try {
                 await updateUserTask(user.userId, task.id, (t) => {
+                    // Fresh-read re-check: skip if a concurrent tool call completed
+                    // the task or already moved its ping (e.g. user said "напомни
+                    // завтра" while this tick was running).
+                    if (t.status !== 'pending' || t.pingAt > nowDate) return;
                     t.pingAt = newPingAt;
                 });
                 console.log('⏭️ Staggered reminder (another task due same tick):', {
@@ -710,8 +748,17 @@ cron.schedule('*/10 * * * *', async () => {
 // Look-ahead reminder-collision fixer: silently spreads task pings that would
 // land within 5 min of each other (or of a predicted routine fire) via a
 // no-Telegram AI call. Minutes 7/37 — offset from :00 where most routines
-// fire and history compaction runs.
-cron.schedule(process.env.COLLISION_FIXER_CRON || '7,37 * * * *', async () => {
+// fire and history compaction runs. Validate the env override — an invalid
+// expression would throw at startup and put the container in a restart loop.
+const COLLISION_FIXER_CRON_DEFAULT = '7,37 * * * *';
+const collisionFixerCron = (() => {
+    const fromEnv = process.env.COLLISION_FIXER_CRON;
+    if (!fromEnv) return COLLISION_FIXER_CRON_DEFAULT;
+    if (cron.validate(fromEnv)) return fromEnv;
+    console.warn(`🧭 Invalid COLLISION_FIXER_CRON "${fromEnv}", falling back to "${COLLISION_FIXER_CRON_DEFAULT}"`);
+    return COLLISION_FIXER_CRON_DEFAULT;
+})();
+cron.schedule(collisionFixerCron, async () => {
     try {
         await runCollisionFixer({
             bot,

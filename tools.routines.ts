@@ -1,5 +1,17 @@
 import {Tool} from "./tool.types";
 import {textify} from "./telegramFormat";
+import {CronExpressionParser} from "cron-parser";
+
+/** Throw if a cron tool arg doesn't parse. An unparseable cron silently kills
+ * the routine (minute tick logs an error forever, routine never fires) —
+ * invisible in silent background runs where nobody reads the reply. */
+function assertParseableCron(value: string): void {
+    try {
+        CronExpressionParser.parse(value);
+    } catch {
+        throw new Error(`Invalid cron expression: "${value}"`);
+    }
+}
 import {
     addUserRoutine,
     generateShortId,
@@ -54,6 +66,8 @@ export const AddRoutine: Tool = {
         if (args.default_annoyance && !['low', 'med', 'high'].includes(args.default_annoyance)) {
             throw new Error(`Invalid annoyance level: ${args.default_annoyance}. Must be one of: low, med, high`);
         }
+
+        assertParseableCron(args.cron);
 
         const newRoutine: Routine = {
             id: generateShortId(),
@@ -126,6 +140,8 @@ export const UpdateRoutine: Tool = {
         if (args.default_annoyance && !['low', 'med', 'high'].includes(args.default_annoyance)) {
             throw new Error(`Invalid annoyance level: ${args.default_annoyance}. Must be one of: low, med, high`);
         }
+
+        if (args.cron !== undefined) assertParseableCron(args.cron);
 
         // Check if routine exists
         const existingRoutine = await getRoutine(userId, routineId);
