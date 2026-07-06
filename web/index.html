@@ -434,7 +434,12 @@
         // Last AI suggestion per cacheKey — lets plain Condense distinguish a
         // re-roll (textarea still holds our own suggestion → keep the true
         // original) from a hand-rewritten description (→ becomes the new original).
+        // Also drives refine-button visibility (a suggestion provably exists).
         const lastSuggestions = new Map();
+        // In-flight condense/refine requests by cacheKey. A module-level Set —
+        // NOT DOM state — because grid re-renders (collapse, Hide/Show) replace
+        // the card and would otherwise silently re-arm its buttons mid-request.
+        const condenseInFlight = new Set();
 
         /** Write a condense/refine result into a card: textarea value + re-fit,
          * status line with length arrow, and reveal the Shorter/Longer buttons.
@@ -466,11 +471,11 @@
             const status = card.querySelector('[data-field="status"]');
             const refineSpan = card.querySelector('[data-field="refine"]');
             if (!ta) return;
-            // In-flight guard: ta is disabled for the duration of a condense
-            // request on this card — a second click (Condense during a refine or
-            // vice versa) would race two responses (last-writer-wins on the
-            // textarea) and clobber the originals map.
-            if (ta.disabled) return;
+            // In-flight guard, keyed by cacheKey so it survives grid re-renders —
+            // a second request (Condense during a refine or vice versa) would
+            // race two responses (last-writer-wins on the textarea) and clobber
+            // the originals map.
+            if (condenseInFlight.has(cacheKey)) return;
             const taValue = ta.value;
             if (!taValue.trim()) {
                 status.textContent = 'nothing to condense';
@@ -495,8 +500,10 @@
                 body = { description: condenseOriginals.get(cacheKey) ?? taValue };
             }
 
+            condenseInFlight.add(cacheKey);
             // Disable ALL condense-family buttons on this card + the textarea
-            // while we wait, so the user doesn't pile up requests on the same row.
+            // while we wait (UI mirror of the Set — a re-rendered card gets the
+            // same disabled state from renderStickerCard via condenseInFlight).
             const condenseButtons = [btn, ...card.querySelectorAll('[data-field="condense"], [data-field="refine"] button')]
                 .filter((b, i, arr) => arr.indexOf(b) === i);
             condenseButtons.forEach(b => { b.disabled = true; });
@@ -544,9 +551,19 @@
                 status.textContent = '✗ ' + (e.message || 'fetch failed');
                 status.className = 'text-xs text-red-400';
             } finally {
+                condenseInFlight.delete(cacheKey);
                 condenseButtons.forEach(b => { b.disabled = false; });
                 btn.textContent = btnLabel;
                 ta.disabled = false;
+                // A card re-rendered mid-request was TEMPLATED disabled (via
+                // condenseInFlight) — the captured references above point at the
+                // detached old card, so re-enable the live one explicitly.
+                const nowCard = document.getElementById(`sticker-${cssEscape(cacheKey)}`);
+                if (nowCard && nowCard !== card) {
+                    nowCard.querySelectorAll('[data-field="condense"], [data-field="refine"] button').forEach(b => { b.disabled = false; });
+                    const nowTa = nowCard.querySelector('textarea[data-field="description"]');
+                    if (nowTa) nowTa.disabled = false;
+                }
             }
         }
 
@@ -643,25 +660,30 @@
                             ${correctedBadge}
                             <span class="text-dark-muted ml-auto">used ${e.usedCount}×</span>
                             <span data-field="status" class="text-dark-muted"></span>
-                            <!-- refine buttons: hidden until a condense suggestion exists.
-                                 Visibility survives re-renders via condenseOriginals (the
-                                 map lookup runs at template-build time, not in HTML). -->
-                            <span data-field="refine" class="${condenseOriginals.has(e.cacheKey) ? 'inline-flex' : 'hidden'} items-center gap-1">
+                            <!-- refine buttons: hidden until a condense SUGGESTION exists
+                                 (lastSuggestions is set only on success — condenseOriginals
+                                 is set before the request and would show them on failure).
+                                 Map lookups run at template-build time, not in HTML.
+                                 inFlight mirrors the condenseInFlight lock across re-renders. -->
+                            <span data-field="refine" class="${lastSuggestions.has(e.cacheKey) ? 'inline-flex' : 'hidden'} items-center gap-1">
                                 <button onclick="condenseSticker('${escKey}', this, 'shorter')"
+                                    ${condenseInFlight.has(e.cacheKey) ? 'disabled' : ''}
                                     title="Re-ask AI: make the suggestion shorter"
                                     class="bg-purple-900 hover:bg-purple-800 px-2 py-0.5 rounded">Shorter</button>
                                 <button onclick="condenseSticker('${escKey}', this, 'longer')"
+                                    ${condenseInFlight.has(e.cacheKey) ? 'disabled' : ''}
                                     title="Re-ask AI: make the suggestion longer (pull nuance back from the original)"
                                     class="bg-purple-900 hover:bg-purple-800 px-2 py-0.5 rounded">Longer</button>
                             </span>
                             <button data-field="condense" onclick="condenseSticker('${escKey}', this)"
+                                ${condenseInFlight.has(e.cacheKey) ? 'disabled' : ''}
                                 title="AI-condense the description focusing on meaning, not visual detail"
                                 class="bg-purple-700 hover:bg-purple-800 px-3 py-0.5 rounded">Condense</button>
                             <button onclick="saveSticker('${escKey}')"
                                 class="bg-blue-600 hover:bg-blue-700 px-3 py-0.5 rounded">Save</button>
                         </div>
                         <!-- description, full-width, 2 rows tall by default — auto-grows on input -->
-                        <textarea data-field="description"
+                        <textarea data-field="description" ${condenseInFlight.has(e.cacheKey) ? 'disabled' : ''}
                             class="bg-dark-bg border border-dark-border rounded px-2 py-1 text-xs w-full resize-y min-h-[2.25rem] max-h-48 overflow-y-auto"
                             rows="2" placeholder="description"
                             oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,192)+'px'">${escapeHtml(e.description || '')}</textarea>
@@ -699,9 +721,10 @@
             syncStickerEditsToState();
             const errMsg = stickerState.error;
             if (stickerCollapsed) {
+                const filterNote = (stickerState.q || stickerState.kind) ? ' matching' : '';
                 const errChip = errMsg
                     ? `<span class="text-xs text-red-400">load failed</span>`
-                    : `<span class="text-xs text-dark-muted font-normal">(${stickerState.total})</span>`;
+                    : `<span class="text-xs text-dark-muted font-normal">(${stickerState.total}${filterNote})</span>`;
                 document.getElementById('stickerEditor').innerHTML = `
                     <div class="bg-dark-card border border-dark-border rounded-lg px-4 py-2 flex items-center justify-between">
                         <h2 class="text-lg font-semibold">🎴 Stickers &amp; Emoji ${errChip}</h2>

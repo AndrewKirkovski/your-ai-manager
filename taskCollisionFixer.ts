@@ -1,5 +1,6 @@
 import type TelegramBot from 'node-telegram-bot-api';
 import { CronExpressionParser } from 'cron-parser';
+import { DateTime } from 'luxon';
 import type { AIProvider } from './aiProvider';
 import type { Routine } from './userStore';
 import { getAllUsers, getAllTasks } from './userStore';
@@ -13,8 +14,10 @@ const BOT_TZ = process.env.TZ || 'Europe/Warsaw';
 
 // Two events closer than this are a collision; the AI is told to spread them
 // to >= 10 minutes apart (comfortably above this threshold, so a fixed
-// cluster doesn't re-trigger on the next run).
-const CLUSTER_GAP_MS = 5 * 60_000;
+// cluster doesn't re-trigger on the next run). Strictly BELOW the minute
+// tick's STAGGER_STEP_MS (5 min) — tasks the tick just staggered are exactly
+// 5 min apart and must not be re-flagged as collisions here.
+const CLUSTER_GAP_MS = 4 * 60_000;
 // Routines firing more often than this within the look-ahead window are
 // intentional nag-loops (e.g. */15) — their self-collisions are by design,
 // so predicting them would report unfixable clusters every run.
@@ -96,12 +99,17 @@ export function clusterEvents(events: ScheduleEvent[], gapMs = CLUSTER_GAP_MS): 
     return clusters.filter(isActionable);
 }
 
-/** Stable identity of a cluster: sorted kind:id@minute. If the AI (or the
- * user) moves any member, the signature changes and the cluster is retried
- * naturally; an identical signature within RETRY_MS is skipped. */
+/** Stable identity of a cluster. Tasks are one-shot → absolute minute; routine
+ * fires RECUR → time-of-day in BOT_TZ, otherwise a recurring collision the AI
+ * declined to fix would mint a fresh signature every day and re-spend a silent
+ * AI call forever. If the AI (or the user) moves any member, the signature
+ * changes and the cluster is retried naturally; an identical signature within
+ * RETRY_MS is skipped. */
 export function clusterSignature(cluster: ScheduleEvent[]): string {
     return cluster
-        .map(e => `${e.kind}:${e.id}@${Math.floor(e.at.getTime() / 60_000)}`)
+        .map(e => e.kind === 'routine'
+            ? `routine:${e.id}@tod:${DateTime.fromJSDate(e.at, { zone: BOT_TZ }).hour * 60 + DateTime.fromJSDate(e.at, { zone: BOT_TZ }).minute}`
+            : `task:${e.id}@${Math.floor(e.at.getTime() / 60_000)}`)
         .sort()
         .join('|');
 }
@@ -123,9 +131,19 @@ function formatClusters(clusters: ScheduleEvent[][]): string {
         .join('\n\n');
 }
 
-// userId → cluster signature → last attempt (ms). In-memory on purpose: a
-// restart merely retries each cluster once, and the fix is idempotent.
+// userId → cluster signature → suppressed-until (ms epoch). Marked ONLY after
+// a successful AI attempt — a 429/outage must not burn the backoff window.
+// Task clusters retry after RETRY_MS; routine-only clusters recur daily by
+// nature (their signatures are time-of-day-stable), so a declined fix is
+// suppressed for a week instead of re-spending an AI call every few hours.
+// In-memory on purpose: a restart merely retries each cluster once, and the
+// fix is idempotent.
 const attempted = new Map<number, Map<string, number>>();
+const RETRY_MS_ROUTINE_ONLY = 7 * 24 * 3600_000;
+
+function retryMsFor(cluster: ScheduleEvent[]): number {
+    return cluster.every(e => e.kind === 'routine') ? RETRY_MS_ROUTINE_ONLY : RETRY_MS;
+}
 
 export interface CollisionFixerDeps {
     bot: TelegramBot;
@@ -135,12 +153,14 @@ export interface CollisionFixerDeps {
     enqueue: (userId: number, work: () => Promise<void>) => Promise<void>;
     /** index.ts getCurrentInfo — same memory block the chat prompts use. */
     getCurrentInfo: (userId: number) => Promise<string>;
+    /** index.ts isAllowedUser — don't spend AI money on non-allowlisted rows. */
+    isUserAllowed: (userId: number) => boolean;
 }
 
 /** Look-ahead reminder-collision fixer. For each user: pending task pings in
  * the next 24h + predicted routine fires → clusters of events within 5 min →
- * one SILENT AI call (tools enabled, nothing sent to Telegram) that spreads
- * them apart via UpdateTask/UpdateRoutine. */
+ * one SILENT AI call (schedule tools only, nothing sent to Telegram) that
+ * spreads them apart via RescheduleTaskPing/UpdateRoutine. */
 export async function runCollisionFixer(deps: CollisionFixerDeps): Promise<void> {
     const now = getCurrentTime();
     const windowStart = now.plus({ minutes: WINDOW_START_BUFFER_MIN }).toJSDate();
@@ -149,6 +169,7 @@ export async function runCollisionFixer(deps: CollisionFixerDeps): Promise<void>
 
     for (const user of users) {
         if (!user.chatId) continue;
+        if (!deps.isUserAllowed(user.userId)) continue;
         try {
             const taskEvents: ScheduleEvent[] = (user.tasks ?? [])
                 .filter(t => t.status === 'pending' && t.pingAt >= windowStart && t.pingAt <= windowEnd)
@@ -165,16 +186,14 @@ export async function runCollisionFixer(deps: CollisionFixerDeps): Promise<void>
 
             const userAttempts = attempted.get(user.userId) ?? new Map<string, number>();
             const nowMs = Date.now();
-            for (const [sig, ts] of userAttempts) {
-                if (nowMs - ts > RETRY_MS) userAttempts.delete(sig);
+            for (const [sig, suppressedUntil] of userAttempts) {
+                if (nowMs >= suppressedUntil) userAttempts.delete(sig);
             }
+            attempted.set(user.userId, userAttempts);
 
             const clusters = clusterEvents([...taskEvents, ...routineEvents])
                 .filter(c => !userAttempts.has(clusterSignature(c)));
             if (clusters.length === 0) continue;
-
-            for (const c of clusters) userAttempts.set(clusterSignature(c), nowMs);
-            attempted.set(user.userId, userAttempts);
 
             console.log('🧭 [collision-fix] clusters found:', {
                 userId: user.userId,
@@ -187,27 +206,37 @@ export async function runCollisionFixer(deps: CollisionFixerDeps): Promise<void>
                 // Re-validate against fresh DB state: the queue may have delayed
                 // us behind a long chat reply, during which cluster tasks can
                 // fire (minute tick marks them completed/needs_replanning) or be
-                // moved/completed by the user's own tool calls. Prompting the AI
-                // with stale members would make its UpdateTask reset an already-
-                // handled task back to 'pending' — a resurrected duplicate ping.
+                // moved/completed by the user's own tool calls. Also RE-APPLY the
+                // start buffer with the CURRENT clock: the scan-time buffer is
+                // consumed by queue delay, and handing the AI a task the minute
+                // tick is about to fire (or firing mid-stream) reopens the
+                // resurrect-and-double-ping race the buffer exists to prevent.
                 const freshTasks = await getAllTasks(user.userId);
-                const freshClusters = clusters
-                    .map(c => c.filter(e => {
-                        if (e.kind === 'routine') return true;
-                        const t = freshTasks.find(ft => ft.id === e.id);
-                        return !!t && t.status === 'pending'
-                            && Math.abs(t.pingAt.getTime() - e.at.getTime()) < 60_000;
+                const bufferEdge = Date.now() + WINDOW_START_BUFFER_MIN * 60_000;
+                const freshPairs = clusters
+                    .map(orig => ({
+                        orig,
+                        fresh: orig.filter(e => {
+                            if (e.at.getTime() < bufferEdge) return false;
+                            if (e.kind === 'routine') return true;
+                            const t = freshTasks.find(ft => ft.id === e.id);
+                            return !!t && t.status === 'pending'
+                                && Math.abs(t.pingAt.getTime() - e.at.getTime()) < 60_000;
+                        }),
                     }))
-                    .filter(c => c.length >= 2 && isActionable(c));
-                if (freshClusters.length === 0) {
+                    .filter(p => p.fresh.length >= 2 && isActionable(p.fresh));
+                if (freshPairs.length === 0) {
                     console.log('🧭 [collision-fix] clusters went stale in queue, skipping:', { userId: user.userId });
                     return;
                 }
 
                 const memory = await deps.getCurrentInfo(user.userId);
+                // Throws on provider failure (silent mode rethrows) — caught by
+                // the per-user catch below WITHOUT marking the clusters
+                // attempted, so a 429 at :07 doesn't burn the backoff window.
                 const result = await AIService.streamAIResponse({
                     userId: user.userId,
-                    userMessage: COLLISION_FIX_PROMPT(memory, formatClusters(freshClusters)),
+                    userMessage: COLLISION_FIX_PROMPT(memory, formatClusters(freshPairs.map(p => p.fresh))),
                     systemPromptCachePrefix: getSystemPrompt(),
                     systemPrompt: '', // memory inlined into the prompt
                     bot: deps.bot,
@@ -221,8 +250,25 @@ export async function runCollisionFixer(deps: CollisionFixerDeps): Promise<void>
                     addUserToHistory: false,
                     addAssistantToHistory: false,
                     enableToolCalls: true,
+                    // Hard allowlist (enforced in aiService, not just prompted):
+                    // schedule tools only, and RescheduleTaskPing instead of
+                    // UpdateTask — it compare-and-sets on status==='pending' and
+                    // rejects past / post-dueAt moves, so this run cannot
+                    // resurrect a fired task or break a deadline even if the
+                    // model ignores every prompt rule.
+                    allowedTools: [
+                        'RescheduleTaskPing', 'GetTaskById', 'GetTasksByIdList', 'GetTasksByStatus', 'GetTasksByRoutine',
+                        'UpdateRoutine', 'ListRoutines', 'GetRoutineById',
+                    ],
                     purpose: 'collision-fix',
                 });
+
+                // Mark attempted ONLY after a successful AI round trip.
+                const doneMs = Date.now();
+                for (const p of freshPairs) {
+                    userAttempts.set(clusterSignature(p.orig), doneMs + retryMsFor(p.orig));
+                }
+
                 console.log('🧭 [collision-fix] result:', {
                     userId: user.userId,
                     summary: result.message.slice(0, 300),

@@ -284,8 +284,9 @@ Ask what they want help with. Keep it casual and SHORT. No bullet-point feature 
  * on the just-sent message instead of firing a dry back-to-back reminder. */
 export const RECENT_REMINDER_NOTE = (taskName: string, minAgo: number) => `
 NOTE: A reminder about "${stripSystemTags(taskName)}" was sent just ${minAgo} min ago — it's in recent history.
-Don't fire a dry back-to-back reminder: reference the previous one / weave this task in naturally,
-or — if this task allows tools and stacking reminders feels spammy — postpone it via UpdateTask(ping_at="...") and write NOTHING to the user.`;
+Don't fire a dry back-to-back reminder: reference the previous one / weave this task in naturally.
+If this task allows tools and stacking reminders feels spammy, you may instead postpone it via UpdateTask(ping_at="...")
+and write NOTHING to the user — in that case this NOTE overrides the "write a SHORT message" requirement below.`;
 
 export const TASK_TRIGGERED_PROMPT = (memory: string, task: {id: string, name: string}, recentReminderNote = '') => `
 <system>
@@ -298,7 +299,7 @@ YOUR TASK:
 2. If dueAt has already passed OR task is severely overdue OR a new task from the same routine is starting/has started → fail the task using MarkTaskFailed tool
 
 MANDATORY:
-- Use ONE tool: either UpdateTask(id="${task.id}", ping_at="...") or MarkTaskFailed(id="${task.id}")
+- Use ONE tool: either UpdateTask(task_id="${task.id}", ping_at="...") or MarkTaskFailed(task_id="${task.id}")
 - IT IS MANDATORY TO PROCESS ALL TASKS THAT ARE IN needs_replanning status
 - Write a SHORT message to the user — vary your phrasing each time
 - Check message history: if you already reminded about this and user didn't respond, try a DIFFERENT angle (humor, guilt trip, challenge, casual mention)
@@ -331,13 +332,12 @@ You are deconflicting the reminder schedule. Upcoming collisions were detected (
 ${clustersText}
 
 RULES:
-- Use ONLY schedule tools: UpdateTask, UpdateRoutine, and read-only task/routine getters. NEVER call tools that contact the user (SendStickerToUser, stat/chart tools, image tools, web search) — this is an invisible maintenance run.
+- Only schedule tools are available in this run (RescheduleTaskPing, UpdateRoutine, read-only task/routine getters) — this is an invisible maintenance run; do not try to contact the user.
 - "predicted routine fire" entries are FIXED points — they come from a routine's cron and cannot be moved by editing tasks. Move ad-hoc tasks AWAY from them.
-- Fix each cluster with UpdateTask(task_id, ping_at="...") so events end up at least 10 minutes apart.
-- Prefer moving low-annoyance tasks; keep high-annoyance / urgent (dueAt soon) tasks where they are.
-- NEVER move ping_at into the past or within the next 15 minutes. NEVER move ping_at past the task's dueAt.
+- Fix each cluster with RescheduleTaskPing(task_id, ping_at="...") so events end up at least 10 minutes apart. The tool enforces safety: it fails if the task is no longer pending, if ping_at is in the past, or past the task's dueAt — if it fails, leave that task alone (do NOT retry with a different tool).
+- Prefer moving low-annoyance tasks; keep high-annoyance / urgent (dueAt soon) tasks where they are. Avoid ping_at within the next 15 minutes.
 - If the user explicitly asked for a specific reminder time recently (check history), keep that task in place and move the other one.
-- If a cluster consists ONLY of routine fires, you may nudge ONE routine's cron by 5-15 minutes via UpdateRoutine — same hour, same meaning, minimal shift. At most one such change per run.
+- If a cluster consists ONLY of routine fires, you may nudge ONE routine's cron by 5-15 minutes via UpdateRoutine — same hour, same meaning, minimal shift. At most one such change per run. If the double-booking looks intentional, leave it and say so.
 - After the tool calls, write a one-line log summary of what you changed (or "no safe fix" and why). This goes to logs only.
 </system>
 `;

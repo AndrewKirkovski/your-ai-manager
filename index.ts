@@ -25,7 +25,7 @@ import {
     setUser,
     getAllUsers,
     getAllRoutines,
-    getAllTasks, Task, updateUserTask,
+    getAllTasks, getTask, Task, updateUserTask,
     cleanupOldTasks,
     addImageToCache,
     getTrackedStatNames, getLatestStat, getStatCount,
@@ -607,6 +607,26 @@ cron.schedule('* * * * *', async () => {
                 // for everyone.
                 if (marked) void enqueuePerUser(user.userId, async () => {
                     try {
+                        // Re-verify at RUN time, not just mark time: this closure
+                        // may sit behind a long chat reply on the queue, and that
+                        // reply's tool calls can legitimately complete or move
+                        // this very task ("сделал!" / "перенеси на вечер"). The
+                        // prompt below MANDATES a user-visible reminder — firing
+                        // it from a stale snapshot pings about a task the user
+                        // just handled. If state moved on, the task either fires
+                        // later at its new pingAt via the normal tick, or is done.
+                        const expectedStatus = dueTask.requiresAction ? 'needs_replanning' : 'completed';
+                        const fresh = await getTask(user.userId, dueTask.id);
+                        if (!fresh || fresh.status !== expectedStatus
+                            || fresh.pingAt.getTime() !== dueTask.pingAt.getTime()) {
+                            console.log('⏭️ Reminder skipped — task changed while queued:', {
+                                userId: user.userId,
+                                taskId: dueTask.id,
+                                status: fresh?.status,
+                            });
+                            return;
+                        }
+
                         const memory = await getCurrentInfo(user.userId);
 
                         // lastReminderAt is read AND written inside this queued
@@ -629,7 +649,7 @@ cron.schedule('* * * * *', async () => {
                             ? TASK_TRIGGERED_PROMPT(memory, dueTask, note)
                             : TASK_TRIGGERED_PROMPT_NO_ACTION(memory, dueTask, note);
 
-                        let streamedText = false;
+                        let delivered = false;
                         const result = await AIService.streamAIResponse({
                             userId: user.userId,
                             userMessage: taskPrompt,
@@ -642,11 +662,14 @@ cron.schedule('* * * * *', async () => {
                             addAssistantToHistory: true,
                             enableToolCalls: true,
                             purpose: 'task-reminder',
-                            onTextStreamed: () => { streamedText = true; },
+                            // Confirmed-delivery callback (NOT onTextStreamed,
+                            // which is commit-on-attempt and fires even when
+                            // the Telegram send fails).
+                            onTextDelivered: () => { delivered = true; },
                         });
 
-                        // Record only reminders the user actually saw.
-                        if (streamedText) {
+                        // Record only reminders the user actually received.
+                        if (delivered) {
                             lastReminderAt.set(user.userId, { at: Date.now(), taskName: dueTask.name });
                         }
 
@@ -676,13 +699,24 @@ cron.schedule('* * * * *', async () => {
 
         for (let i = 0; i < staggeredTasks.length; i++) {
             const task = staggeredTasks[i];
-            // Clamp at dueAt so our own collision-avoidance never pushes a task
-            // past its deadline (the trigger prompt would then auto-fail a task
-            // the user was never reminded about). Floor at +1 min keeps it off
-            // this tick; a dueAt-clamped task fires next tick with the note.
-            let pingMs = nowDate.getTime() + STAGGER_STEP_MS * (i + 1);
-            if (task.dueAt) pingMs = Math.min(pingMs, task.dueAt.getTime());
-            pingMs = Math.max(pingMs, nowDate.getTime() + 60_000);
+            const pingMs = nowDate.getTime() + STAGGER_STEP_MS * (i + 1);
+            // Never defer a task INTO its deadline: a clamped ping at/past dueAt
+            // means its only reminder fires when trigger-prompt rule 2 says
+            // MarkTaskFailed — the bot would fail a task the user was never
+            // reminded about, purely from its own collision avoidance. Leave
+            // pingAt untouched instead: with the oldest pingAt it wins the next
+            // tick outright and fires ~1 min after this reminder, carrying the
+            // recent-reminder note. (A dueAt already in the past changes nothing
+            // — the deadline is blown either way, so full spacing applies.)
+            if (task.dueAt && task.dueAt.getTime() > nowDate.getTime()
+                && pingMs >= task.dueAt.getTime() - 60_000) {
+                console.log('⏭️ Not staggering deadline-imminent task (fires next tick):', {
+                    userId: user.userId,
+                    taskId: task.id,
+                    dueAt: task.dueAt.toISOString(),
+                });
+                continue;
+            }
             const newPingAt = new Date(pingMs);
             try {
                 await updateUserTask(user.userId, task.id, (t) => {
@@ -766,6 +800,7 @@ cron.schedule(collisionFixerCron, async () => {
             model: OPEN_AI_MODEL,
             enqueue: enqueuePerUser,
             getCurrentInfo,
+            isUserAllowed: isAllowedUser,
         });
     } catch (error) {
         console.error('🧭 Collision fixer cron error:', error instanceof Error ? error.message : String(error));

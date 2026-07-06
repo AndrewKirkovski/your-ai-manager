@@ -22,12 +22,18 @@ export interface AIStreamOptions {
     /**
      * Default true. Set false for silent background runs (e.g. the collision
      * fixer): aiService itself sends nothing — no streaming message, no typing
-     * indicator, no image gallery, no user-facing 🐺 error on failure. Tool
-     * calls still execute, and tools with their own Telegram side effects
-     * (SendStickerToUser, stat charts) are NOT blocked here — silent callers
-     * must steer the model away from those in the prompt.
+     * indicator, no image gallery, no user-facing 🐺 error on failure. Tools
+     * with their own Telegram side effects (SendStickerToUser, stat charts)
+     * are NOT blocked by this flag — pair it with `allowedTools`.
      */
     shouldUpdateTelegram?: boolean;
+    /**
+     * When set, ONLY these tools are offered to the model AND enforced at
+     * execution time (a call to anything else returns an error tool_result
+     * without executing). Use for background runs that must not reach the
+     * user or touch unrelated state. Undefined = full registry.
+     */
+    allowedTools?: string[];
     addUserToHistory?: boolean;
     addAssistantToHistory?: boolean;
     currentRecursionDepth?: number;
@@ -45,12 +51,20 @@ export interface AIStreamOptions {
      */
     signal?: AbortSignal;
     /**
-     * Fires once, when the FIRST safeSend successfully creates a Telegram
-     * message for this reply (i.e. the moment visible text becomes user-
-     * facing). The burst-coalescer flips a flag here so subsequent incoming
-     * user messages know not to abort an already-visible stream.
+     * Fires once, BEFORE the first safeSend is attempted (commit-on-attempt).
+     * The burst-coalescer flips a flag here so subsequent incoming user
+     * messages know not to abort a stream that is about to become visible —
+     * it must fire even if the send then fails, or an abort racing the send
+     * roundtrip would orphan a half-delivered message.
      */
     onTextStreamed?: () => void;
+    /**
+     * Fires once, AFTER the first safeSend actually succeeded — i.e. the user
+     * verifiably received a message. Use when the caller must know delivery
+     * happened (e.g. the task-reminder path records lastReminderAt from this),
+     * not merely that delivery was attempted.
+     */
+    onTextDelivered?: () => void;
 }
 
 export interface AIStreamResult {
@@ -165,6 +179,10 @@ export class AIService {
                         if (sentMessage) {
                             messageId = sentMessage.message_id;
                             lastSentContent = aiResponseAccumulated;
+                            // Confirmed delivery (unlike onTextStreamed above,
+                            // which is commit-on-attempt). Fires at most once —
+                            // messageId is set now, so this branch never re-runs.
+                            try { options.onTextDelivered?.(); } catch (e) { /* listener bug shouldn't kill stream */ }
                         } else {
                             initialSendFailed = true;
                         }
@@ -217,13 +235,17 @@ export class AIService {
                 ...(appendMessagesAfterUser || []),
             ];
 
-            // Get tool definitions if enabled
+            // Get tool definitions if enabled. allowedTools narrows the offer —
+            // background runs (collision fixer) get only schedule tools so the
+            // model can't reach user-facing or unrelated tools at all.
             const toolDefs: ToolDefinition[] | undefined = enableToolCalls
-                ? getAllToolDefinitions().map(t => ({
-                    name: t.function.name,
-                    description: t.function.description || '',
-                    parameters: t.function.parameters as Record<string, unknown>,
-                }))
+                ? getAllToolDefinitions()
+                    .filter(t => !options.allowedTools || options.allowedTools.includes(t.function.name))
+                    .map(t => ({
+                        name: t.function.name,
+                        description: t.function.description || '',
+                        parameters: t.function.parameters as Record<string, unknown>,
+                    }))
                 : undefined;
 
             console.debug('💬 AI request via', provider.name, { model, maxTokens, toolCount: toolDefs?.length ?? 0 });
@@ -404,6 +426,19 @@ export class AIService {
 
                     const toolName = toolCall.name;
                     const toolArgs = toolCall.arguments;
+
+                    // Enforce the allowlist at execution time too — the model can
+                    // hallucinate tools it wasn't offered; reject without executing.
+                    if (options.allowedTools && !options.allowedTools.includes(toolName)) {
+                        console.warn(`🚫 Tool ${toolName} blocked — not in allowedTools for this run`);
+                        newAppendedMessages.push({
+                            role: 'tool_result',
+                            toolCallId: toolCall.id,
+                            content: JSON.stringify({ error: `Tool ${toolName} is not available in this context` }),
+                        });
+                        continue;
+                    }
+
                     let parsedArgs: Record<string, unknown> = {};
                     try {
                         parsedArgs = JSON.parse(toolArgs || '{}');
@@ -569,16 +604,21 @@ export class AIService {
                 timestamp: new Date().toISOString()
             }, error);
 
+            // Silent background runs (collision fixer) get the error RETHROWN:
+            // they have no user to show it to, and returning it as a normal
+            // result string made failures indistinguishable from success —
+            // callers would mark work done (anti-flap) on a 429.
+            if (!shouldUpdateTelegram) {
+                throw error;
+            }
+
             const errorMessage = `
 Ой 🐺
 \`\`\`
 ${error instanceof Error ? error.message : String(error)}
 \`\`\`
             `;
-            // Silent background runs (collision fixer) must not surface errors in chat.
-            if (shouldUpdateTelegram) {
-                await safeSend(bot, userId, errorMessage);
-            }
+            await safeSend(bot, userId, errorMessage);
 
             return {
                 message: errorMessage,

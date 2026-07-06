@@ -279,8 +279,10 @@ export const UpdateTask: Tool = {
             if (args.due_at !== undefined) {
                 task.dueAt = args.due_at ? new Date(args.due_at) : undefined;
             }
-            if (args.ping_at !== undefined) {
-                task.pingAt = args.ping_at ? new Date(args.ping_at) : task.pingAt;
+            // Empty string must be a full no-op — before this guard it kept
+            // pingAt but still force-reset status to 'pending'.
+            if (args.ping_at) {
+                task.pingAt = new Date(args.ping_at);
                 task.status = 'pending'; // Reset status to pending if ping_at is updated
             }
             if (args.requires_action !== undefined) task.requiresAction = args.requires_action;
@@ -296,6 +298,66 @@ export const UpdateTask: Tool = {
             success: true,
             task: updatedTask,
             message: `Task "${updatedTask?.name}" updated successfully`
+        };
+    }
+};
+
+/** Narrow, side-effect-free reschedule for background maintenance (collision
+ * fixer). Unlike UpdateTask, it NEVER changes status: compare-and-set on
+ * status==='pending' at write time, so it cannot resurrect a task the minute
+ * tick fired (or the user completed) while the silent AI call was in flight.
+ * Rejects moves into the past and past the task's dueAt — deterministic
+ * enforcement of what COLLISION_FIX_PROMPT could previously only ask for. */
+export const RescheduleTaskPing: Tool = {
+    name: 'RescheduleTaskPing',
+    description: 'Move a PENDING task\'s next reminder time (ping_at) without touching anything else. Fails if the task is not pending anymore, if ping_at is in the past, or if it is after the task\'s due date. Prefer UpdateTask for user-requested changes; this tool is for schedule deconfliction.',
+    parameters: {
+        type: 'object',
+        properties: {
+            task_id: {
+                type: 'string',
+                description: 'The ID of the task to reschedule'
+            },
+            ping_at: {
+                type: 'string',
+                description: 'The new reminder time in ISO format (must be in the future, and before due_at if set)',
+                format: 'date-time'
+            }
+        },
+        required: ['task_id', 'ping_at']
+    },
+    execute: async (args: { userId: string; task_id: string; ping_at: string }) => {
+        const userId = parseInt(args.userId);
+        assertParseableDate(args.ping_at, 'ping_at');
+        const newPingAt = new Date(args.ping_at);
+        if (newPingAt.getTime() <= Date.now()) {
+            throw new Error(`ping_at must be in the future (got ${args.ping_at})`);
+        }
+
+        const existing = await getTask(userId, args.task_id);
+        if (!existing) {
+            throw new Error(`Task with ID ${args.task_id} not found`);
+        }
+        if (existing.dueAt && newPingAt.getTime() > existing.dueAt.getTime()) {
+            throw new Error(`ping_at ${args.ping_at} is after the task's dueAt ${existing.dueAt.toISOString()} — the reminder would fire past the deadline`);
+        }
+
+        // Compare-and-set inside the fresh read: only a still-pending task moves.
+        let applied = false;
+        await updateUserTask(userId, args.task_id, (task) => {
+            if (task.status !== 'pending') return;
+            task.pingAt = newPingAt;
+            applied = true;
+        });
+        if (!applied) {
+            throw new Error(`Task ${args.task_id} is no longer pending — it fired or was completed while this run was in progress. Do not reschedule it.`);
+        }
+
+        const updated = await getTask(userId, args.task_id);
+        return {
+            success: true,
+            task: updated,
+            message: `Task "${updated?.name}" reminder moved to ${args.ping_at}`
         };
     }
 };

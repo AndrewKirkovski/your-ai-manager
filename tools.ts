@@ -8,6 +8,7 @@ import {
     GetTasksByStatus,
     MarkTaskComplete,
     MarkTaskFailed,
+    RescheduleTaskPing,
     UpdateTask,
     DeleteTask
 } from "./tools.tasks";
@@ -68,6 +69,7 @@ export const tools = {
     GetTasksByRoutine,
     AddTask,
     UpdateTask,
+    RescheduleTaskPing,
     MarkTaskComplete,
     MarkTaskFailed,
     DeleteTask,
