@@ -441,6 +441,18 @@
         // the card and would otherwise silently re-arm its buttons mid-request.
         const condenseInFlight = new Set();
 
+        /** Write a status line onto the LIVE card for this cacheKey (the grid
+         * may have re-rendered mid-request, detaching the captured span — an
+         * error written there would vanish silently). Falls back to the
+         * captured span when no live card exists (grid collapsed). */
+        function setCondenseStatus(cacheKey, capturedStatus, text, cls) {
+            const liveCard = document.getElementById(`sticker-${cssEscape(cacheKey)}`);
+            const el = (liveCard && liveCard.querySelector('[data-field="status"]')) || capturedStatus;
+            if (!el) return;
+            el.textContent = text;
+            el.className = cls;
+        }
+
         /** Write a condense/refine result into a card: textarea value + re-fit,
          * status line with length arrow, and reveal the Shorter/Longer buttons.
          * `card` may be the originally captured card or a re-rendered live one. */
@@ -500,7 +512,6 @@
                 body = { description: condenseOriginals.get(cacheKey) ?? taValue };
             }
 
-            condenseInFlight.add(cacheKey);
             // Disable ALL condense-family buttons on this card + the textarea
             // while we wait (UI mirror of the Set — a re-rendered card gets the
             // same disabled state from renderStickerCard via condenseInFlight).
@@ -512,6 +523,10 @@
             ta.disabled = true;
             status.textContent = direction ? `asking for ${direction}…` : 'condensing…';
             status.className = 'text-xs text-dark-muted';
+            // Added LAST before try so no statement can throw between add and
+            // the finally's delete — a leaked key would disable the card's
+            // controls on every re-render for the page lifetime.
+            condenseInFlight.add(cacheKey);
             try {
                 const res = await fetch(`/api/stickers/${encodeURIComponent(cacheKey)}/condense`, {
                     method: 'POST',
@@ -520,8 +535,7 @@
                 });
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
-                    status.textContent = '✗ ' + (err.error || `HTTP ${res.status}`);
-                    status.className = 'text-xs text-red-400';
+                    setCondenseStatus(cacheKey, status, '✗ ' + (err.error || `HTTP ${res.status}`), 'text-xs text-red-400');
                     return;
                 }
                 const data = await res.json();
@@ -548,8 +562,7 @@
                 applyCondenseResult(card, data.condensed, taValue.length);
             } catch (e) {
                 console.error('Failed to condense sticker:', e);
-                status.textContent = '✗ ' + (e.message || 'fetch failed');
-                status.className = 'text-xs text-red-400';
+                setCondenseStatus(cacheKey, status, '✗ ' + (e.message || 'fetch failed'), 'text-xs text-red-400');
             } finally {
                 condenseInFlight.delete(cacheKey);
                 condenseButtons.forEach(b => { b.disabled = false; });

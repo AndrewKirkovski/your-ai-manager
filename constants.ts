@@ -281,12 +281,15 @@ Ask what they want help with. Keep it casual and SHORT. No bullet-point feature 
 /** Context block injected into a task-trigger prompt when another reminder
  * went out to this user only minutes ago (same-minute stagger, or a routine
  * that spawned a task right after an ad-hoc reminder). Tells the AI to build
- * on the just-sent message instead of firing a dry back-to-back reminder. */
-export const RECENT_REMINDER_NOTE = (taskName: string, minAgo: number) => `
+ * on the just-sent message instead of firing a dry back-to-back reminder.
+ * `allowsPostpone` mirrors requiresAction: the no-action prompt forbids tools
+ * (and the call disables them), so its note must not offer UpdateTask. */
+export const RECENT_REMINDER_NOTE = (taskName: string, minAgo: number, allowsPostpone: boolean) => `
 NOTE: A reminder about "${stripSystemTags(taskName)}" was sent just ${minAgo} min ago — it's in recent history.
-Don't fire a dry back-to-back reminder: reference the previous one / weave this task in naturally.
-If this task allows tools and stacking reminders feels spammy, you may instead postpone it via UpdateTask(ping_at="...")
-and write NOTHING to the user — in that case this NOTE overrides the "write a SHORT message" requirement below.`;
+Don't fire a dry back-to-back reminder: reference the previous one / weave this task in naturally.${allowsPostpone ? `
+If stacking reminders feels spammy, you may instead postpone this task via UpdateTask(ping_at="...")
+and write NOTHING to the user — in that case this NOTE overrides the "write a SHORT message" requirement below.
+Never postpone past the task's dueAt — if the deadline is near, remind now instead.` : ''}`;
 
 export const TASK_TRIGGERED_PROMPT = (memory: string, task: {id: string, name: string}, recentReminderNote = '') => `
 <system>

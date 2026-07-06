@@ -326,8 +326,8 @@ export const RescheduleTaskPing: Tool = {
         },
         required: ['task_id', 'ping_at']
     },
-    execute: async (args: { userId: string; task_id: string; ping_at: string }) => {
-        const userId = parseInt(args.userId);
+    execute: async (args: { userId: number; task_id: string; ping_at: string }) => {
+        const userId = args.userId;
         assertParseableDate(args.ping_at, 'ping_at');
         const newPingAt = new Date(args.ping_at);
         if (newPingAt.getTime() <= Date.now()) {
@@ -338,19 +338,25 @@ export const RescheduleTaskPing: Tool = {
         if (!existing) {
             throw new Error(`Task with ID ${args.task_id} not found`);
         }
-        if (existing.dueAt && newPingAt.getTime() > existing.dueAt.getTime()) {
-            throw new Error(`ping_at ${args.ping_at} is after the task's dueAt ${existing.dueAt.toISOString()} — the reminder would fire past the deadline`);
-        }
 
-        // Compare-and-set inside the fresh read: only a still-pending task moves.
-        let applied = false;
+        // Both guards live INSIDE the fresh read so nothing can change between
+        // validation and write: status compare-and-set (a fired/completed task
+        // must never be resurrected) and the dueAt ceiling (a reminder past
+        // the deadline would be auto-failed by the trigger prompt).
+        let failure: string | null = null;
         await updateUserTask(userId, args.task_id, (task) => {
-            if (task.status !== 'pending') return;
+            if (task.status !== 'pending') {
+                failure = `Task ${args.task_id} is no longer pending — it fired or was completed in the meantime. Leave it alone; use UpdateTask only if the user explicitly asked to reschedule it.`;
+                return;
+            }
+            if (task.dueAt && newPingAt.getTime() > task.dueAt.getTime()) {
+                failure = `ping_at ${args.ping_at} is after the task's dueAt ${task.dueAt.toISOString()} — the reminder would fire past the deadline. Pick an earlier time.`;
+                return;
+            }
             task.pingAt = newPingAt;
-            applied = true;
         });
-        if (!applied) {
-            throw new Error(`Task ${args.task_id} is no longer pending — it fired or was completed while this run was in progress. Do not reschedule it.`);
+        if (failure) {
+            throw new Error(failure);
         }
 
         const updated = await getTask(userId, args.task_id);

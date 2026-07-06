@@ -258,7 +258,12 @@ const stmts = {
         WHERE id=@id AND user_id=@user_id
     `),
     deleteTask: db.prepare('DELETE FROM tasks WHERE id = ? AND user_id = ?'),
-    cleanupOldTasks: db.prepare('DELETE FROM tasks WHERE user_id = ? AND id NOT IN (SELECT id FROM tasks WHERE user_id = ? ORDER BY created_at DESC LIMIT ?)'),
+    // Only terminal rows are eligible for deletion: a pending task is a live
+    // scheduled reminder, and needs_replanning is a reminder IN FLIGHT (the
+    // tick marks it, then an AI call processes it) — deleting either silently
+    // drops a reminder the user never got, and nothing re-surfaces it.
+    cleanupOldTasks: db.prepare(`DELETE FROM tasks WHERE user_id = ? AND status IN ('completed', 'failed')
+        AND id NOT IN (SELECT id FROM tasks WHERE user_id = ? ORDER BY created_at DESC LIMIT ?)`),
 
     // Memory
     getMemoryByUser: db.prepare<[number], MemoryRow>('SELECT key, value, first_recorded_at, updated_at FROM memory WHERE user_id = ?'),

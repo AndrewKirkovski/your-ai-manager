@@ -22,9 +22,12 @@ export interface AIStreamOptions {
     /**
      * Default true. Set false for silent background runs (e.g. the collision
      * fixer): aiService itself sends nothing — no streaming message, no typing
-     * indicator, no image gallery, no user-facing 🐺 error on failure. Tools
-     * with their own Telegram side effects (SendStickerToUser, stat charts)
-     * are NOT blocked by this flag — pair it with `allowedTools`.
+     * indicator, no image gallery, no user-facing 🐺 error on failure — and
+     * provider errors RETHROW instead of returning error text as a normal
+     * result (silent callers must be able to distinguish failure). Pair with
+     * `allowedTools` to restrict tools, and keep addUserToHistory /
+     * addAssistantToHistory false: a silent run that throws mid-tool-chain
+     * would otherwise persist a user row with no assistant row.
      */
     shouldUpdateTelegram?: boolean;
     /**
@@ -180,8 +183,12 @@ export class AIService {
                             messageId = sentMessage.message_id;
                             lastSentContent = aiResponseAccumulated;
                             // Confirmed delivery (unlike onTextStreamed above,
-                            // which is commit-on-attempt). Fires at most once —
-                            // messageId is set now, so this branch never re-runs.
+                            // which is commit-on-attempt). Fires at most once PER
+                            // RECURSION LEVEL (messageId is set now, so this
+                            // branch never re-runs within this level; the tool-
+                            // loop recursion starts a fresh message and may fire
+                            // again — load-bearing for tool-first replies whose
+                            // visible text only appears at depth 1+).
                             try { options.onTextDelivered?.(); } catch (e) { /* listener bug shouldn't kill stream */ }
                         } else {
                             initialSendFailed = true;
@@ -436,6 +443,10 @@ export class AIService {
                             toolCallId: toolCall.id,
                             content: JSON.stringify({ error: `Tool ${toolName} is not available in this context` }),
                         });
+                        // Keep the history trace complete for history-writing
+                        // callers — under-reporting what the model attempted
+                        // would make later turns look inconsistent.
+                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nBlocked: not in allowedTools for this run\n`;
                         continue;
                     }
 

@@ -577,9 +577,23 @@ cron.schedule('* * * * *', async () => {
         //    recent-reminder note so the AI builds on the message that just
         //    went out (or postpones again) instead of pinging back-to-back.
         const nowDate = now.toJSDate();
+        // Winner order: deadline-imminent tasks first (nearest future dueAt) —
+        // one reminder fires per tick, and draining a pile-up by pingAt age
+        // could let a nearer deadline slip past dueAt unreminded (trigger
+        // prompt would then auto-fail it). Everything else drains most-overdue
+        // first, as before.
+        const DEADLINE_IMMINENT_MS = 15 * 60_000;
+        const isImminent = (t: Task) => !!t.dueAt
+            && t.dueAt.getTime() > nowDate.getTime()
+            && t.dueAt.getTime() - nowDate.getTime() <= DEADLINE_IMMINENT_MS;
         const dueTasks = user.tasks
             .filter(t => t.status === 'pending' && t.pingAt <= nowDate)
-            .sort((a, b) => a.pingAt.getTime() - b.pingAt.getTime());
+            .sort((a, b) => {
+                const ia = isImminent(a), ib = isImminent(b);
+                if (ia !== ib) return ia ? -1 : 1;
+                if (ia && ib) return a.dueAt!.getTime() - b.dueAt!.getTime();
+                return a.pingAt.getTime() - b.pingAt.getTime();
+            });
         const [dueTask, ...staggeredTasks] = dueTasks;
 
         if (dueTask) {
@@ -642,7 +656,9 @@ cron.schedule('* * * * *', async () => {
                         const note = prevReminder
                             && prevReminder.taskName !== dueTask.name
                             && sinceMs <= RECENT_REMINDER_WINDOW_MS
-                            ? RECENT_REMINDER_NOTE(prevReminder.taskName, Math.max(1, Math.round(sinceMs / 60_000)))
+                            // allowsPostpone follows requiresAction: the no-action
+                            // prompt forbids tools, so its note must not offer one.
+                            ? RECENT_REMINDER_NOTE(prevReminder.taskName, Math.max(1, Math.round(sinceMs / 60_000)), dueTask.requiresAction)
                             : '';
 
                         const taskPrompt = dueTask.requiresAction
@@ -660,7 +676,11 @@ cron.schedule('* * * * *', async () => {
                             model: OPEN_AI_MODEL,
                             addUserToHistory: false,
                             addAssistantToHistory: true,
-                            enableToolCalls: true,
+                            // No-action heads-ups declare "DO NOT USE ANY TOOLS" —
+                            // enforce it instead of only prompting it (the task is
+                            // already auto-completed; a stray UpdateTask(ping_at)
+                            // would resurrect it to pending).
+                            enableToolCalls: dueTask.requiresAction,
                             purpose: 'task-reminder',
                             // Confirmed-delivery callback (NOT onTextStreamed,
                             // which is commit-on-attempt and fires even when

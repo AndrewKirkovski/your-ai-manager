@@ -157,11 +157,31 @@ export interface CollisionFixerDeps {
     isUserAllowed: (userId: number) => boolean;
 }
 
+// Overlap guard (mirrors routineTickRunning): a run stuck behind long chat
+// replies must not overlap the next cron slot — marking is post-success, so
+// an overlapping scan would see no suppression and enqueue duplicate silent
+// AI calls for the same clusters.
+let fixerRunning = false;
+
 /** Look-ahead reminder-collision fixer. For each user: pending task pings in
- * the next 24h + predicted routine fires → clusters of events within 5 min →
- * one SILENT AI call (schedule tools only, nothing sent to Telegram) that
- * spreads them apart via RescheduleTaskPing/UpdateRoutine. */
+ * the next 24h + predicted routine fires → clusters of events within
+ * CLUSTER_GAP_MS of each other → one SILENT AI call (schedule tools only,
+ * nothing sent to Telegram) that spreads them apart via
+ * RescheduleTaskPing/UpdateRoutine. */
 export async function runCollisionFixer(deps: CollisionFixerDeps): Promise<void> {
+    if (fixerRunning) {
+        console.warn('🧭 [collision-fix] previous run still in progress, skipping this cycle');
+        return;
+    }
+    fixerRunning = true;
+    try {
+        await runCollisionFixerCycle(deps);
+    } finally {
+        fixerRunning = false;
+    }
+}
+
+async function runCollisionFixerCycle(deps: CollisionFixerDeps): Promise<void> {
     const now = getCurrentTime();
     const windowStart = now.plus({ minutes: WINDOW_START_BUFFER_MIN }).toJSDate();
     const windowEnd = now.plus({ hours: LOOKAHEAD_HOURS }).toJSDate();
@@ -214,6 +234,10 @@ export async function runCollisionFixer(deps: CollisionFixerDeps): Promise<void>
                 const freshTasks = await getAllTasks(user.userId);
                 const bufferEdge = Date.now() + WINDOW_START_BUFFER_MIN * 60_000;
                 const freshPairs = clusters
+                    // Suppression re-check at RUN time: a queue-delayed closure
+                    // from an earlier run may have marked this signature after
+                    // our scan (belt to the fixerRunning suspenders).
+                    .filter(orig => !userAttempts.has(clusterSignature(orig)))
                     .map(orig => ({
                         orig,
                         fresh: orig.filter(e => {
