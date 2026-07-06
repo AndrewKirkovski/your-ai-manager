@@ -413,11 +413,21 @@ app.post('/api/stickers/:cacheKey/condense', async (req: Request, res: Response)
         if (!source || !source.trim()) {
             return res.status(400).json({ error: 'Empty description — nothing to condense' });
         }
+        // Optional refine mode ("Shorter"/"Longer" buttons): current suggestion +
+        // direction, alongside the original in `description`.
+        const current = typeof req.body?.current === 'string' ? req.body.current.trim() : '';
+        const direction = req.body?.direction;
+        let refine: { current: string; direction: 'shorter' | 'longer' } | undefined;
+        if (current && (direction === 'shorter' || direction === 'longer')) {
+            refine = { current, direction };
+        } else if (current || direction !== undefined) {
+            return res.status(400).json({ error: 'Refine requires both current (non-empty string) and direction ("shorter" | "longer")' });
+        }
         const condensed = await condenseStickerDescription(source, {
             kind: entry.kind,
             emojis: entry.emojis,
             setName: entry.setName,
-        });
+        }, refine);
         if (!condensed) {
             return res.status(502).json({ error: 'Condense failed (no lookup model configured or model returned empty)' });
         }

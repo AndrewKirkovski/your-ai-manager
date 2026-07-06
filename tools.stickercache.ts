@@ -78,18 +78,23 @@ function recordLookupUsage(resp: { usage?: { prompt_tokens?: number; completion_
 /** Condense a sticker / emoji description via the cheap lookup model. Used by
  * the admin dashboard's "Condense" button — the human reviews the result and
  * decides whether to keep it. Optional context (kind/emojis/setName) is folded
- * into the prompt so the model can preserve domain hints. Tokens recorded under
- * user_id=0 with purpose 'condense_description'. Returns null on any failure
- * path so the caller surfaces an error instead of overwriting with garbage. */
+ * into the prompt so the model can preserve domain hints. When `refine` is set
+ * (dashboard "Shorter"/"Longer" buttons), the model gets BOTH the original and
+ * the current suggestion and is asked to adjust the suggestion's length while
+ * keeping the meaning focus. Tokens recorded under user_id=0 with purpose
+ * 'condense_description'. Returns null on any failure path so the caller
+ * surfaces an error instead of overwriting with garbage. */
 export async function condenseStickerDescription(
     originalDescription: string,
-    context?: { kind?: string; emojis?: string[]; setName?: string }
+    context?: { kind?: string; emojis?: string[]; setName?: string },
+    refine?: { current: string; direction: 'shorter' | 'longer' }
 ): Promise<string | null> {
     if (!lookupClient) {
         console.warn('[condense] no lookup client configured; returning null');
         return null;
     }
     if (!originalDescription || !originalDescription.trim()) return null;
+    if (refine && !refine.current.trim()) return null;
 
     const ctxParts: string[] = [];
     if (context?.kind) ctxParts.push(`Kind: ${context.kind}.`);
@@ -97,19 +102,34 @@ export async function condenseStickerDescription(
     if (context?.setName) ctxParts.push(`Pack: "${context.setName}".`);
     const ctx = ctxParts.length > 0 ? ctxParts.join(' ') + '\n' : '';
 
-    const prompt =
-        `Condense this sticker / custom emoji description so it focuses on WHAT THE STICKER MEANS — ` +
-        `the emotion, vibe, or situation a sender would use it for — not on how it visually looks. ` +
-        `Drop visual minutiae (fur colour, eye shape, exact pose) unless they ARE the meaning. ` +
-        `Drop boilerplate like "senders use this to..." / "the sender uses this to..." — express the use directly. ` +
-        `Keep it under 25 words, ideally one short sentence. Output ONLY the condensed description, no preamble, no quotes.\n\n` +
-        `${ctx}Original description:\n${originalDescription.trim()}`;
+    const meaningFocus =
+        `Stay focused on WHAT THE STICKER MEANS — the emotion, vibe, or situation a sender would use it for — ` +
+        `not on how it visually looks. Drop boilerplate like "senders use this to..." — express the use directly. `;
+
+    const prompt = refine
+        ? (refine.direction === 'shorter'
+            ? `You previously condensed a sticker / custom emoji description. Rewrite the CURRENT SUGGESTION to be noticeably SHORTER — ` +
+              `cut to the single core meaning, aim for roughly half the words, minimum 3 words. ` +
+              meaningFocus +
+              `Output ONLY the revised description, no preamble, no quotes.\n\n` +
+              `${ctx}Original description:\n${originalDescription.trim()}\n\nCurrent suggestion:\n${refine.current.trim()}`
+            : `You previously condensed a sticker / custom emoji description. Rewrite the CURRENT SUGGESTION to be noticeably LONGER — ` +
+              `pull back the most meaning-relevant nuance from the original (secondary emotion, typical situation, tone), up to ~35 words. ` +
+              meaningFocus +
+              `Output ONLY the revised description, no preamble, no quotes.\n\n` +
+              `${ctx}Original description:\n${originalDescription.trim()}\n\nCurrent suggestion:\n${refine.current.trim()}`)
+        : `Condense this sticker / custom emoji description so it focuses on WHAT THE STICKER MEANS — ` +
+          `the emotion, vibe, or situation a sender would use it for — not on how it visually looks. ` +
+          `Drop visual minutiae (fur colour, eye shape, exact pose) unless they ARE the meaning. ` +
+          `Drop boilerplate like "senders use this to..." / "the sender uses this to..." — express the use directly. ` +
+          `Keep it under 25 words, ideally one short sentence. Output ONLY the condensed description, no preamble, no quotes.\n\n` +
+          `${ctx}Original description:\n${originalDescription.trim()}`;
 
     try {
         const resp = await lookupClient.chat.completions.create({
             model: lookupModel,
             messages: [{ role: 'user', content: prompt }],
-            max_tokens: 120,
+            max_tokens: 160,
         });
         // Token usage attributed to the synthetic system user (user_id=0) since
         // condensing is a dashboard action, not tied to any chat user.

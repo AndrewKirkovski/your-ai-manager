@@ -426,31 +426,52 @@
             loadStickers(false);
         }
 
-        async function condenseSticker(cacheKey, btn) {
+        // Pre-condense original description per cacheKey. "Shorter"/"Longer"
+        // refines send the TRUE original alongside the current suggestion so the
+        // model can pull nuance back in, not just paraphrase the paraphrase.
+        // Transient by design (page-lifetime); survives grid re-renders.
+        const condenseOriginals = new Map();
+
+        async function condenseSticker(cacheKey, btn, direction) {
             const card = document.getElementById(`sticker-${cssEscape(cacheKey)}`);
             if (!card) return;
             const ta = card.querySelector('textarea[data-field="description"]');
             const status = card.querySelector('[data-field="status"]');
+            const refineSpan = card.querySelector('[data-field="refine"]');
             if (!ta) return;
-            const original = ta.value;
-            if (!original.trim()) {
+            const taValue = ta.value;
+            if (!taValue.trim()) {
                 status.textContent = 'nothing to condense';
                 status.className = 'text-xs text-yellow-400';
                 return;
             }
-            // Disable button + textarea while we wait so the user doesn't pile
-            // up requests on the same row.
-            const wasDisabled = btn.disabled;
-            btn.disabled = true;
+
+            // Plain condense: current textarea text IS the original — remember it.
+            // Refine: send the remembered original + the current suggestion.
+            // (Fallback to taValue covers a refine after page reload lost the map.)
+            let body;
+            if (direction) {
+                body = { description: condenseOriginals.get(cacheKey) ?? taValue, current: taValue, direction };
+            } else {
+                condenseOriginals.set(cacheKey, taValue);
+                body = { description: taValue };
+            }
+
+            // Disable ALL condense-family buttons on this card + the textarea
+            // while we wait, so the user doesn't pile up requests on the same row.
+            const condenseButtons = [btn, ...(refineSpan ? refineSpan.querySelectorAll('button') : [])]
+                .filter((b, i, arr) => arr.indexOf(b) === i);
+            condenseButtons.forEach(b => { b.disabled = true; });
+            const btnLabel = btn.textContent;
             btn.textContent = '…';
             ta.disabled = true;
-            status.textContent = 'condensing…';
+            status.textContent = direction ? `asking for ${direction}…` : 'condensing…';
             status.className = 'text-xs text-dark-muted';
             try {
                 const res = await fetch(`/api/stickers/${encodeURIComponent(cacheKey)}/condense`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ description: original }),
+                    body: JSON.stringify(body),
                 });
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
@@ -473,15 +494,21 @@
                 // Re-fit the textarea height to the (typically much shorter) result.
                 ta.style.height = 'auto';
                 ta.style.height = Math.min(ta.scrollHeight, 192) + 'px';
-                status.textContent = `↓ ${original.length} → ${data.condensed.length} chars (review & Save)`;
+                const arrow = data.condensed.length <= taValue.length ? '↓' : '↑';
+                status.textContent = `${arrow} ${taValue.length} → ${data.condensed.length} chars (review & Save)`;
                 status.className = 'text-xs text-green-400';
+                // A suggestion now exists — offer Shorter/Longer refines.
+                if (refineSpan) {
+                    refineSpan.classList.remove('hidden');
+                    refineSpan.classList.add('inline-flex');
+                }
             } catch (e) {
                 console.error('Failed to condense sticker:', e);
                 status.textContent = '✗ ' + (e.message || 'fetch failed');
                 status.className = 'text-xs text-red-400';
             } finally {
-                btn.disabled = wasDisabled;
-                btn.textContent = 'Condense';
+                condenseButtons.forEach(b => { b.disabled = false; });
+                btn.textContent = btnLabel;
                 ta.disabled = false;
             }
         }
@@ -574,6 +601,15 @@
                             ${correctedBadge}
                             <span class="text-dark-muted ml-auto">used ${e.usedCount}×</span>
                             <span data-field="status" class="text-dark-muted"></span>
+                            <!-- refine buttons: hidden until a condense suggestion exists -->
+                            <span data-field="refine" class="hidden items-center gap-1">
+                                <button onclick="condenseSticker('${escKey}', this, 'shorter')"
+                                    title="Re-ask AI: make the suggestion shorter"
+                                    class="bg-purple-900 hover:bg-purple-800 px-2 py-0.5 rounded">Shorter</button>
+                                <button onclick="condenseSticker('${escKey}', this, 'longer')"
+                                    title="Re-ask AI: make the suggestion longer (pull nuance back from the original)"
+                                    class="bg-purple-900 hover:bg-purple-800 px-2 py-0.5 rounded">Longer</button>
+                            </span>
                             <button onclick="condenseSticker('${escKey}', this)"
                                 title="AI-condense the description focusing on meaning, not visual detail"
                                 class="bg-purple-700 hover:bg-purple-800 px-3 py-0.5 rounded">Condense</button>
