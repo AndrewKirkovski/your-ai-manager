@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import {addMessageToHistory, getRecentMessageHistory, recordAITokens, bumpStickerUsedCount, getReplyMaxTokens, recordBudgetEscalation} from './userStore';
+import {addMessageToHistory, getRecentMessageHistory, recordAITokens, bumpStickerUsedCount, getReplyMaxTokens, getActiveTokenGrant, setTokenConsentPending} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
 import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers, exceedsTelegramLimit} from './telegramFormat';
@@ -42,24 +42,12 @@ export interface AIStreamOptions {
     currentRecursionDepth?: number;
     enableToolCalls?: boolean;
     /**
-     * Force thinking off for this run. Set by the no-silence retry in
-     * streamAIResponse after a turn came back with no text and no tool calls;
-     * hands the whole max_tokens allowance to visible text.
+     * Force thinking off for this run. Set only by the thinking-off floor in
+     * streamAIResponse, when even the maximum granted budget produced no visible
+     * text on a tool-less turn — handing the whole allowance to text guarantees
+     * an answer comes out rather than the bot asking for more forever.
      */
     disableThinking?: boolean;
-    /**
-     * Stream into an existing Telegram message instead of sending a new one.
-     * Set by the escalation ladder so a retry EDITS the partial answer in place
-     * rather than posting a second message next to it.
-     */
-    reuseMessageId?: number;
-    /**
-     * Tells this attempt that the escalation ladder still has headroom and will
-     * re-run it at a bigger budget if it truncates — so it must not persist its
-     * half-finished text to history. Set by streamAIResponse; false on the final
-     * attempt, whose text (truncated or not) is the answer and must be kept.
-     */
-    willRetryIfTruncated?: boolean;
     appendMessagesAfterUser?: ProviderMessage[];
     /** Callback to handle images from search results (sent separately, not in history) */
     onImageResults?: (images: string[]) => Promise<void>;
@@ -94,35 +82,25 @@ export interface AIStreamResult {
     rawResponse: string;
     toolCalls?: ToolCallInfo[];
     /**
-     * Set only when the turn produced nothing the user could see.
-     *  - 'aborted'   — burst-coalescer soft-cancel. Intentional; never retried,
-     *                  never backfilled (the next coalesced reply answers).
-     *  - 'no_output' — the stream ran to completion and yielded no text AND no
-     *                  tool calls. Nothing ran, so nothing can be duplicated by
-     *                  running it again — that is what makes the retry safe.
-     * Absent when the turn produced text or called a tool.
+     * The burst-coalescer soft-cancelled this reply. Deliberate silence: the
+     * next coalesced reply answers, so the consent-ask and never-silent fallback
+     * must both skip it.
      */
-    emptyReason?: 'aborted' | 'no_output';
+    emptyReason?: 'aborted';
     /**
-     * stop_reason was 'max_tokens': the model hit the ceiling mid-turn. This is
-     * literally "failed to answer within the token budget" — it covers both a
-     * reply truncated mid-sentence and a turn that spent everything on thinking
-     * and said nothing. Drives the escalation ladder in streamAIResponse.
+     * The turn ultimately hit the token budget with no further tool to run — a
+     * genuine "couldn't finish within budget", covering both a reply truncated
+     * mid-sentence and a turn that spent everything on thinking and said nothing.
+     * Propagated up from the deepest generation, so a truncation inside tool-call
+     * recursion is still visible at the top. Drives the consent ask.
      */
     ranOutOfTokens?: boolean;
     /**
-     * The provider call failed and `message` holds the user-facing error text
-     * rather than an answer. Lets the ladder tell "this retry blew up" apart
-     * from "this retry answered", so it can fall back to the attempt the retry
-     * was supposed to replace instead of discarding it.
+     * Any tool executed anywhere in this turn (propagated through recursion).
+     * Gates the thinking-off floor: a tool-less turn is safe to re-run, a
+     * tool-using one is not (addUserTask has no dedup) and must ask instead.
      */
-    errored?: boolean;
-    /**
-     * Telegram message this turn streamed into, when it sent one. A retry
-     * reuses it (`reuseMessageId`) so the fuller answer EDITS the partial one
-     * in place instead of posting a second message beside it.
-     */
-    messageId?: number;
+    usedTools?: boolean;
 }
 
 /** Recursively strip <system> from all string leaves in a tool-result value.
@@ -142,59 +120,70 @@ function deepStripSystemTagsInResult(value: unknown): unknown {
 }
 
 /**
- * Starting output allowance when the user has no raised budget of their own.
- * max_tokens covers thinking AND visible text together, so at the old 1500 a
- * high-effort thinking pass could consume the whole allowance and leave nothing
- * to say. This is a starting point, not a guess at "enough" — when a task needs
- * more, the escalation ladder in streamAIResponse takes it up.
+ * Base output allowance when no grant window is active and the user has set no
+ * persistent budget. max_tokens covers thinking AND visible text together, so at
+ * the old 1500 a high-effort thinking pass could consume the whole allowance and
+ * leave nothing to say. 8000 fits ordinary chat comfortably; genuinely heavy
+ * tasks that overrun it trigger the consent ask rather than a silent bump.
  */
 const DEFAULT_MAX_TOKENS = 8000;
 
-/**
- * Ceiling for escalation. The model's own output cap is 128k; this sits well
- * inside it and far above any reply this bot needs, existing only so a
- * pathological turn cannot spend without bound.
- */
-const MAX_ESCALATED_TOKENS = 64000;
+/** Elevated budget a consent grant opens, and how long its window lasts. The
+ * window (not a per-message counter) is what lets one "yes" cover a whole
+ * multi-step task — every request inside it, tool-result recursion included,
+ * resolves to this budget. 64000 sits well inside the model's 128k output cap. */
+const GRANT_BUDGET = 64000;
+const GRANT_WINDOW_MINUTES = 5;
 
-/** Each escalation step multiplies the budget. Steps from 8k: 32k → 64k. */
-const ESCALATION_FACTOR = 4;
+/** Delivered when a turn couldn't finish within budget, so the user is never
+ * left with silence AND is given the choice to let the bot spend more. Two
+ * variants: one when a partial answer was shown, one when nothing was. */
+const ASK_MORE_AFTER_PARTIAL = 'Ответ не уместился в лимит 🐺 Разрешишь потратить больше токенов на пару минут — тогда допишу полностью?';
+const ASK_MORE_AFTER_NOTHING = 'Не хватило лимита токенов, чтобы ответить 🐺 Разрешишь потратить больше на пару минут — тогда отвечу?';
 
-/** Last-resort words when a turn produced nothing at all, so the user is never
+/** Last-resort words when a turn produced nothing at all for a reason that is
+ * NOT a budget overrun (a refusal, an empty completion), so the user is never
  * left staring at silence wondering whether the bot is alive. */
 const NO_OUTPUT_FALLBACK = 'Задумался и потерял мысль 🐺 Повтори, пожалуйста?';
+
+/** Does this raw model text carry anything the USER would actually see? Mirrors
+ * the delivery path (updateTelegramMessage), which sends nothing once internal
+ * markers are stripped and the remainder is whitespace — so "the message string
+ * is non-empty" and "the user saw text" are NOT the same test. */
+function hasVisibleText(raw: string): boolean {
+    return !!stripInternalMarkers(raw).trim();
+}
 
 export class AIService {
     /**
      * Unified function to handle AI streaming responses with tool calling support.
      *
      * Also guarantees the turn FINISHES, however complex the task, and never
-     * ends in silence.
+     * ends in silence — but WITHOUT silently spending more than its budget.
      *
      * The failure this defends against: max_tokens caps thinking and visible
      * text *together*, and adaptive thinking expands to fill whatever it is
      * given — so a turn can spend its whole allowance thinking and return no
-     * text and no tool calls (production incident 2026-07-17, max_tokens=1500).
-     * No budget rules that out, so picking a bigger number is not a fix. The
-     * ladder instead reacts to what the model reports:
+     * text and no tool calls (production incident 2026-07-17, max_tokens=1500),
+     * or simply truncate a long answer. The response is consent-gated, not auto:
      *
-     *   1. ESCALATE while the model says it ran out of room (stop_reason
-     *      'max_tokens' — covers both a truncated reply and a thinking-only
-     *      turn). Each step multiplies the budget up to MAX_ESCALATED_TOKENS,
-     *      so complexity is met with room rather than an apology. Only ever
-     *      re-runs when NO tool executed, so there are no side effects to
-     *      duplicate; a retry reuses the same Telegram message, so the fuller
-     *      answer replaces the partial one instead of posting beside it.
-     *   2. THINKING OFF, if the ceiling is reached and there is still nothing.
-     *      The whole allowance then goes to visible text, so this cannot come
-     *      back thinking-only at any budget.
-     *   3. SPEAK ANYWAY, if the user still received nothing. Keyed off delivery
-     *      rather than any specific failure mode, so it also covers refusals and
-     *      empty replies we haven't seen yet.
-     *
-     * A turn that had to escalate is recorded (recordBudgetEscalation) so the
-     * next turn asks the user whether to keep the higher budget — see
-     * getCurrentInfo in index.ts and the SetReplyTokenBudget tool.
+     *   1. RE-ALLOCATE for free. Ordinary chat fits the base budget; nothing to
+     *      do. (Using the same budget differently — e.g. the thinking-off floor
+     *      below — is not "spending more" and needs no consent.)
+     *   2. ASK to spend more. When the turn couldn't finish within budget, the
+     *      bot tells the user and asks permission (setTokenConsentPending). It
+     *      does NOT escalate on its own. The ask is always delivered, so this is
+     *      also the never-silent guarantee for a budget overrun.
+     *   3. On the user's "yes", the model calls GrantMoreTokens, which opens a
+     *      time-boxed elevated-budget WINDOW. Every request inside it — including
+     *      tool-result recursion — resolves to the elevated budget (see
+     *      resolveReplyBudget), so a multi-step task finishes on one grant.
+     *   4. THINKING-OFF FLOOR. If even the maximum granted budget yields no text
+     *      on a tool-less turn, re-running would only ask forever — so hand the
+     *      whole allowance to text once to force an answer out. Safe because no
+     *      tool ran (nothing to duplicate).
+     *   5. SPEAK ANYWAY. A non-budget empty (refusal, odd completion) still gets
+     *      a fallback line, so the user is never left with silence.
      */
     static async streamAIResponse(options: AIStreamOptions): Promise<AIStreamResult> {
         const withDefaults = (opts: AIStreamOptions): AIStreamOptions => ({
@@ -215,96 +204,66 @@ export class AIService {
             },
         });
 
+        // One generation. The effective budget (base, persistent, or an active
+        // grant window) is resolved inside — freshly, at every recursion level —
+        // so a grant the model opens mid-turn covers the continuation too.
+        // `let` because the thinking-off floor may replace it with its retry.
+        let result = await this.streamAIResponseInternal(observed);
+
+        // The consent ask, thinking-off floor, and never-silent fallback are the
+        // turn's final word: only the top level, only for a real user, speaks
+        // them. A recursion level (depth > 0) and a silent background run both
+        // return their result untouched.
         const isTopLevel = (options.currentRecursionDepth ?? 0) === 0;
-        // An explicit maxTokens from a caller (collision fixer, style scan) is a
-        // deliberate cap, but it is a starting point like any other — the ladder
-        // may still raise it rather than let that caller's task go unfinished.
-        const startBudget = options.maxTokens
-            ?? (isTopLevel ? await getReplyMaxTokens(options.userId) : undefined)
-            ?? DEFAULT_MAX_TOKENS;
+        const userFacing = options.shouldUpdateTelegram ?? true;
+        if (!isTopLevel || !userFacing) return result;
 
-        let budget = startBudget;
-        // While headroom remains, a truncated attempt is provisional — tell it
-        // not to persist text the next attempt will replace.
-        let result = await this.streamAIResponseInternal({
-            ...observed,
-            maxTokens: budget,
-            willRetryIfTruncated: budget < MAX_ESCALATED_TOKENS,
-        });
+        // Aborts are deliberate silence — the next coalesced reply answers.
+        if (result.emptyReason === 'aborted') return result;
 
-        /** Options shared by every attempt AFTER the first. The user row is
-         * already written by attempt 1 and re-writing it would duplicate the
-         * prompt in history (the /goal and greeting paths pass
-         * addUserToHistory: true) — the tool-call recursion guards the same way. */
-        const retryBase = { ...observed, addUserToHistory: false };
+        // "Did the user actually SEE text this turn?" — the only reliable signal
+        // across recursion. `delivered` flips on any confirmed send at any depth
+        // (a tool-first reply's answer streams from depth 1+, and result.message
+        // holds only the depth-0 text). And it must be VISIBLE text: the delivery
+        // path skips a message whose stripped/trimmed body is empty (whitespace
+        // or an echoed <system>/<thinking> block), so raw result.message
+        // truthiness would wrongly count that as "seen".
+        const sawText = delivered || hasVisibleText(result.message);
 
-        // Escalate while the model reports it ran out of room. Gated on no tool
-        // having run: that is what makes re-running free of duplicate side
-        // effects (addUserTask has no dedup). When a tool DID run, the tool-call
-        // recursion continues the work and each level gets its own fresh budget.
-        while (result.ranOutOfTokens && !result.toolCalls?.length && budget < MAX_ESCALATED_TOKENS) {
-            const raised = Math.min(budget * ESCALATION_FACTOR, MAX_ESCALATED_TOKENS);
-            console.warn(`📈 ${options.userId}: ${budget} tokens was not enough — escalating to ${raised}`);
-            budget = raised;
-            const superseded = result;
-            result = await this.streamAIResponseInternal({
-                ...retryBase,
-                maxTokens: budget,
-                reuseMessageId: result.messageId,
-                willRetryIfTruncated: budget < MAX_ESCALATED_TOKENS,
-            });
-            // The retry errored out, so the attempt it was meant to replace is
-            // the best answer we have — but it deliberately skipped its own
-            // history write on the promise of being replaced. Commit it now, or
-            // the turn leaves no assistant row at all and the next turn's
-            // context sees a user message that was never answered.
-            if (result.errored && superseded.message) {
-                result = await this.commitSupersededAttempt(options, superseded, result);
-                break;
+        if (result.ranOutOfTokens) {
+            // Thinking-off floor: a tool-less, text-less turn at the maximum
+            // granted budget can't be helped by asking for still more — the model
+            // just needs the whole allowance for text. Force an answer out.
+            const grantActive = (await getActiveTokenGrant(options.userId)) !== null;
+            if (!result.usedTools && !sawText && grantActive) {
+                console.warn(`🔇→🗣 ${options.userId}: granted budget still produced no text — forcing an answer with thinking off`);
+                const forced = await this.streamAIResponseInternal({
+                    ...observed,
+                    disableThinking: true,
+                    addUserToHistory: false, // the user row was written on the first attempt
+                });
+                // Return the forced attempt if it delivered or produced visible
+                // text (it may have gone tool-first, delivering via recursion
+                // with an empty top-level message). Only if it too came up empty
+                // do we fall through to the never-silent fallback with its result.
+                if (delivered || hasVisibleText(forced.message)) return forced;
+                result = forced;
+            } else {
+                // Couldn't finish within budget: ask the user for permission to
+                // spend more. Reliably delivered, so it doubles as never-silent.
+                // sawText picks the wording — "didn't fit, finish it?" if a
+                // partial showed, "couldn't answer, may I?" if nothing did.
+                await this.askForMoreTokens(options, sawText);
+                return result;
             }
         }
 
-        // Ceiling reached and still nothing to show: hand the entire allowance
-        // to visible text. This is by definition the final attempt, so it must
-        // NOT inherit a stale willRetryIfTruncated (in recursion it would
-        // otherwise arrive as true and make this attempt discard its own text).
-        const budgetFixedIt = budget > startBudget && !result.emptyReason;
-        if (result.emptyReason === 'no_output') {
-            console.warn(`🔁 ${options.userId}: still no output at ${budget} — retrying with thinking off`);
-            result = await this.streamAIResponseInternal({
-                ...retryBase,
-                maxTokens: budget,
-                disableThinking: true,
-                reuseMessageId: result.messageId,
-                willRetryIfTruncated: false,
-            });
-        }
-
-        // Ask about the higher budget only when the higher budget is what
-        // actually finished the turn. If the thinking-off retry is what produced
-        // the answer, more tokens would NOT have helped, and asking the user to
-        // adopt this budget for every future reply would be wrong advice.
-        // Silent runs are excluded: nobody saw "your previous answer".
-        if (isTopLevel && budgetFixedIt && !result.emptyReason
-            && (options.shouldUpdateTelegram ?? true)) {
-            await recordBudgetEscalation(options.userId, budget)
-                .catch(err => console.warn('[budget] recordBudgetEscalation failed:', err instanceof Error ? err.message : err));
-        }
-
-        // Backstop. Keyed on "the user received nothing", NOT on any particular
-        // failure mode — that is what makes it total. It therefore also covers
-        // the case the emptyReason checks miss: the model calls a tool with no
-        // preamble and the recursive turn then yields no text, so tools ran (no
-        // 'no_output' anywhere) yet nothing ever reached the user.
-        //
-        // Excluded: aborts (deliberate silence — the next coalesced reply
-        // answers), silent background runs (no user to speak to), and any turn
-        // that already has a message to show — notably the error path, which
-        // sent its own 🐺 text and would otherwise get a second message.
-        // Only the top level may speak for the turn.
-        if (isTopLevel && !delivered && !result.message
-            && result.emptyReason !== 'aborted'
-            && (options.shouldUpdateTelegram ?? true)) {
+        // Never-silent floor for a non-budget empty (refusal, odd completion).
+        // Gated on VISIBLE text, matching the delivery path — a whitespace- or
+        // marker-only completion is nothing from the user's side even though its
+        // raw message string is non-empty. The error-catch path is unaffected:
+        // its 🐺 text is visible, so this correctly stays quiet after it.
+        if (!delivered && !hasVisibleText(result.message)) {
             console.error(`🚨 ${options.userId}: turn delivered nothing to the user — sending fallback`);
             await safeSend(options.bot, options.userId, NO_OUTPUT_FALLBACK);
             return { ...result, message: NO_OUTPUT_FALLBACK, rawResponse: NO_OUTPUT_FALLBACK };
@@ -314,30 +273,36 @@ export class AIService {
     }
 
     /**
-     * Rescue an attempt whose replacement errored out.
+     * The effective per-request output budget, resolved fresh on every call so a
+     * grant window opened mid-turn immediately covers the tool-result recursion.
      *
-     * A superseded attempt skips its own history write because a retry was
-     * expected to replace it. When that retry instead fails, this persists the
-     * superseded text so the turn still leaves an assistant row, and returns it
-     * as the turn's answer — the user has already seen it streamed, and it beats
-     * showing only an error with no record of the reply.
+     * Background callers (collision fixer, style scan) pass an explicit cap and
+     * get exactly it — grants belong to user chats, not cron jobs. A user-facing
+     * request takes the active grant window if one is open, otherwise the user's
+     * persistent budget, otherwise the default.
      */
-    private static async commitSupersededAttempt(
-        options: AIStreamOptions,
-        superseded: AIStreamResult,
-        errorResult: AIStreamResult,
-    ): Promise<AIStreamResult> {
-        console.warn(`↩️ ${options.userId}: escalated retry failed — keeping the partial answer from the previous attempt`);
-        if (options.addAssistantToHistory ?? true) {
-            const safeContent = stripSystemTags(superseded.message);
-            if (safeContent) {
-                await addMessageToHistory(options.userId, 'assistant', safeContent)
-                    .catch(err => console.warn('[budget] committing superseded attempt failed:', err instanceof Error ? err.message : err));
-            }
-        }
-        // Keep errored so callers still know the turn degraded, but carry the
-        // real text: the backstop must not treat this as "nothing delivered".
-        return { ...superseded, errored: errorResult.errored };
+    private static async resolveReplyBudget(options: AIStreamOptions): Promise<number> {
+        const userFacing = options.shouldUpdateTelegram ?? true;
+        if (!userFacing) return options.maxTokens ?? DEFAULT_MAX_TOKENS;
+        const [grant, persistent] = await Promise.all([
+            getActiveTokenGrant(options.userId),
+            getReplyMaxTokens(options.userId),
+        ]);
+        const base = options.maxTokens ?? persistent ?? DEFAULT_MAX_TOKENS;
+        return grant ? Math.max(grant, base) : base;
+    }
+
+    /**
+     * Tell the user the answer didn't fit and ask permission to spend more, and
+     * flag the pending consent so the next turn acts on their reply (the model
+     * is told, via getCurrentInfo, to call GrantMoreTokens on a "yes"). Delivered
+     * unconditionally — this is what keeps a budget overrun from being silent.
+     */
+    private static async askForMoreTokens(options: AIStreamOptions, hadPartial: boolean): Promise<void> {
+        console.warn(`🙋 ${options.userId}: couldn't finish within budget — asking permission to use more`);
+        await setTokenConsentPending(options.userId)
+            .catch(err => console.warn('[budget] setTokenConsentPending failed:', err instanceof Error ? err.message : err));
+        await safeSend(options.bot, options.userId, hadPartial ? ASK_MORE_AFTER_PARTIAL : ASK_MORE_AFTER_NOTHING);
     }
 
     /**
@@ -352,7 +317,6 @@ export class AIService {
             bot,
             provider,
             model,
-            maxTokens = DEFAULT_MAX_TOKENS,
             shouldUpdateTelegram = true,
             addUserToHistory = true,
             addAssistantToHistory = true,
@@ -360,6 +324,10 @@ export class AIService {
             currentRecursionDepth = 0,
             appendMessagesAfterUser,
         } = options;
+
+        // Resolved fresh here (not passed down from the parent), so a grant
+        // window opened earlier in this same turn already applies to this call.
+        const maxTokens = await this.resolveReplyBudget(options);
 
         // Hoisted to function scope so the abort catch can salvage partial
         // billing data. Anthropic emits `message_start` with input_tokens
@@ -370,9 +338,9 @@ export class AIService {
         let usageOutputTokens = 0;
 
         try {
-            // Seeded on a ladder retry so the fuller answer edits the partial
-            // one in place — from the user's side it just looks like streaming.
-            let messageId: number | undefined = options.reuseMessageId;
+            // Tracks the message THIS generation is streaming into, so mid-stream
+            // ticks edit it rather than posting duplicates. Fresh per call.
+            let messageId: number | undefined;
             let lastSentContent: string = '';
             // Guard against retrying the initial send on every throttled tick after
             // a transient Telegram failure (would surface duplicate messages if a
@@ -479,6 +447,21 @@ export class AIService {
                     : []),
                 ...(appendMessagesAfterUser || []),
             ];
+
+            // The 4.6+ models reject a conversation that ends with an assistant
+            // message ("does not support assistant message prefill"). That can
+            // happen on the empty-userMessage burst path: while a slow tool-call
+            // turn is still running, a newer user message is recorded, then the
+            // slow turn's assistant/tool-summary rows land AFTER it — so history
+            // now ends with an assistant row and the burst reply 400s (seen in
+            // prod 2026-07-17, request req_011Cd7x4). Trim trailing assistant
+            // rows so the array ends on the user's actual last message; the
+            // trimmed summaries' facts (created tasks/routines) still reach the
+            // model via getCurrentInfo. tool_result tails are fine — they are
+            // part of a user turn — so only 'assistant' is trimmed.
+            while (messages.length && messages[messages.length - 1].role === 'assistant') {
+                messages.pop();
+            }
 
             // Get tool definitions if enabled. allowedTools narrows the offer —
             // background runs (collision fixer) get only schedule tools so the
@@ -647,23 +630,16 @@ export class AIService {
 
             historyResponseAccumulated = aiResponseAccumulated;
 
-            // This attempt ran out of room and the ladder still has headroom, so
-            // it is about to be re-run at a bigger budget and everything below
-            // is provisional. Skip the final tick: it is the only place that
-            // splits an over-long reply into EXTRA messages, and those extras
-            // cannot be taken back — a retry only edits the first message, so
-            // the overflow from a superseded attempt would linger under the real
-            // answer as stale, half-finished text. Mid-stream edits already put
-            // the partial in the first message; the retry overwrites it there.
-            const willBeSuperseded = options.willRetryIfTruncated === true
-                && stopReason === 'max_tokens'
-                && toolCalls.length === 0;
-
             // Final display tick: mdToTelegramHtml via safeEdit strips <system>/<thinking>/legacy
             // tags through sanitize-html's nonTextTags. No separate cleanup needed.
-            if (!willBeSuperseded) {
-                await updateTelegramMessage(true);
-            }
+            // Every attempt commits its own visible text now — there is no
+            // supersede-and-replace, so a truncated answer is the real answer
+            // (the consent ask offers to extend it) and must be shown and kept.
+            await updateTelegramMessage(true);
+
+            // Carries the deepest generation's terminal state up so the top level
+            // can tell whether the WHOLE turn finished within budget.
+            let recursiveResult: AIStreamResult | undefined;
 
             if (toolCalls.length > 0 && enableToolCalls) {
 
@@ -805,20 +781,16 @@ export class AIService {
 
                 console.log(`🔄 Continuing with ${newAppendedMessages.length} tool result(s), depth: ${currentRecursionDepth + 1}`);
 
-                const recursiveResult = await this.streamAIResponse({
+                recursiveResult = await this.streamAIResponse({
                     ...options,
                     currentRecursionDepth: currentRecursionDepth + 1,
                     appendMessagesAfterUser: newAppendedMessages,
                     addUserToHistory: false, // Don't add recursive calls to history
-                    // Per-attempt flags belong to THIS level only and must not
-                    // leak downward: reuseMessageId would make the child edit
-                    // our message instead of sending its own, disableThinking
-                    // would silently disable thinking for the rest of the chain,
-                    // and a stale willRetryIfTruncated would make the child
-                    // discard text nobody is going to replace.
-                    reuseMessageId: undefined,
+                    // disableThinking belongs to THIS level's thinking-off floor
+                    // only; letting it leak down would silently disable thinking
+                    // for the rest of the chain. The child resolves its own budget
+                    // from the DB, so a grant applies without being passed in.
                     disableThinking: undefined,
-                    willRetryIfTruncated: undefined,
                 });
 
                 historyResponseAccumulated = historyResponseAccumulated + recursiveResult.rawResponse;
@@ -833,14 +805,9 @@ export class AIService {
             // before any tool runs are caught earlier (catch block returns
             // empty without ever reaching this line). Skip writing if the
             // content is empty — happens when the model emits only thinking
-            // blocks then silently completes (no text, no tools, no recursion).
-            // Same reason the final display tick was skipped above: this
-            // attempt is about to be replaced, so persisting its half-finished
-            // text would leave a stale row next to the complete answer — and
-            // feed the truncated version back as context on later turns. (The
-            // thinking-only case needs no guard: empty content is never
-            // written.)
-            if (addAssistantToHistory && !willBeSuperseded) {
+            // blocks then silently completes; the consent ask handles that case,
+            // and there is nothing to record.
+            if (addAssistantToHistory) {
                 const safeAssistantContent = stripSystemTags(historyResponseAccumulated);
                 if (safeAssistantContent) {
                     await addMessageToHistory(userId, 'assistant', safeAssistantContent);
@@ -849,25 +816,28 @@ export class AIService {
                         : safeAssistantContent;
                     console.log(`📝 Added assistant message to history: "${preview.replace(/\n/g, ' ')}"`);
                 } else {
-                    // Thinking-only completion — model emitted thinking blocks
-                    // but no text, no tool calls, no recursion. Nothing to
-                    // persist; streamAIResponse retries this with thinking off.
+                    // Thinking-only completion — no text, no tools. Nothing to
+                    // persist; the top level asks the user for more budget.
                     console.warn(`⚠️ AI emitted thinking-only response for ${userId} — no visible output, no history row written`, { stopReason });
                 }
             }
 
-            // No text and no tool calls means the turn accomplished nothing —
-            // and, because no tool ran, that it can be re-run with no risk of
-            // duplicating side effects. streamAIResponse keys its retry off this.
-            const producedNothing = !aiResponseAccumulated.length && toolCalls.length === 0;
+            // "Couldn't finish within budget", folding in the recursion: if we
+            // recursed, the deepest child is the turn's tail and carries the
+            // verdict; otherwise it's our own stop_reason with nothing left to
+            // run. usedTools is true if any tool ran at this level or below —
+            // it gates the thinking-off floor (only a tool-less turn is safe to
+            // re-run).
+            const ownRanOut = stopReason === 'max_tokens' && toolCalls.length === 0;
+            const ranOutOfTokens = recursiveResult ? !!recursiveResult.ranOutOfTokens : ownRanOut;
+            const usedTools = toolCalls.length > 0 || !!recursiveResult?.usedTools;
 
             return {
                 message: aiResponseAccumulated,
                 rawResponse: aiResponseAccumulated,
                 toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-                ...(producedNothing ? { emptyReason: 'no_output' as const } : {}),
-                ...(stopReason === 'max_tokens' ? { ranOutOfTokens: true } : {}),
-                ...(messageId !== undefined ? { messageId } : {}),
+                ...(ranOutOfTokens ? { ranOutOfTokens: true } : {}),
+                ...(usedTools ? { usedTools: true } : {}),
             };
 
         } catch (error) {
@@ -896,10 +866,10 @@ export class AIService {
                     recordAITokens(userId, usageInputTokens, usageOutputTokens, options.purpose ?? 'reply', model)
                         .catch(err => console.warn('[token-stat] partial recordAITokens (abort) failed:', err instanceof Error ? err.message : err));
                 }
-                // 'aborted', NOT 'no_output': this silence is deliberate. The
-                // coalescer cancelled to let a newer message win, and the retry
-                // would fight it (and the fallback would talk over the reply
-                // that replaces this one).
+                // Marked 'aborted' so the top level treats this silence as
+                // deliberate: the coalescer cancelled to let a newer message
+                // win, so neither the consent ask nor the never-silent fallback
+                // should talk over the reply that replaces this one.
                 return { message: '', rawResponse: '', emptyReason: 'aborted' };
             }
 
@@ -926,10 +896,11 @@ ${error instanceof Error ? error.message : String(error)}
             `;
             await safeSend(bot, userId, errorMessage);
 
+            // message is set (the 🐺 error the user just saw), so the top-level
+            // never-silent fallback correctly treats the turn as "delivered".
             return {
                 message: errorMessage,
                 rawResponse: errorMessage,
-                errored: true,
             };
         }
     }

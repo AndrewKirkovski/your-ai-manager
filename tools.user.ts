@@ -1,6 +1,11 @@
 import {Tool} from "./tool.types";
-import {setUserGoal, getUserGoal, clearUserGoal, setReplyMaxTokens, getReplyMaxTokens} from "./userStore";
+import {setUserGoal, getUserGoal, clearUserGoal, setReplyMaxTokens, getReplyMaxTokens, grantTokenWindow} from "./userStore";
 import {textify} from "./telegramFormat";
+
+/** Elevated budget and window a consent grant opens. Kept in sync with the
+ * constants of the same purpose in aiService.ts. */
+const GRANT_BUDGET = 64000;
+const GRANT_WINDOW_MINUTES = 5;
 
 export const SetGoal: Tool = {
     name: 'SetGoal',
@@ -80,6 +85,26 @@ export const GetReplyTokenBudget: Tool = {
         return budget === null
             ? { isDefault: true, message: 'Using the default reply budget.' }
             : { isDefault: false, maxTokens: budget };
+    }
+};
+
+export const GrantMoreTokens: Tool = {
+    name: 'GrantMoreTokens',
+    description: `Give yourself a larger token budget (${GRANT_BUDGET} tokens/reply) for the next ${GRANT_WINDOW_MINUTES} minutes so you can finish a complex answer or a multi-step task. The window covers every request in it — follow-up tool calls and their processing too, not just one message — so one grant finishes the whole task. `
+        + 'Call this ONLY after the user has agreed to let you spend more tokens (for example, they said yes/да/давай to your question about it). Do not call it on your own initiative without that agreement. After calling it, continue and answer the request that did not fit before.',
+    parameters: {
+        type: 'object',
+        properties: {}
+    },
+    execute: async (args: { userId: number }) => {
+        const until = await grantTokenWindow(args.userId, GRANT_BUDGET, GRANT_WINDOW_MINUTES);
+        return {
+            success: true,
+            maxTokens: GRANT_BUDGET,
+            windowMinutes: GRANT_WINDOW_MINUTES,
+            until,
+            message: `Budget raised to ${GRANT_BUDGET} tokens/reply until ${until}. Now finish the request that ran out of room.`,
+        };
     }
 };
 

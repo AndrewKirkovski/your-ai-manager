@@ -32,7 +32,7 @@ import {
     getTodayStats,
     getAllUserMemoryRecords,
     deleteUserMemory,
-    takePendingBudgetAsk,
+    isTokenConsentPending,
 } from "./userStore";
 import {addUserTask, generateShortId, addMessageToHistory} from './userStore';
 import {AIService} from './aiService';
@@ -394,13 +394,15 @@ async function getCurrentInfo(userId: number, opts?: { userFacing?: boolean }): 
 
     const memoryRecords = await getAllUserMemoryRecords(userId);
 
-    // A previous turn only finished by spending more than the user's budget.
-    // Ask once whether to keep the higher budget — consume-once, so this shows
-    // up in exactly one turn's prompt rather than nagging until answered.
-    // Only on user-facing turns: see the note on `userFacing` above.
-    const pendingBudgetAsk = opts?.userFacing ? await takePendingBudgetAsk(userId) : null;
-    const budgetAskStr = pendingBudgetAsk
-        ? `\nIMPORTANT — ask the user about this in your reply: your previous answer did not fit in the current reply budget, and only completed after raising it to ${pendingBudgetAsk} tokens. Ask (in your own voice, briefly) whether they want you to use ${pendingBudgetAsk} tokens for replies from now on, so complex answers succeed first time instead of being retried. If they agree, call SetReplyTokenBudget with maxTokens=${pendingBudgetAsk}. If they decline, carry on as you are — you will still finish complex answers, just less efficiently.\n`
+    // Last turn couldn't finish within the token budget, so the bot asked the
+    // user for permission to spend more. Peek (not consume) on user-facing turns:
+    // the flag persists until a grant resolves it or it goes stale, so a reply
+    // aborted before the model could act doesn't drop the pending "yes". The
+    // guidance is internal (never a user-visible message), so showing it for a
+    // few turns until resolved is harmless.
+    const consentPending = opts?.userFacing ? await isTokenConsentPending(userId) : false;
+    const budgetAskStr = consentPending
+        ? `\nIMPORTANT — you recently told the user their answer didn't fit your token budget and asked permission to use more. If their latest message agrees (e.g. yes / да / ок / давай / go ahead), call GrantMoreTokens and then fully answer the request that didn't fit. If they decline or change the subject, just proceed normally without granting.\n`
         : '';
 
     // Goal / routine-name / task-name are AI- or user-writable free text. Strip

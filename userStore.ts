@@ -659,44 +659,64 @@ export async function clearUserGoal(userId: number): Promise<void> {
 // ============== REPLY TOKEN BUDGET ==============
 // max_tokens bounds a turn's thinking AND its visible reply together, so a
 // budget too small for the task yields a truncated answer — or, if thinking
-// consumed all of it, no answer at all. aiService escalates automatically so
-// the turn still finishes; these let a user who regularly needs more start
-// there instead of re-paying the failed first attempt every time.
+// consumed all of it, no answer at all. When a turn can't finish, the bot asks
+// the user for permission to use more (it does not silently escalate); on
+// consent it opens a short elevated-budget WINDOW that covers the whole
+// processing chain, tool-result recursion included.
 
-/** The user's chosen reply budget, or null to use aiService's default. */
+/** The user's persistent reply budget, or null to use aiService's default. */
 export async function getReplyMaxTokens(userId: number): Promise<number | null> {
     const row = db.prepare('SELECT reply_max_tokens FROM users WHERE user_id = ?')
         .get(userId) as { reply_max_tokens: number | null } | undefined;
     return row?.reply_max_tokens ?? null;
 }
 
-/** Persist a reply budget for this user. Pass null to fall back to the default.
- * Also clears any pending ask — the question has been answered. */
+/** Persist a reply budget for this user. Pass null to fall back to the default. */
 export async function setReplyMaxTokens(userId: number, maxTokens: number | null): Promise<void> {
-    db.prepare('UPDATE users SET reply_max_tokens = ?, pending_budget_ask = NULL WHERE user_id = ?')
-        .run(maxTokens, userId);
+    db.prepare('UPDATE users SET reply_max_tokens = ? WHERE user_id = ?').run(maxTokens, userId);
 }
 
-/** Record that a turn only finished by escalating to `budget`, so the next turn
- * can ask whether to keep it. Not recorded when the user is already at or above
- * that budget — there would be nothing to ask about. */
-export async function recordBudgetEscalation(userId: number, budget: number): Promise<void> {
-    const current = await getReplyMaxTokens(userId);
-    if (current !== null && current >= budget) return;
-    db.prepare('UPDATE users SET pending_budget_ask = ? WHERE user_id = ?').run(budget, userId);
+/** The elevated budget currently granted to this user, or null if no window is
+ * active. ISO-8601 UTC strings compare lexicographically as times, so the
+ * expiry check needs no Date parsing. */
+export async function getActiveTokenGrant(userId: number): Promise<number | null> {
+    const row = db.prepare('SELECT token_grant_until, token_grant_budget FROM users WHERE user_id = ?')
+        .get(userId) as { token_grant_until: string | null; token_grant_budget: number | null } | undefined;
+    if (!row?.token_grant_until || row.token_grant_budget == null) return null;
+    return new Date().toISOString() < row.token_grant_until ? row.token_grant_budget : null;
 }
 
-/** Read and clear the pending escalation in one step (consume-once): the note it
- * drives is injected into exactly one turn's prompt, so the bot asks once rather
- * than nagging every turn until answered. */
-export async function takePendingBudgetAsk(userId: number): Promise<number | null> {
-    const row = db.prepare('SELECT pending_budget_ask FROM users WHERE user_id = ?')
-        .get(userId) as { pending_budget_ask: number | null } | undefined;
-    const pending = row?.pending_budget_ask ?? null;
-    if (pending !== null) {
-        db.prepare('UPDATE users SET pending_budget_ask = NULL WHERE user_id = ?').run(userId);
-    }
-    return pending;
+/** Open (or refresh) an elevated-budget window that ends `minutes` from now.
+ * Clears the pending-consent flag — the user just answered by granting. */
+export async function grantTokenWindow(userId: number, budget: number, minutes: number): Promise<string> {
+    const until = new Date(Date.now() + minutes * 60_000).toISOString();
+    db.prepare('UPDATE users SET token_grant_budget = ?, token_grant_until = ?, token_consent_pending = NULL WHERE user_id = ?')
+        .run(budget, until, userId);
+    return until;
+}
+
+/** Mark that the bot has asked this user for a bigger budget, so the next turn
+ * knows to act on a "yes". Stored as the ask time. */
+export async function setTokenConsentPending(userId: number): Promise<void> {
+    db.prepare('UPDATE users SET token_consent_pending = ? WHERE user_id = ?').run(new Date().toISOString(), userId);
+}
+
+/** Is a consent ask still outstanding for this user? Peek, NOT consume: the flag
+ * stays set until it is actually resolved — grantTokenWindow clears it on a
+ * grant — or until it goes stale here. Consuming it at prompt-assembly (the
+ * earlier design) meant a reply that was soft-aborted before the model could act
+ * silently dropped the user's pending "yes"; leaving it set lets the next
+ * coalesced reply still see it. Returns true only while recent (within
+ * `maxAgeMs`); a stale flag is cleared and reads false, so an old "yes" can't
+ * unlock a budget much later. */
+export async function isTokenConsentPending(userId: number, maxAgeMs = 15 * 60_000): Promise<boolean> {
+    const row = db.prepare('SELECT token_consent_pending FROM users WHERE user_id = ?')
+        .get(userId) as { token_consent_pending: string | null } | undefined;
+    const asked = row?.token_consent_pending ?? null;
+    if (asked === null) return false;
+    if (Date.now() - Date.parse(asked) <= maxAgeMs) return true;
+    db.prepare('UPDATE users SET token_consent_pending = NULL WHERE user_id = ?').run(userId);
+    return false;
 }
 
 // ============== IMAGE CACHE ==============

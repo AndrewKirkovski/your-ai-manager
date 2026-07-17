@@ -26,30 +26,47 @@ export function applyColumnMigrations(db: Database.Database): void {
         }
     }
     // users: per-user reply budget (added 2026-07-17)
-    // Both nullable. reply_max_tokens NULL = use the built-in default.
-    // pending_budget_ask holds the budget a turn had to escalate to, until the
-    // next turn asks the user whether to keep it (consume-once).
+    //
+    //   reply_max_tokens    persistent per-user default; NULL = built-in default.
+    //   token_grant_until   ISO timestamp; while now < it, replies use the
+    //                       elevated token_grant_budget. This is the consent-
+    //                       granted window (GrantMoreTokens tool) that covers a
+    //                       whole processing chain — tool-result recursion too.
+    //   token_grant_budget  the elevated max_tokens active during the window.
+    //   token_consent_pending  ISO timestamp; set when the bot asked the user
+    //                       for a bigger budget, consumed by the next user-facing
+    //                       turn so the bot asks once, not every turn.
+    //
+    // pending_budget_ask is retained (an earlier auto-escalation design) but no
+    // longer read or written; SQLite has no cheap DROP COLUMN, so it stays inert.
     {
         const cols = db.prepare('PRAGMA table_info(users)').all() as { name: string }[];
-        if (!cols.some(c => c.name === 'reply_max_tokens')) {
-            db.exec(`ALTER TABLE users ADD COLUMN reply_max_tokens INTEGER`);
-        }
-        if (!cols.some(c => c.name === 'pending_budget_ask')) {
-            db.exec(`ALTER TABLE users ADD COLUMN pending_budget_ask INTEGER`);
-        }
+        const add = (name: string, type: string) => {
+            if (!cols.some(c => c.name === name)) db.exec(`ALTER TABLE users ADD COLUMN ${name} ${type}`);
+        };
+        add('reply_max_tokens', 'INTEGER');
+        add('pending_budget_ask', 'INTEGER');
+        add('token_grant_until', 'TEXT');
+        add('token_grant_budget', 'INTEGER');
+        add('token_consent_pending', 'TEXT');
     }
 }
 
 export const SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS users (
-        user_id            INTEGER PRIMARY KEY,
-        chat_id            INTEGER,
-        goal               TEXT NOT NULL DEFAULT '',
-        timezone           TEXT,
+        user_id                INTEGER PRIMARY KEY,
+        chat_id                INTEGER,
+        goal                   TEXT NOT NULL DEFAULT '',
+        timezone               TEXT,
         -- NULL = use the built-in default reply budget.
-        reply_max_tokens   INTEGER,
-        -- Budget a turn had to escalate to; consumed by the next turn's ask.
-        pending_budget_ask INTEGER
+        reply_max_tokens       INTEGER,
+        -- Retained but inert (superseded by the grant-window columns below).
+        pending_budget_ask     INTEGER,
+        -- Consent-granted elevated-budget window (GrantMoreTokens tool).
+        token_grant_until      TEXT,
+        token_grant_budget     INTEGER,
+        -- Set when the bot asked for more budget; consumed by the next turn.
+        token_consent_pending  TEXT
     );
 
     CREATE TABLE IF NOT EXISTS routines (

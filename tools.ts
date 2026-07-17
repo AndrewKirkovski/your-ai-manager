@@ -30,7 +30,8 @@ import {
     GetGoal,
     ClearGoal,
     SetReplyTokenBudget,
-    GetReplyTokenBudget
+    GetReplyTokenBudget,
+    GrantMoreTokens
 } from "./tools.user";
 import {
     WebSearch,
@@ -92,6 +93,7 @@ export const tools = {
     ClearGoal,
     SetReplyTokenBudget,
     GetReplyTokenBudget,
+    GrantMoreTokens,
     // Search tools
     WebSearch,
     SearchImages,
