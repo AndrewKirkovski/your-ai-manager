@@ -28,7 +28,9 @@ import {
 import {
     SetGoal,
     GetGoal,
-    ClearGoal
+    ClearGoal,
+    SetReplyTokenBudget,
+    GetReplyTokenBudget
 } from "./tools.user";
 import {
     WebSearch,
@@ -88,6 +90,8 @@ export const tools = {
     SetGoal,
     GetGoal,
     ClearGoal,
+    SetReplyTokenBudget,
+    GetReplyTokenBudget,
     // Search tools
     WebSearch,
     SearchImages,

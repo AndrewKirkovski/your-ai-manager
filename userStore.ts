@@ -656,6 +656,49 @@ export async function clearUserGoal(userId: number): Promise<void> {
     db.prepare('UPDATE users SET goal = \'\' WHERE user_id = ?').run(userId);
 }
 
+// ============== REPLY TOKEN BUDGET ==============
+// max_tokens bounds a turn's thinking AND its visible reply together, so a
+// budget too small for the task yields a truncated answer — or, if thinking
+// consumed all of it, no answer at all. aiService escalates automatically so
+// the turn still finishes; these let a user who regularly needs more start
+// there instead of re-paying the failed first attempt every time.
+
+/** The user's chosen reply budget, or null to use aiService's default. */
+export async function getReplyMaxTokens(userId: number): Promise<number | null> {
+    const row = db.prepare('SELECT reply_max_tokens FROM users WHERE user_id = ?')
+        .get(userId) as { reply_max_tokens: number | null } | undefined;
+    return row?.reply_max_tokens ?? null;
+}
+
+/** Persist a reply budget for this user. Pass null to fall back to the default.
+ * Also clears any pending ask — the question has been answered. */
+export async function setReplyMaxTokens(userId: number, maxTokens: number | null): Promise<void> {
+    db.prepare('UPDATE users SET reply_max_tokens = ?, pending_budget_ask = NULL WHERE user_id = ?')
+        .run(maxTokens, userId);
+}
+
+/** Record that a turn only finished by escalating to `budget`, so the next turn
+ * can ask whether to keep it. Not recorded when the user is already at or above
+ * that budget — there would be nothing to ask about. */
+export async function recordBudgetEscalation(userId: number, budget: number): Promise<void> {
+    const current = await getReplyMaxTokens(userId);
+    if (current !== null && current >= budget) return;
+    db.prepare('UPDATE users SET pending_budget_ask = ? WHERE user_id = ?').run(budget, userId);
+}
+
+/** Read and clear the pending escalation in one step (consume-once): the note it
+ * drives is injected into exactly one turn's prompt, so the bot asks once rather
+ * than nagging every turn until answered. */
+export async function takePendingBudgetAsk(userId: number): Promise<number | null> {
+    const row = db.prepare('SELECT pending_budget_ask FROM users WHERE user_id = ?')
+        .get(userId) as { pending_budget_ask: number | null } | undefined;
+    const pending = row?.pending_budget_ask ?? null;
+    if (pending !== null) {
+        db.prepare('UPDATE users SET pending_budget_ask = NULL WHERE user_id = ?').run(userId);
+    }
+    return pending;
+}
+
 // ============== IMAGE CACHE ==============
 
 export async function addImageToCache(userId: number, fileId: string, caption: string | undefined, description: string | undefined): Promise<void> {

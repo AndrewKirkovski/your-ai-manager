@@ -7,6 +7,7 @@ import type {
     ProviderMessage,
     ToolDefinition,
 } from './aiProvider';
+import { resolveThinkingConfig, floorMaxTokensForThinking, THINKING_EFFORT } from './aiProvider';
 
 export class OpenAIProvider implements AIProvider {
     readonly name = 'openai';
@@ -46,14 +47,16 @@ export class OpenAIProvider implements AIProvider {
 
         // Enable extended thinking via extra_body (Anthropic compat layer)
         if (this.isAnthropicEndpoint) {
-            const thinkingConfig = this.getThinkingConfig(request.model);
+            const thinkingConfig = resolveThinkingConfig(request.model, request.disableThinking);
             if (thinkingConfig) {
-                requestOptions.extra_body = { thinking: thinkingConfig };
-                // max_tokens must be > budget_tokens
-                const budget = (thinkingConfig as any).budget_tokens;
-                if (budget && (request.maxTokens || 1500) <= budget) {
-                    requestOptions.max_tokens = budget + 4000;
+                const extraBody: Record<string, unknown> = { thinking: thinkingConfig };
+                // Pin adaptive thinking depth explicitly rather than inheriting
+                // the API default — mirrors the native provider.
+                if (thinkingConfig.type === 'adaptive') {
+                    extraBody.output_config = { effort: THINKING_EFFORT };
                 }
+                requestOptions.extra_body = extraBody;
+                requestOptions.max_tokens = floorMaxTokensForThinking(request.maxTokens, thinkingConfig);
             }
         }
 
@@ -112,7 +115,17 @@ export class OpenAIProvider implements AIProvider {
                 }
             }
 
-            if (chunk.choices[0]?.finish_reason) {
+            const finishReason = chunk.choices[0]?.finish_reason;
+            if (finishReason) {
+                // Normalise to Anthropic's vocabulary so consumers don't care
+                // which provider they're on: OpenAI says 'length' where
+                // Anthropic says 'max_tokens'. aiService's escalation ladder
+                // keys off 'max_tokens', so without this mapping a turn that ran
+                // out of room would never escalate on this path.
+                yield {
+                    type: 'stop_reason',
+                    reason: finishReason === 'length' ? 'max_tokens' : finishReason,
+                };
                 pendingDone = true;
                 // Don't break here — let the final usage-only chunk arrive after finish_reason.
             }
@@ -175,18 +188,6 @@ export class OpenAIProvider implements AIProvider {
         }
 
         return result;
-    }
-
-    private getThinkingConfig(model: string): Record<string, unknown> | null {
-        // 4.6 models: adaptive thinking (recommended)
-        if (/4-6|4\.6/i.test(model)) {
-            return { type: 'adaptive' };
-        }
-        // Older models that support thinking: use enabled with budget
-        if (/opus|sonnet-4|claude-3[.-]7/i.test(model)) {
-            return { type: 'enabled', budget_tokens: 2000 };
-        }
-        return null;
     }
 
     private convertTool(tool: ToolDefinition): OpenAI.ChatCompletionTool {

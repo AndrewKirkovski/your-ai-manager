@@ -32,6 +32,7 @@ import {
     getTodayStats,
     getAllUserMemoryRecords,
     deleteUserMemory,
+    takePendingBudgetAsk,
 } from "./userStore";
 import {addUserTask, generateShortId, addMessageToHistory} from './userStore';
 import {AIService} from './aiService';
@@ -360,7 +361,17 @@ function formatMemoryBlock(memory: Record<string, { value: string; firstRecorded
     return '\n' + lines.join('\n');
 }
 
-async function getCurrentInfo(userId: number): Promise<string> {
+/**
+ * Builds the per-turn dynamic context block.
+ *
+ * `userFacing` must be true ONLY when the resulting reply is actually delivered
+ * to the user. It gates the consume-once budget ask: a silent background run
+ * (the collision fixer) shares this same block, and consuming the ask there
+ * would burn it on a prompt nobody ever reads — the user would never be asked.
+ * Defaults to false so a new call site loses nothing by forgetting it; the ask
+ * simply waits for the next user-facing turn.
+ */
+async function getCurrentInfo(userId: number, opts?: { userFacing?: boolean }): Promise<string> {
     const user = await getUser(userId);
     if (!user) throw new Error('Ошибка: пользователь не найден');
 
@@ -383,6 +394,15 @@ async function getCurrentInfo(userId: number): Promise<string> {
 
     const memoryRecords = await getAllUserMemoryRecords(userId);
 
+    // A previous turn only finished by spending more than the user's budget.
+    // Ask once whether to keep the higher budget — consume-once, so this shows
+    // up in exactly one turn's prompt rather than nagging until answered.
+    // Only on user-facing turns: see the note on `userFacing` above.
+    const pendingBudgetAsk = opts?.userFacing ? await takePendingBudgetAsk(userId) : null;
+    const budgetAskStr = pendingBudgetAsk
+        ? `\nIMPORTANT — ask the user about this in your reply: your previous answer did not fit in the current reply budget, and only completed after raising it to ${pendingBudgetAsk} tokens. Ask (in your own voice, briefly) whether they want you to use ${pendingBudgetAsk} tokens for replies from now on, so complex answers succeed first time instead of being retried. If they agree, call SetReplyTokenBudget with maxTokens=${pendingBudgetAsk}. If they decline, carry on as you are — you will still finish complex answers, just less efficiently.\n`
+        : '';
+
     // Goal / routine-name / task-name are AI- or user-writable free text. Strip
     // <system> before interpolation so they can't forge fake system directives.
     const Memory = `
@@ -400,7 +420,7 @@ ${replanningTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'
 Memory (stale entries may not reflect current state — treat older facts with appropriate skepticism):${formatMemoryBlock(memoryRecords)}
 
 Today's stats: ${todayStatsStr}
-        `
+${budgetAskStr}        `
 
     return Memory;
 }
@@ -414,7 +434,8 @@ async function replyToUser(
         const user = await getUser(userId);
         if (!user) return 'Ошибка: пользователь не найден';
 
-        const memory = await getCurrentInfo(userId);
+        // Reply goes to the user, so this turn may carry the budget ask.
+        const memory = await getCurrentInfo(userId, { userFacing: true });
         // Split static prefix (cacheable) from per-turn dynamic memory so Anthropic
         // prompt-caching reuses the long scaffolding across turns. The provider
         // handles concatenation for the OpenAI-compat path internally.

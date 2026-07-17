@@ -25,14 +25,31 @@ export function applyColumnMigrations(db: Database.Database): void {
             db.exec(`ALTER TABLE stat_entries ADD COLUMN model TEXT`);
         }
     }
+    // users: per-user reply budget (added 2026-07-17)
+    // Both nullable. reply_max_tokens NULL = use the built-in default.
+    // pending_budget_ask holds the budget a turn had to escalate to, until the
+    // next turn asks the user whether to keep it (consume-once).
+    {
+        const cols = db.prepare('PRAGMA table_info(users)').all() as { name: string }[];
+        if (!cols.some(c => c.name === 'reply_max_tokens')) {
+            db.exec(`ALTER TABLE users ADD COLUMN reply_max_tokens INTEGER`);
+        }
+        if (!cols.some(c => c.name === 'pending_budget_ask')) {
+            db.exec(`ALTER TABLE users ADD COLUMN pending_budget_ask INTEGER`);
+        }
+    }
 }
 
 export const SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS users (
-        user_id   INTEGER PRIMARY KEY,
-        chat_id   INTEGER,
-        goal      TEXT NOT NULL DEFAULT '',
-        timezone  TEXT
+        user_id            INTEGER PRIMARY KEY,
+        chat_id            INTEGER,
+        goal               TEXT NOT NULL DEFAULT '',
+        timezone           TEXT,
+        -- NULL = use the built-in default reply budget.
+        reply_max_tokens   INTEGER,
+        -- Budget a turn had to escalate to; consumed by the next turn's ask.
+        pending_budget_ask INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS routines (

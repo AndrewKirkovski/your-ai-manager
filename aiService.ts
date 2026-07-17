@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import {addMessageToHistory, getRecentMessageHistory, recordAITokens, bumpStickerUsedCount} from './userStore';
+import {addMessageToHistory, getRecentMessageHistory, recordAITokens, bumpStickerUsedCount, getReplyMaxTokens, recordBudgetEscalation} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
 import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers, exceedsTelegramLimit} from './telegramFormat';
@@ -41,6 +41,25 @@ export interface AIStreamOptions {
     addAssistantToHistory?: boolean;
     currentRecursionDepth?: number;
     enableToolCalls?: boolean;
+    /**
+     * Force thinking off for this run. Set by the no-silence retry in
+     * streamAIResponse after a turn came back with no text and no tool calls;
+     * hands the whole max_tokens allowance to visible text.
+     */
+    disableThinking?: boolean;
+    /**
+     * Stream into an existing Telegram message instead of sending a new one.
+     * Set by the escalation ladder so a retry EDITS the partial answer in place
+     * rather than posting a second message next to it.
+     */
+    reuseMessageId?: number;
+    /**
+     * Tells this attempt that the escalation ladder still has headroom and will
+     * re-run it at a bigger budget if it truncates — so it must not persist its
+     * half-finished text to history. Set by streamAIResponse; false on the final
+     * attempt, whose text (truncated or not) is the answer and must be kept.
+     */
+    willRetryIfTruncated?: boolean;
     appendMessagesAfterUser?: ProviderMessage[];
     /** Callback to handle images from search results (sent separately, not in history) */
     onImageResults?: (images: string[]) => Promise<void>;
@@ -74,6 +93,36 @@ export interface AIStreamResult {
     message: string;
     rawResponse: string;
     toolCalls?: ToolCallInfo[];
+    /**
+     * Set only when the turn produced nothing the user could see.
+     *  - 'aborted'   — burst-coalescer soft-cancel. Intentional; never retried,
+     *                  never backfilled (the next coalesced reply answers).
+     *  - 'no_output' — the stream ran to completion and yielded no text AND no
+     *                  tool calls. Nothing ran, so nothing can be duplicated by
+     *                  running it again — that is what makes the retry safe.
+     * Absent when the turn produced text or called a tool.
+     */
+    emptyReason?: 'aborted' | 'no_output';
+    /**
+     * stop_reason was 'max_tokens': the model hit the ceiling mid-turn. This is
+     * literally "failed to answer within the token budget" — it covers both a
+     * reply truncated mid-sentence and a turn that spent everything on thinking
+     * and said nothing. Drives the escalation ladder in streamAIResponse.
+     */
+    ranOutOfTokens?: boolean;
+    /**
+     * The provider call failed and `message` holds the user-facing error text
+     * rather than an answer. Lets the ladder tell "this retry blew up" apart
+     * from "this retry answered", so it can fall back to the attempt the retry
+     * was supposed to replace instead of discarding it.
+     */
+    errored?: boolean;
+    /**
+     * Telegram message this turn streamed into, when it sent one. A retry
+     * reuses it (`reuseMessageId`) so the fuller answer EDITS the partial one
+     * in place instead of posting a second message beside it.
+     */
+    messageId?: number;
 }
 
 /** Recursively strip <system> from all string leaves in a tool-result value.
@@ -92,16 +141,203 @@ function deepStripSystemTagsInResult(value: unknown): unknown {
     return value;
 }
 
+/**
+ * Starting output allowance when the user has no raised budget of their own.
+ * max_tokens covers thinking AND visible text together, so at the old 1500 a
+ * high-effort thinking pass could consume the whole allowance and leave nothing
+ * to say. This is a starting point, not a guess at "enough" — when a task needs
+ * more, the escalation ladder in streamAIResponse takes it up.
+ */
+const DEFAULT_MAX_TOKENS = 8000;
+
+/**
+ * Ceiling for escalation. The model's own output cap is 128k; this sits well
+ * inside it and far above any reply this bot needs, existing only so a
+ * pathological turn cannot spend without bound.
+ */
+const MAX_ESCALATED_TOKENS = 64000;
+
+/** Each escalation step multiplies the budget. Steps from 8k: 32k → 64k. */
+const ESCALATION_FACTOR = 4;
+
+/** Last-resort words when a turn produced nothing at all, so the user is never
+ * left staring at silence wondering whether the bot is alive. */
+const NO_OUTPUT_FALLBACK = 'Задумался и потерял мысль 🐺 Повтори, пожалуйста?';
+
 export class AIService {
     /**
-     * Unified function to handle AI streaming responses with tool calling support
+     * Unified function to handle AI streaming responses with tool calling support.
+     *
+     * Also guarantees the turn FINISHES, however complex the task, and never
+     * ends in silence.
+     *
+     * The failure this defends against: max_tokens caps thinking and visible
+     * text *together*, and adaptive thinking expands to fill whatever it is
+     * given — so a turn can spend its whole allowance thinking and return no
+     * text and no tool calls (production incident 2026-07-17, max_tokens=1500).
+     * No budget rules that out, so picking a bigger number is not a fix. The
+     * ladder instead reacts to what the model reports:
+     *
+     *   1. ESCALATE while the model says it ran out of room (stop_reason
+     *      'max_tokens' — covers both a truncated reply and a thinking-only
+     *      turn). Each step multiplies the budget up to MAX_ESCALATED_TOKENS,
+     *      so complexity is met with room rather than an apology. Only ever
+     *      re-runs when NO tool executed, so there are no side effects to
+     *      duplicate; a retry reuses the same Telegram message, so the fuller
+     *      answer replaces the partial one instead of posting beside it.
+     *   2. THINKING OFF, if the ceiling is reached and there is still nothing.
+     *      The whole allowance then goes to visible text, so this cannot come
+     *      back thinking-only at any budget.
+     *   3. SPEAK ANYWAY, if the user still received nothing. Keyed off delivery
+     *      rather than any specific failure mode, so it also covers refusals and
+     *      empty replies we haven't seen yet.
+     *
+     * A turn that had to escalate is recorded (recordBudgetEscalation) so the
+     * next turn asks the user whether to keep the higher budget — see
+     * getCurrentInfo in index.ts and the SetReplyTokenBudget tool.
      */
     static async streamAIResponse(options: AIStreamOptions): Promise<AIStreamResult> {
-        return this.streamAIResponseInternal({
-            ...options,
+        const withDefaults = (opts: AIStreamOptions): AIStreamOptions => ({
+            ...opts,
             // Tools are always enabled by default (unless recursion limit reached)
-            enableToolCalls: (options.currentRecursionDepth ?? 0) >= 5 ? false : (options.enableToolCalls ?? true),
+            enableToolCalls: (opts.currentRecursionDepth ?? 0) >= 5 ? false : (opts.enableToolCalls ?? true),
         });
+
+        // Track confirmed delivery across the whole turn, including the tool-call
+        // recursion — onTextDelivered fires per level, and a tool-first reply's
+        // only visible text may come from depth 1+.
+        let delivered = false;
+        const observed = withDefaults({
+            ...options,
+            onTextDelivered: () => {
+                delivered = true;
+                options.onTextDelivered?.();
+            },
+        });
+
+        const isTopLevel = (options.currentRecursionDepth ?? 0) === 0;
+        // An explicit maxTokens from a caller (collision fixer, style scan) is a
+        // deliberate cap, but it is a starting point like any other — the ladder
+        // may still raise it rather than let that caller's task go unfinished.
+        const startBudget = options.maxTokens
+            ?? (isTopLevel ? await getReplyMaxTokens(options.userId) : undefined)
+            ?? DEFAULT_MAX_TOKENS;
+
+        let budget = startBudget;
+        // While headroom remains, a truncated attempt is provisional — tell it
+        // not to persist text the next attempt will replace.
+        let result = await this.streamAIResponseInternal({
+            ...observed,
+            maxTokens: budget,
+            willRetryIfTruncated: budget < MAX_ESCALATED_TOKENS,
+        });
+
+        /** Options shared by every attempt AFTER the first. The user row is
+         * already written by attempt 1 and re-writing it would duplicate the
+         * prompt in history (the /goal and greeting paths pass
+         * addUserToHistory: true) — the tool-call recursion guards the same way. */
+        const retryBase = { ...observed, addUserToHistory: false };
+
+        // Escalate while the model reports it ran out of room. Gated on no tool
+        // having run: that is what makes re-running free of duplicate side
+        // effects (addUserTask has no dedup). When a tool DID run, the tool-call
+        // recursion continues the work and each level gets its own fresh budget.
+        while (result.ranOutOfTokens && !result.toolCalls?.length && budget < MAX_ESCALATED_TOKENS) {
+            const raised = Math.min(budget * ESCALATION_FACTOR, MAX_ESCALATED_TOKENS);
+            console.warn(`📈 ${options.userId}: ${budget} tokens was not enough — escalating to ${raised}`);
+            budget = raised;
+            const superseded = result;
+            result = await this.streamAIResponseInternal({
+                ...retryBase,
+                maxTokens: budget,
+                reuseMessageId: result.messageId,
+                willRetryIfTruncated: budget < MAX_ESCALATED_TOKENS,
+            });
+            // The retry errored out, so the attempt it was meant to replace is
+            // the best answer we have — but it deliberately skipped its own
+            // history write on the promise of being replaced. Commit it now, or
+            // the turn leaves no assistant row at all and the next turn's
+            // context sees a user message that was never answered.
+            if (result.errored && superseded.message) {
+                result = await this.commitSupersededAttempt(options, superseded, result);
+                break;
+            }
+        }
+
+        // Ceiling reached and still nothing to show: hand the entire allowance
+        // to visible text. This is by definition the final attempt, so it must
+        // NOT inherit a stale willRetryIfTruncated (in recursion it would
+        // otherwise arrive as true and make this attempt discard its own text).
+        const budgetFixedIt = budget > startBudget && !result.emptyReason;
+        if (result.emptyReason === 'no_output') {
+            console.warn(`🔁 ${options.userId}: still no output at ${budget} — retrying with thinking off`);
+            result = await this.streamAIResponseInternal({
+                ...retryBase,
+                maxTokens: budget,
+                disableThinking: true,
+                reuseMessageId: result.messageId,
+                willRetryIfTruncated: false,
+            });
+        }
+
+        // Ask about the higher budget only when the higher budget is what
+        // actually finished the turn. If the thinking-off retry is what produced
+        // the answer, more tokens would NOT have helped, and asking the user to
+        // adopt this budget for every future reply would be wrong advice.
+        // Silent runs are excluded: nobody saw "your previous answer".
+        if (isTopLevel && budgetFixedIt && !result.emptyReason
+            && (options.shouldUpdateTelegram ?? true)) {
+            await recordBudgetEscalation(options.userId, budget)
+                .catch(err => console.warn('[budget] recordBudgetEscalation failed:', err instanceof Error ? err.message : err));
+        }
+
+        // Backstop. Keyed on "the user received nothing", NOT on any particular
+        // failure mode — that is what makes it total. It therefore also covers
+        // the case the emptyReason checks miss: the model calls a tool with no
+        // preamble and the recursive turn then yields no text, so tools ran (no
+        // 'no_output' anywhere) yet nothing ever reached the user.
+        //
+        // Excluded: aborts (deliberate silence — the next coalesced reply
+        // answers), silent background runs (no user to speak to), and any turn
+        // that already has a message to show — notably the error path, which
+        // sent its own 🐺 text and would otherwise get a second message.
+        // Only the top level may speak for the turn.
+        if (isTopLevel && !delivered && !result.message
+            && result.emptyReason !== 'aborted'
+            && (options.shouldUpdateTelegram ?? true)) {
+            console.error(`🚨 ${options.userId}: turn delivered nothing to the user — sending fallback`);
+            await safeSend(options.bot, options.userId, NO_OUTPUT_FALLBACK);
+            return { ...result, message: NO_OUTPUT_FALLBACK, rawResponse: NO_OUTPUT_FALLBACK };
+        }
+
+        return result;
+    }
+
+    /**
+     * Rescue an attempt whose replacement errored out.
+     *
+     * A superseded attempt skips its own history write because a retry was
+     * expected to replace it. When that retry instead fails, this persists the
+     * superseded text so the turn still leaves an assistant row, and returns it
+     * as the turn's answer — the user has already seen it streamed, and it beats
+     * showing only an error with no record of the reply.
+     */
+    private static async commitSupersededAttempt(
+        options: AIStreamOptions,
+        superseded: AIStreamResult,
+        errorResult: AIStreamResult,
+    ): Promise<AIStreamResult> {
+        console.warn(`↩️ ${options.userId}: escalated retry failed — keeping the partial answer from the previous attempt`);
+        if (options.addAssistantToHistory ?? true) {
+            const safeContent = stripSystemTags(superseded.message);
+            if (safeContent) {
+                await addMessageToHistory(options.userId, 'assistant', safeContent)
+                    .catch(err => console.warn('[budget] committing superseded attempt failed:', err instanceof Error ? err.message : err));
+            }
+        }
+        // Keep errored so callers still know the turn degraded, but carry the
+        // real text: the backstop must not treat this as "nothing delivered".
+        return { ...superseded, errored: errorResult.errored };
     }
 
     /**
@@ -116,7 +352,7 @@ export class AIService {
             bot,
             provider,
             model,
-            maxTokens = 1500,
+            maxTokens = DEFAULT_MAX_TOKENS,
             shouldUpdateTelegram = true,
             addUserToHistory = true,
             addAssistantToHistory = true,
@@ -134,7 +370,9 @@ export class AIService {
         let usageOutputTokens = 0;
 
         try {
-            let messageId: number | undefined;
+            // Seeded on a ladder retry so the fuller answer edits the partial
+            // one in place — from the user's side it just looks like streaming.
+            let messageId: number | undefined = options.reuseMessageId;
             let lastSentContent: string = '';
             // Guard against retrying the initial send on every throttled tick after
             // a transient Telegram failure (would surface duplicate messages if a
@@ -255,7 +493,12 @@ export class AIService {
                     }))
                 : undefined;
 
-            console.debug('💬 AI request via', provider.name, { model, maxTokens, toolCount: toolDefs?.length ?? 0 });
+            console.debug('💬 AI request via', provider.name, {
+                model,
+                maxTokens,
+                toolCount: toolDefs?.length ?? 0,
+                ...(options.disableThinking ? { thinking: 'off (no-silence retry)' } : {}),
+            });
 
             // Stream from provider. options.signal is forwarded so the burst-
             // coalescer can abort an in-flight reply that hasn't yet shown
@@ -268,12 +511,14 @@ export class AIService {
                 maxTokens,
                 model,
                 signal: options.signal,
+                disableThinking: options.disableThinking,
             });
 
             let aiResponseAccumulated = '';
             let historyResponseAccumulated = '';
             const toolCalls: ToolCallInfo[] = [];
             let thinkingBlocks: ThinkingBlockData[] | undefined;
+            let stopReason: string | undefined;
             // usageInputTokens/usageOutputTokens are declared at function scope
             // above (so the catch block can read them on abort).
 
@@ -301,6 +546,10 @@ export class AIService {
                     switch (chunk.type) {
                         case 'text':
                             aiResponseAccumulated += chunk.content;
+                            break;
+
+                        case 'stop_reason':
+                            stopReason = chunk.reason;
                             break;
 
                         case 'tool_call_start': {
@@ -361,7 +610,11 @@ export class AIService {
                     recordAITokens(userId, usageInputTokens, usageOutputTokens, options.purpose ?? 'reply', model)
                         .catch(err => console.warn('[token-stat] partial recordAITokens (silent abort) failed:', err instanceof Error ? err.message : err));
                 }
-                return { message: '', rawResponse: '' };
+                // This is the USUAL abort path (the catch block is the rare
+                // one), so it carries the same 'aborted' marker: the ladder must
+                // never retry a deliberate cancel, and an aborted turn must not
+                // record a budget ask.
+                return { message: '', rawResponse: '', emptyReason: 'aborted' };
             }
 
             // Record AI token usage. recordAITokens double-writes: per-user AND user_id=0 (global).
@@ -394,9 +647,23 @@ export class AIService {
 
             historyResponseAccumulated = aiResponseAccumulated;
 
+            // This attempt ran out of room and the ladder still has headroom, so
+            // it is about to be re-run at a bigger budget and everything below
+            // is provisional. Skip the final tick: it is the only place that
+            // splits an over-long reply into EXTRA messages, and those extras
+            // cannot be taken back — a retry only edits the first message, so
+            // the overflow from a superseded attempt would linger under the real
+            // answer as stale, half-finished text. Mid-stream edits already put
+            // the partial in the first message; the retry overwrites it there.
+            const willBeSuperseded = options.willRetryIfTruncated === true
+                && stopReason === 'max_tokens'
+                && toolCalls.length === 0;
+
             // Final display tick: mdToTelegramHtml via safeEdit strips <system>/<thinking>/legacy
             // tags through sanitize-html's nonTextTags. No separate cleanup needed.
-            await updateTelegramMessage(true);
+            if (!willBeSuperseded) {
+                await updateTelegramMessage(true);
+            }
 
             if (toolCalls.length > 0 && enableToolCalls) {
 
@@ -531,7 +798,9 @@ export class AIService {
                             console.log(`📝 Added partial (abort) assistant row to history (${safeAssistantContent.length} chars)`);
                         }
                     }
-                    return { message: '', rawResponse: '' };
+                    // Aborted, not empty — tools already ran here, so this must
+                    // never be re-run (addUserTask has no dedup).
+                    return { message: '', rawResponse: '', emptyReason: 'aborted' };
                 }
 
                 console.log(`🔄 Continuing with ${newAppendedMessages.length} tool result(s), depth: ${currentRecursionDepth + 1}`);
@@ -540,7 +809,16 @@ export class AIService {
                     ...options,
                     currentRecursionDepth: currentRecursionDepth + 1,
                     appendMessagesAfterUser: newAppendedMessages,
-                    addUserToHistory: false // Don't add recursive calls to history
+                    addUserToHistory: false, // Don't add recursive calls to history
+                    // Per-attempt flags belong to THIS level only and must not
+                    // leak downward: reuseMessageId would make the child edit
+                    // our message instead of sending its own, disableThinking
+                    // would silently disable thinking for the rest of the chain,
+                    // and a stale willRetryIfTruncated would make the child
+                    // discard text nobody is going to replace.
+                    reuseMessageId: undefined,
+                    disableThinking: undefined,
+                    willRetryIfTruncated: undefined,
                 });
 
                 historyResponseAccumulated = historyResponseAccumulated + recursiveResult.rawResponse;
@@ -556,7 +834,13 @@ export class AIService {
             // empty without ever reaching this line). Skip writing if the
             // content is empty — happens when the model emits only thinking
             // blocks then silently completes (no text, no tools, no recursion).
-            if (addAssistantToHistory) {
+            // Same reason the final display tick was skipped above: this
+            // attempt is about to be replaced, so persisting its half-finished
+            // text would leave a stale row next to the complete answer — and
+            // feed the truncated version back as context on later turns. (The
+            // thinking-only case needs no guard: empty content is never
+            // written.)
+            if (addAssistantToHistory && !willBeSuperseded) {
                 const safeAssistantContent = stripSystemTags(historyResponseAccumulated);
                 if (safeAssistantContent) {
                     await addMessageToHistory(userId, 'assistant', safeAssistantContent);
@@ -566,17 +850,24 @@ export class AIService {
                     console.log(`📝 Added assistant message to history: "${preview.replace(/\n/g, ' ')}"`);
                 } else {
                     // Thinking-only completion — model emitted thinking blocks
-                    // but no text, no tool calls, no recursion. User sees
-                    // nothing in Telegram and history has no record. Surface
-                    // it so we can spot the pattern in production logs.
-                    console.warn(`⚠️ AI emitted thinking-only response for ${userId} — no visible output, no history row written`);
+                    // but no text, no tool calls, no recursion. Nothing to
+                    // persist; streamAIResponse retries this with thinking off.
+                    console.warn(`⚠️ AI emitted thinking-only response for ${userId} — no visible output, no history row written`, { stopReason });
                 }
             }
+
+            // No text and no tool calls means the turn accomplished nothing —
+            // and, because no tool ran, that it can be re-run with no risk of
+            // duplicating side effects. streamAIResponse keys its retry off this.
+            const producedNothing = !aiResponseAccumulated.length && toolCalls.length === 0;
 
             return {
                 message: aiResponseAccumulated,
                 rawResponse: aiResponseAccumulated,
                 toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+                ...(producedNothing ? { emptyReason: 'no_output' as const } : {}),
+                ...(stopReason === 'max_tokens' ? { ranOutOfTokens: true } : {}),
+                ...(messageId !== undefined ? { messageId } : {}),
             };
 
         } catch (error) {
@@ -605,7 +896,11 @@ export class AIService {
                     recordAITokens(userId, usageInputTokens, usageOutputTokens, options.purpose ?? 'reply', model)
                         .catch(err => console.warn('[token-stat] partial recordAITokens (abort) failed:', err instanceof Error ? err.message : err));
                 }
-                return { message: '', rawResponse: '' };
+                // 'aborted', NOT 'no_output': this silence is deliberate. The
+                // coalescer cancelled to let a newer message win, and the retry
+                // would fight it (and the fallback would talk over the reply
+                // that replaces this one).
+                return { message: '', rawResponse: '', emptyReason: 'aborted' };
             }
 
             console.error('❌ Error generating AI response:', {
@@ -633,7 +928,8 @@ ${error instanceof Error ? error.message : String(error)}
 
             return {
                 message: errorMessage,
-                rawResponse: errorMessage
+                rawResponse: errorMessage,
+                errored: true,
             };
         }
     }

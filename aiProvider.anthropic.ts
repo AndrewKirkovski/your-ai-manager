@@ -8,6 +8,7 @@ import type {
     ToolDefinition,
     ThinkingBlockData,
 } from './aiProvider';
+import { resolveThinkingConfig, floorMaxTokensForThinking, THINKING_EFFORT } from './aiProvider';
 
 export class AnthropicProvider implements AIProvider {
     readonly name = 'anthropic';
@@ -21,16 +22,8 @@ export class AnthropicProvider implements AIProvider {
         const messages = this.convertMessages(request.messages);
         const tools = request.tools?.map(t => this.convertTool(t));
 
-        const thinkingConfig = /4-6|4\.6/i.test(request.model)
-            ? { type: 'adaptive' as const }
-            : /opus|sonnet-4|claude-3[.-]7/i.test(request.model)
-                ? { type: 'enabled' as const, budget_tokens: 2000 }
-                : null;
-        let maxTokens = request.maxTokens;
-        const budget = thinkingConfig && 'budget_tokens' in thinkingConfig ? thinkingConfig.budget_tokens : 0;
-        if (budget && maxTokens <= budget) {
-            maxTokens = budget + 4000;
-        }
+        const thinkingConfig = resolveThinkingConfig(request.model, request.disableThinking);
+        const maxTokens = floorMaxTokensForThinking(request.maxTokens, thinkingConfig);
         // Build the system param. When `systemPromptCachePrefix` is provided we
         // emit it as a separate text block with cache_control={type:'ephemeral'}
         // so Anthropic prompt-caching applies to the static scaffolding. The
@@ -50,6 +43,10 @@ export class AnthropicProvider implements AIProvider {
             system: systemParam,
             messages,
             ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
+            // Effort drives adaptive thinking depth; the API defaults it to
+            // 'high' but say so explicitly so the depth is visible at the call
+            // site rather than inherited.
+            ...(thinkingConfig?.type === 'adaptive' ? { output_config: { effort: THINKING_EFFORT } } : {}),
             stream: true as const,
         };
 
@@ -162,6 +159,10 @@ export class AnthropicProvider implements AIProvider {
                     // Emit accumulated thinking blocks before done (needed for recursive tool calls)
                     if (thinkingBlocks.length > 0) {
                         yield { type: 'thinking_blocks', blocks: thinkingBlocks };
+                    }
+                    const stop = (event as Anthropic.MessageDeltaEvent).delta?.stop_reason;
+                    if (stop) {
+                        yield { type: 'stop_reason', reason: stop };
                     }
                     // Emit usage with the final output_token count from message_delta
                     const u = (event as Anthropic.MessageDeltaEvent).usage;
