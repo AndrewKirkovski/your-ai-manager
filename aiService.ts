@@ -154,6 +154,111 @@ function hasVisibleText(raw: string): boolean {
     return !!stripInternalMarkers(raw).trim();
 }
 
+// ── Provider-failure resilience ────────────────────────────────────────────
+// The goal: a user only ever sees an error for something genuinely
+// unrecoverable (auth/token misconfig, or the network staying down through
+// every retry). Everything transient — a 429, an Anthropic 529 overloaded, a
+// 5xx, a dropped socket before we've shown anything — must SELF-HEAL by retry,
+// invisibly. And when we do surface something, it's a friendly in-character
+// line, never a raw stack/JSON dumped into the chat.
+
+/** How many times the stream is (re)attempted before we give up and surface a
+ * message. Each attempt already benefits from the SDK's own connect-time
+ * retries (Retry-After aware), so this is the outer safety net covering
+ * SDK-exhaustion and errors thrown after the SSE stream had begun. */
+const MAX_STREAM_ATTEMPTS = 3;
+
+/** User-facing lines for the three terminal failure classes. Deliberately
+ * vague and in-character: the technical detail lives in the server log, never
+ * in the user's chat. */
+const AI_ERROR_TRANSIENT = 'Связь с ИИ сейчас нестабильна 🐺 Подожди минутку и повтори, пожалуйста.';
+const AI_ERROR_AUTH = 'У меня сейчас проблема с доступом к ИИ 🐺 Это сбой на моей стороне — уже вижу его.';
+const AI_ERROR_INTERNAL = 'Что-то заглючило у меня в голове 🐺 Попробуй переспросить.';
+
+type ProviderErrorKind = 'transient' | 'auth' | 'malformed' | 'unknown';
+
+/** Short message for logging, without dragging a whole stack into one line. */
+function errMsg(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+}
+
+/** An intentional cancel (burst-coalescer soft-abort, SIGTERM) — must never be
+ * retried or reclassified as a provider failure. Matches by name/constructor
+ * and message because the SDKs' abort errors don't set a consistent `.name`. */
+function isAbortLikeError(err: unknown): boolean {
+    if (!(err instanceof Error)) return false;
+    return err.name === 'AbortError'
+        || err.constructor?.name === 'APIUserAbortError'
+        || /aborted|cancel/i.test(err.message);
+}
+
+/** Classify a provider failure so we know whether to retry it and, if it
+ * survives all retries, which friendly line to show.
+ *  - transient: retry it (429 / 5xx / 529 overloaded / dropped connection)
+ *  - auth:      unrecoverable, tell the user it's on our side (bad/absent key,
+ *               revoked access, exhausted credit) — no retry, it won't change
+ *  - malformed: we built a bad request (400/404/422) — a bug to fix, not retry
+ *  - unknown:   anything unrecognised — treat conservatively (no retry) */
+function classifyProviderError(err: unknown): ProviderErrorKind {
+    const anyErr = err as { status?: number; code?: string; name?: string; constructor?: { name?: string } };
+    const status = typeof anyErr?.status === 'number' ? anyErr.status : undefined;
+    const code = typeof anyErr?.code === 'string' ? anyErr.code : undefined;
+    const ctor = anyErr?.constructor?.name ?? anyErr?.name;
+    const msg = errMsg(err).toLowerCase();
+
+    // Auth / billing: fixed by a human, never by retrying. Anthropic returns a
+    // low-credit balance as a 400, so match it by message, not just status.
+    if (status === 401 || status === 403
+        || /invalid[\s_-]?api[\s_-]?key|authentication|x-api-key|permission denied|credit balance/.test(msg)) {
+        return 'auth';
+    }
+
+    // Transient: worth another attempt.
+    if (status === 408 || status === 409 || status === 429
+        || (status !== undefined && status >= 500)
+        || /overloaded|rate.?limit|too many requests|service unavailable|internal server error|timeout|timed out|econnreset|etimedout|econnrefused|eai_again|enotfound|socket hang up|fetch failed|network|terminated|connection error/.test(msg)
+        || ctor === 'APIConnectionError' || ctor === 'APIConnectionTimeoutError'
+        || (code !== undefined && ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE'].includes(code))) {
+        return 'transient';
+    }
+
+    // A request the model/API rejected as malformed — our bug to prevent, not
+    // to retry (retrying re-sends the same bad request).
+    if (status === 400 || status === 404 || status === 422) return 'malformed';
+
+    return 'unknown';
+}
+
+/** Backoff before the next attempt: exponential + jitter, but never below a
+ * provider-supplied Retry-After. Capped so a chat reply can't stall for long. */
+function retryDelayMs(attempt: number, err: unknown): number {
+    const backoff = Math.min(8000, 400 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 300);
+    const headers = (err as { headers?: unknown })?.headers;
+    let retryAfterSec: number | undefined;
+    if (headers && typeof (headers as { get?: unknown }).get === 'function') {
+        const v = (headers as { get: (k: string) => string | null }).get('retry-after');
+        if (v != null) retryAfterSec = Number(v);
+    } else if (headers && typeof headers === 'object') {
+        const v = (headers as Record<string, unknown>)['retry-after'];
+        if (v != null) retryAfterSec = Number(v);
+    }
+    if (retryAfterSec !== undefined && Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+        return Math.max(backoff, Math.min(retryAfterSec * 1000, 15000));
+    }
+    return backoff;
+}
+
+/** setTimeout that rejects promptly if the burst-coalescer aborts mid-wait, so
+ * a soft-cancel during backoff unwinds instead of sleeping out the full delay. */
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+        const onAbort = () => { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')); };
+        const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
+}
+
 export class AIService {
     /**
      * Unified function to handle AI streaming responses with tool calling support.
@@ -483,20 +588,6 @@ export class AIService {
                 ...(options.disableThinking ? { thinking: 'off (no-silence retry)' } : {}),
             });
 
-            // Stream from provider. options.signal is forwarded so the burst-
-            // coalescer can abort an in-flight reply that hasn't yet shown
-            // visible text.
-            const stream = provider.streamChat({
-                systemPrompt,
-                systemPromptCachePrefix,
-                messages,
-                tools: toolDefs,
-                maxTokens,
-                model,
-                signal: options.signal,
-                disableThinking: options.disableThinking,
-            });
-
             let aiResponseAccumulated = '';
             let historyResponseAccumulated = '';
             const toolCalls: ToolCallInfo[] = [];
@@ -521,57 +612,109 @@ export class AIService {
                 }
             }, 500) : undefined;
 
+            // Consume the stream with transparent retry. A transient provider
+            // failure (429, 5xx, 529 overloaded, a dropped socket) that happens
+            // BEFORE any visible text reached the user is retried with backoff,
+            // so the user never sees it — the reply just self-heals. We only
+            // retry while `messageId === undefined`: once a chunk has been sent
+            // to Telegram, a retry would duplicate or clobber it, so from that
+            // point a failure falls through to the outer catch instead. Aborts,
+            // auth errors, and malformed-request bugs are never retried.
+            //
             // try/finally guarantees clearInterval on stream throw — without it
             // a mid-stream provider error (429, reset) leaks the 500ms timer for
             // the life of the process, each tick firing another safeEdit call.
             try {
-                for await (const chunk of stream) {
-                    switch (chunk.type) {
-                        case 'text':
-                            aiResponseAccumulated += chunk.content;
-                            break;
+                for (let attempt = 1; ; attempt++) {
+                    try {
+                        // Fresh generator per attempt — options.signal is forwarded
+                        // so the burst-coalescer can abort an in-flight reply that
+                        // hasn't yet shown visible text.
+                        const stream = provider.streamChat({
+                            systemPrompt,
+                            systemPromptCachePrefix,
+                            messages,
+                            tools: toolDefs,
+                            maxTokens,
+                            model,
+                            signal: options.signal,
+                            disableThinking: options.disableThinking,
+                        });
 
-                        case 'stop_reason':
-                            stopReason = chunk.reason;
-                            break;
+                        for await (const chunk of stream) {
+                            switch (chunk.type) {
+                                case 'text':
+                                    aiResponseAccumulated += chunk.content;
+                                    break;
 
-                        case 'tool_call_start': {
-                            if (!toolCalls[chunk.index]) {
-                                toolCalls[chunk.index] = {
-                                    id: chunk.id,
-                                    name: chunk.name,
-                                    arguments: '',
-                                };
-                            } else {
-                                // Append name if streamed in parts
-                                toolCalls[chunk.index].name += chunk.name;
+                                case 'stop_reason':
+                                    stopReason = chunk.reason;
+                                    break;
+
+                                case 'tool_call_start': {
+                                    if (!toolCalls[chunk.index]) {
+                                        toolCalls[chunk.index] = {
+                                            id: chunk.id,
+                                            name: chunk.name,
+                                            arguments: '',
+                                        };
+                                    } else {
+                                        // Append name if streamed in parts
+                                        toolCalls[chunk.index].name += chunk.name;
+                                    }
+                                    break;
+                                }
+
+                                case 'tool_call_args': {
+                                    if (toolCalls[chunk.index]) {
+                                        toolCalls[chunk.index].arguments += chunk.args;
+                                    }
+                                    break;
+                                }
+
+                                case 'thinking':
+                                    console.debug(`💭 [thinking] ${chunk.content.substring(0, 200)}`);
+                                    break;
+
+                                case 'thinking_blocks':
+                                    // Captured thinking blocks (with signatures) for multi-turn continuity
+                                    thinkingBlocks = chunk.blocks;
+                                    break;
+
+                                case 'usage':
+                                    usageInputTokens = chunk.input_tokens;
+                                    usageOutputTokens = chunk.output_tokens;
+                                    break;
+
+                                case 'done':
+                                    break;
                             }
-                            break;
                         }
+                        break; // stream consumed cleanly — leave the retry loop
+                    } catch (streamErr) {
+                        // A deliberate cancel is not a provider failure: hand it
+                        // straight to the outer catch's abort branch.
+                        if (options.signal?.aborted || isAbortLikeError(streamErr)) throw streamErr;
 
-                        case 'tool_call_args': {
-                            if (toolCalls[chunk.index]) {
-                                toolCalls[chunk.index].arguments += chunk.args;
-                            }
-                            break;
-                        }
+                        const kind = classifyProviderError(streamErr);
+                        const canRetry = kind === 'transient'
+                            && messageId === undefined      // nothing shown to the user yet
+                            && attempt < MAX_STREAM_ATTEMPTS;
+                        if (!canRetry) throw streamErr;     // outer catch surfaces a friendly line
 
-                        case 'thinking':
-                            console.debug(`💭 [thinking] ${chunk.content.substring(0, 200)}`);
-                            break;
+                        // Discard the failed attempt's partial state BEFORE the
+                        // backoff so the 500ms interval can't flush a half-baked
+                        // reply (which would set messageId and block the retry).
+                        aiResponseAccumulated = '';
+                        toolCalls.length = 0;
+                        thinkingBlocks = undefined;
+                        stopReason = undefined;
+                        usageInputTokens = 0;
+                        usageOutputTokens = 0;
 
-                        case 'thinking_blocks':
-                            // Captured thinking blocks (with signatures) for multi-turn continuity
-                            thinkingBlocks = chunk.blocks;
-                            break;
-
-                        case 'usage':
-                            usageInputTokens = chunk.input_tokens;
-                            usageOutputTokens = chunk.output_tokens;
-                            break;
-
-                        case 'done':
-                            break;
+                        const delay = retryDelayMs(attempt, streamErr);
+                        console.warn(`⟳ [${userId}] provider ${kind} error (attempt ${attempt}/${MAX_STREAM_ATTEMPTS}) — retrying in ${delay}ms: ${errMsg(streamErr)}`);
+                        await sleepWithAbort(delay, options.signal);
                     }
                 }
             } finally {
@@ -873,9 +1016,14 @@ export class AIService {
                 return { message: '', rawResponse: '', emptyReason: 'aborted' };
             }
 
+            // Classify so the user sees a friendly, in-character line matched to
+            // the failure — never the raw error. The full technical detail stays
+            // in the server log below; the chat gets one of three vague lines.
+            const kind = classifyProviderError(error);
             console.error('❌ Error generating AI response:', {
                 userId,
                 userMessage: userMessage.substring(0, 50) + '...',
+                kind,
                 error: error instanceof Error ? error.message : String(error),
                 timestamp: new Date().toISOString()
             }, error);
@@ -888,19 +1036,31 @@ export class AIService {
                 throw error;
             }
 
-            const errorMessage = `
-Ой 🐺
-\`\`\`
-${error instanceof Error ? error.message : String(error)}
-\`\`\`
-            `;
-            await safeSend(bot, userId, errorMessage);
+            // 'transient' here means the retry loop already exhausted its
+            // attempts (or the failure landed after we'd shown text and couldn't
+            // retry) — the network/provider stayed unhealthy, which is a
+            // legitimate thing to tell the user about. 'auth' is the critical
+            // token/credit case. 'malformed'/'unknown' are our own bugs: show a
+            // neutral line, and the loud log above is what actually gets acted on.
+            const userText = kind === 'auth' ? AI_ERROR_AUTH
+                : kind === 'transient' ? AI_ERROR_TRANSIENT
+                : AI_ERROR_INTERNAL;
+            await safeSend(bot, userId, userText);
+            // Signal confirmed delivery UP the recursion. A tool-first turn
+            // whose depth-0 text is empty returns that empty string as its
+            // `message`, so without this the top-level never-silent floor would
+            // see "nothing delivered" and stack NO_OUTPUT_FALLBACK on top of the
+            // friendly line the user just got here. onTextDelivered flips the
+            // top-level `delivered` flag (it chains through every recursion
+            // level), which is exactly the "user saw text" signal that floor checks.
+            try { options.onTextDelivered?.(); } catch { /* listener bug shouldn't matter here */ }
 
-            // message is set (the 🐺 error the user just saw), so the top-level
-            // never-silent fallback correctly treats the turn as "delivered".
+            // message is set (the friendly line the user just saw), so the
+            // top-level never-silent fallback correctly treats the turn as
+            // "delivered" and doesn't stack a second message on top.
             return {
-                message: errorMessage,
-                rawResponse: errorMessage,
+                message: userText,
+                rawResponse: userText,
             };
         }
     }
