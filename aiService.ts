@@ -31,6 +31,18 @@ export interface AIStreamOptions {
      */
     shouldUpdateTelegram?: boolean;
     /**
+     * The turn was initiated by the BOT (a scheduled task reminder, a proactive
+     * ping), not by fresh user input — so nobody is sitting there waiting for a
+     * reply. The AI's real text is still streamed and sent if it produces any;
+     * but a turn that ends up with NO visible output is a valid outcome here (it
+     * rescheduled quietly, decided this tick needs no message, or the provider
+     * failed), so the "never-silent" machinery is suppressed: no NO_OUTPUT
+     * fallback ("повтори, пожалуйста" to a user who never spoke), no consent
+     * ask, and no 🐺 error line on provider failure. The tick simply produces
+     * nothing and retries next cycle. Default false = a real user is waiting.
+     */
+    proactive?: boolean;
+    /**
      * When set, ONLY these tools are offered to the model AND enforced at
      * execution time (a call to anything else returns an error tool_result
      * without executing). Use for background runs that must not reach the
@@ -325,6 +337,14 @@ export class AIService {
 
         // Aborts are deliberate silence — the next coalesced reply answers.
         if (result.emptyReason === 'aborted') return result;
+
+        // Proactive (bot-initiated) turns have nobody waiting: real text was
+        // already streamed if there was any, and an empty turn is a valid
+        // "nothing to say this tick". Suppress every synthetic floor below — the
+        // consent ask, the thinking-off re-run, and the NO_OUTPUT fallback —
+        // because "Задумался и потерял мысль, повтори" fired at a user who never
+        // spoke is self-inflicted noise, not a safety net.
+        if (options.proactive) return result;
 
         // "Did the user actually SEE text this turn?" — the only reliable signal
         // across recursion. `delivered` flips on any confirmed send at any depth
@@ -1034,6 +1054,15 @@ export class AIService {
             // callers would mark work done (anti-flap) on a 429.
             if (!shouldUpdateTelegram) {
                 throw error;
+            }
+
+            // Proactive turns (scheduled reminders) fail QUIETLY: firing "связь
+            // нестабильна" at a user who didn't ask anything is the same kind of
+            // self-inflicted noise as the empty-turn fallback. The task stays
+            // pending / needs_replanning and the next tick retries — the user
+            // just doesn't get a spurious error out of nowhere.
+            if (options.proactive) {
+                return { message: '', rawResponse: '' };
             }
 
             // 'transient' here means the retry loop already exhausted its

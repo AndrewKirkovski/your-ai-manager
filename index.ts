@@ -699,6 +699,12 @@ cron.schedule('* * * * *', async () => {
                             model: OPEN_AI_MODEL,
                             addUserToHistory: false,
                             addAssistantToHistory: true,
+                            // Bot-initiated: the user isn't waiting on this tick.
+                            // If the AI reschedules quietly or has nothing to add,
+                            // that's valid — no "повтори, пожалуйста" fallback, no
+                            // consent ask, no 🐺 error line. It just stays silent
+                            // and retries next tick.
+                            proactive: true,
                             // No-action heads-ups declare "DO NOT USE ANY TOOLS" —
                             // enforce it instead of only prompting it (the task is
                             // already auto-completed; a stray UpdateTask(ping_at)
