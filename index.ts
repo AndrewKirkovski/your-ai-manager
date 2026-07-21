@@ -234,7 +234,23 @@ function serialTextHandler(handler: TextHandler): (msg: TelegramBot.Message, mat
         if (!userId) return;
         if (!isAllowedUser(userId)) return;
         // Fire-and-forget; node-telegram-bot-api doesn't await handler returns.
-        void enqueuePerUser(userId, () => handler(msg, match));
+        void enqueuePerUser(userId, async () => {
+            // Bootstrap a profile for a brand-new user whose FIRST interaction is
+            // a command: bot.on('message') skips '/'-prefixed text, so without this
+            // /tasks, /memory, etc. would hit "пользователь не найден".
+            try {
+                if (!(await getUser(userId))) {
+                    await setUser({
+                        userId, chatId: msg.chat.id,
+                        preferences: { goal: '' },
+                        tasks: [], routines: [], memory: {}, messageHistory: [],
+                    });
+                }
+            } catch (e) {
+                console.warn('[serialTextHandler] profile bootstrap failed:', e instanceof Error ? e.message : e);
+            }
+            await handler(msg, match);
+        });
     };
 }
 
@@ -375,12 +391,20 @@ async function getCurrentInfo(userId: number, opts?: { userFacing?: boolean }): 
     const user = await getUser(userId);
     if (!user) throw new Error('Ошибка: пользователь не найден');
 
-    const routines = await getAllRoutines(userId);
-    const activeRoutines = routines.filter(r => r.isActive);
+    // Each read is guarded so one failing subsystem (a locked table, a bad row)
+    // degrades to an empty section instead of throwing out of getCurrentInfo and
+    // killing the whole reply — the caller can't always deliver a fallback.
+    let activeRoutines: Awaited<ReturnType<typeof getAllRoutines>> = [];
+    try { activeRoutines = (await getAllRoutines(userId)).filter(r => r.isActive); }
+    catch (e) { console.warn('[getCurrentInfo] routines read failed:', e instanceof Error ? e.message : e); }
 
-    const tasks = await getAllTasks(userId);
-    const pendingTasks = tasks.filter(t => t.status === 'pending');
-    const replanningTasks = tasks.filter(t => t.status === 'needs_replanning');
+    let pendingTasks: Awaited<ReturnType<typeof getAllTasks>> = [];
+    let replanningTasks: Awaited<ReturnType<typeof getAllTasks>> = [];
+    try {
+        const tasks = await getAllTasks(userId);
+        pendingTasks = tasks.filter(t => t.status === 'pending');
+        replanningTasks = tasks.filter(t => t.status === 'needs_replanning');
+    } catch (e) { console.warn('[getCurrentInfo] tasks read failed:', e instanceof Error ? e.message : e); }
 
     let todayStatsStr = 'no stats tracked today';
     try {
@@ -392,7 +416,9 @@ async function getCurrentInfo(userId: number, opts?: { userFacing?: boolean }): 
         // Don't let stat errors break the entire context
     }
 
-    const memoryRecords = await getAllUserMemoryRecords(userId);
+    let memoryRecords: Awaited<ReturnType<typeof getAllUserMemoryRecords>> = {};
+    try { memoryRecords = await getAllUserMemoryRecords(userId); }
+    catch (e) { console.warn('[getCurrentInfo] memory read failed:', e instanceof Error ? e.message : e); }
 
     // Last turn couldn't finish within the token budget, so the bot asked the
     // user for permission to spend more. Peek (not consume) on user-facing turns:
@@ -434,7 +460,12 @@ async function replyToUser(
 ): Promise<string> {
     try {
         const user = await getUser(userId);
-        if (!user) return 'Ошибка: пользователь не найден';
+        if (!user) {
+            // Deliver, don't just return — the caller discards the return value,
+            // so a bare return here would leave the user with silence.
+            await safeSend(bot, userId, 'Не могу найти твой профиль 🐺 попробуй /start');
+            return '';
+        }
 
         // Reply goes to the user, so this turn may carry the budget ask.
         const memory = await getCurrentInfo(userId, { userFacing: true });
@@ -499,7 +530,12 @@ async function replyToUser(
             error: error instanceof Error ? error.message : String(error),
             timestamp: new Date().toISOString()
         }, error);
-        return 'Извини, проблемы с генерацией ответа 🐺';
+        // Deliver the last-resort line (the caller discards the return). This
+        // catch fires for non-AI failures (getCurrentInfo, cleanupOldTasks) —
+        // streamAIResponse surfaces its own errors and doesn't throw for
+        // user-facing turns, so without this the user gets nothing.
+        await safeSend(bot, userId, 'Извини, что-то заглючило 🐺 попробуй ещё раз').catch(() => {});
+        return '';
     }
 }
 
@@ -1177,6 +1213,25 @@ bot.onText(/\/help/, serialTextHandler(async (msg) => {
     }
 }));
 
+// Canonical onboarding entrypoint. serialTextHandler already bootstrapped the
+// profile, so this just fires the greeting (works for a brand-new user AND a
+// returning one saying hi). Fixes the gap where a first-ever /start — or any
+// command — used to hit "пользователь не найден".
+bot.onText(/\/start/, serialTextHandler(async (msg) => {
+    try {
+        await AIService.streamAIResponse({
+            userId: msg.from?.id || 0,
+            userMessage: GREETING_PROMPT,
+            systemPromptCachePrefix: getSystemPrompt(),
+            systemPrompt: '',
+            bot, provider, model: OPEN_AI_MODEL,
+            addUserToHistory: true, addAssistantToHistory: true, enableToolCalls: true,
+        });
+    } catch (error) {
+        console.error('Error handling /start:', error);
+    }
+}));
+
 
 
 // Handle regular messages (now with AI command processing AND media support)
@@ -1231,6 +1286,10 @@ async function processIncomingMessage(
         processedContent = msg.text;
         logIndicator = '[Text]';
     } else {
+        // Unsupported type (document, video, GIF, audio, poll, contact, dice, …).
+        // The receipt typing bubble already fired, so a bare null would leave the
+        // user waiting for a reply that never comes — send a short in-character note.
+        await safeSend(bot, msg.chat.id, 'такое я пока не открываю 🐺 кинь текстом или голосовухой').catch(() => {});
         return null;
     }
 
@@ -1242,7 +1301,7 @@ async function processIncomingMessage(
 
     // Real-user-ingress trust boundary: strip <system> so a user typing
     // `</system>evil<system>` can't escape our prompt wrappers. Bot-synthesized
-    // prompts (TASK_TRIGGERED_PROMPT, GREETING_PROMPT, …) bypass this — they
+    // prompts (BATCH_REMINDER_PROMPT, GREETING_PROMPT, …) bypass this — they
     // INTENTIONALLY wrap in <system> and go directly to streamAIResponse.
     processedContent = stripSystemTags(processedContent);
 
