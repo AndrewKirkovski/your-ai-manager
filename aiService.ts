@@ -2,7 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import {addMessageToHistory, getRecentMessageHistory, recordAITokens, bumpStickerUsedCount, getReplyMaxTokens, getActiveTokenGrant, setTokenConsentPending} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
 import {formatDateHuman} from "./dateUtils";
-import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers, exceedsTelegramLimit} from './telegramFormat';
+import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers, exceedsTelegramLimit, mdToTelegramHtml} from './telegramFormat';
 import type {AIProvider, ProviderMessage, ToolCallInfo, ToolDefinition, ThinkingBlockData} from './aiProvider';
 
 export interface AIStreamOptions {
@@ -158,12 +158,26 @@ const ASK_MORE_AFTER_NOTHING = 'Не хватило лимита токенов,
  * left staring at silence wondering whether the bot is alive. */
 const NO_OUTPUT_FALLBACK = 'Задумался и потерял мысль 🐺 Повтори, пожалуйста?';
 
-/** Does this raw model text carry anything the USER would actually see? Mirrors
- * the delivery path (updateTelegramMessage), which sends nothing once internal
- * markers are stripped and the remainder is whitespace — so "the message string
- * is non-empty" and "the user saw text" are NOT the same test. */
+/** Light ack when a turn did real work via a tool (UpdateMemory, TrackStat, …)
+ * but the model added no text. "Потерял мысль" would be wrong there — it DID the
+ * thing — so acknowledge instead of implying the bot blanked. */
+const TOOL_ONLY_ACK = 'ок 🐺';
+
+/** Does this raw model text carry anything the USER would actually see? Runs the
+ * SAME pipeline the send does (strip internal markers → mdToTelegramHtml →
+ * sanitize-html), so "counts as visible" can't diverge from "actually renders
+ * non-empty" — content that's non-empty after marker-stripping but renders to
+ * empty HTML (stray markup) would otherwise fool the never-silent floor. */
 function hasVisibleText(raw: string): boolean {
-    return !!stripInternalMarkers(raw).trim();
+    const stripped = stripInternalMarkers(raw).trim();
+    if (!stripped) return false;
+    try {
+        return !!mdToTelegramHtml(stripped).trim();
+    } catch {
+        // If the renderer throws, fall back to the marker-stripped check rather
+        // than wrongly declaring the turn silent.
+        return true;
+    }
 }
 
 // ── Provider-failure resilience ────────────────────────────────────────────
@@ -389,6 +403,15 @@ export class AIService {
         // raw message string is non-empty. The error-catch path is unaffected:
         // its 🐺 text is visible, so this correctly stays quiet after it.
         if (!delivered && !hasVisibleText(result.message)) {
+            if (result.usedTools) {
+                // The turn DID real work via a tool (UpdateMemory, TrackStat, …)
+                // but the model added no text — e.g. "запомни, что я люблю кофе".
+                // "Потерял мысль, повтори" would be wrong (it remembered); a light
+                // ack is the honest floor here.
+                console.warn(`🔇→🗣 ${options.userId}: tool-only turn with no text — sending ack`);
+                await safeSend(options.bot, options.userId, TOOL_ONLY_ACK);
+                return { ...result, message: TOOL_ONLY_ACK, rawResponse: TOOL_ONLY_ACK };
+            }
             console.error(`🚨 ${options.userId}: turn delivered nothing to the user — sending fallback`);
             await safeSend(options.bot, options.userId, NO_OUTPUT_FALLBACK);
             return { ...result, message: NO_OUTPUT_FALLBACK, rawResponse: NO_OUTPUT_FALLBACK };
