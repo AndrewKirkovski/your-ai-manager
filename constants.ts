@@ -278,51 +278,50 @@ Ask what they want help with. Keep it casual and SHORT. No bullet-point feature 
 </system>
 `;
 
-/** Context block injected into a task-trigger prompt when another reminder
- * went out to this user only minutes ago (same-minute stagger, or a routine
- * that spawned a task right after an ad-hoc reminder). Tells the AI to build
- * on the just-sent message instead of firing a dry back-to-back reminder.
- * `allowsPostpone` mirrors requiresAction: the no-action prompt forbids tools
- * (and the call disables them), so its note must not offer UpdateTask. */
-export const RECENT_REMINDER_NOTE = (taskName: string, minAgo: number, allowsPostpone: boolean) => `
-NOTE: A reminder about "${stripSystemTags(taskName)}" was sent just ${minAgo} min ago — it's in recent history.
-Don't fire a dry, separate back-to-back reminder. Fold THIS task into ONE short combined line that builds on the one you just sent ("и ещё — [task]", "заодно [task] не забудь"). Always say something visible — never go silent.${allowsPostpone ? `
-If it genuinely feels too soon to ping again, you MAY push this task's next ping later with UpdateTask(ping_at="..."), but ONLY together with a one-line heads-up that says so ("ок, про [task] напомню попозже"). Never reschedule without a visible line, and never push ping_at past the task's dueAt.` : ''}`;
-
-export const TASK_TRIGGERED_PROMPT = (memory: string, task: {id: string, name: string}, recentReminderNote = '') => `
+/** One reminder turn for ALL tasks that came due in the same minute tick.
+ * Replaces the old one-task-per-tick + stagger design: instead of firing N
+ * separate messages minutes apart (and licensing silent postpones to keep them
+ * from nagging), the whole cluster is reminded in ONE message that GROUPS
+ * related tasks — so several doctor appointments become a single line, not one
+ * ping per doctor. A due tick ALWAYS produces a visible message; rescheduling
+ * is secondary and never silent. */
+export interface BatchReminderTask {
+    id: string;
+    name: string;
+    requiresAction: boolean;
+    annoyance: string;
+    dueAt?: Date;
+}
+export const BATCH_REMINDER_PROMPT = (memory: string, tasks: BatchReminderTask[]) => {
+    const list = tasks.map(t =>
+        `- "${stripSystemTags(t.name)}" (ID: ${t.id}, ${t.requiresAction ? 'needs action' : 'heads-up only'}, annoyance: ${t.annoyance}${t.dueAt ? `, deadline: ${t.dueAt.toISOString()}` : ''})`
+    ).join('\n');
+    return `
 <system>
 ${memory}
 
-SITUATION: This is the moment to REMIND the user about task "${stripSystemTags(task.name)}" (ID: ${task.id}) — right now, out loud. The reminder IS the message you are about to write. There is no separate reminder step: if you stay silent, the user hears nothing and the task is effectively dropped.
-${recentReminderNote}
-PRIMARY — ALWAYS REQUIRED, NEVER SKIPPABLE:
-- Write exactly ONE short, in-character reminder message to the user. This happens on every trigger and can never be replaced by a tool call or omitted.
+SITUATION: The following ${tasks.length === 1 ? 'task is' : `${tasks.length} tasks are`} due for a reminder RIGHT NOW. Remind the user about ${tasks.length === 1 ? 'it' : 'them'} out loud, in ONE message.
 
-THEN handle scheduling (secondary):
-- Deadline blown? If dueAt has passed, the task is severely overdue, or a fresh task from the same routine has already started → call MarkTaskFailed(task_id="${task.id}"). Even here you still write a line letting it go ("ладно, это уже проехали", "снимаю, время ушло") — MarkTaskFailed is the only branch with no forward reminder, never a silent one.
-- Otherwise, if the task should ping again later → set the next time with UpdateTask(task_id="${task.id}", ping_at="..."), keeping the original name. Space the next ping by annoyance (low: 2-3h, med: 30-60min, high: 1-5min). Do NOT push ping_at to "tomorrow"/"Wednesday" unless the USER asked, or unless your message SAYS you're doing it ("ок, напомню в среду").
-- If you move the next ping noticeably later, your reminder message MUST mention it — a postpone is never invisible.
+DUE NOW:
+${list}
+
+PRIMARY — ALWAYS REQUIRED, NEVER SKIPPABLE:
+- Write ONE short, in-character message reminding the user about these. Staying silent = a failed reminder; there is no separate "remind later" step, the message you write now IS the reminder.
+- GROUP related tasks into a single natural line instead of one line per task — e.g. several doctor appointments → "врачи висят: гастролог, невролог, кардиолог — давай запишемся, хоть с одного начни". Lead with anything urgent (near deadline). Genuinely unrelated tasks can be separate short lines in the SAME message. Keep it to a couple of lines, not a wall of text.
+
+THEN handle scheduling (secondary, silently, AFTER the message):
+- For each task that NEEDS ACTION and should ping again → UpdateTask(task_id, ping_at="...") keeping the name. Space the next ping by annoyance (low: 2-3h, med: 30-60min, high: 1-5min). Do NOT push ping_at to "tomorrow"/"next week" unless the USER asked, or unless your message SAYS so ("ок, напомню в среду").
+- Deadline passed / task clearly superseded → MarkTaskFailed(task_id), and still write a one-line "снимаю, время ушло" for it.
+- Heads-up-only tasks: just mention them — do NOT call any tool on them.
 
 NEVER:
-- Never call UpdateTask (or any tool) and stay silent. A tool-only turn with no visible text is a failed reminder.
-- Never quietly slide ping_at far into the future to avoid reminding now — that is the exact behavior to avoid.
+- Never move a ping noticeably later without your message saying so — a postpone is never invisible.
+- Never call a tool and stay silent.
 
-STYLE:
-- Vary phrasing. If you already reminded and the user didn't respond, escalate the ANGLE (humor, a light jab, a challenge, a casual "ещё висит") — not the frequency.
-- Don't open with "Напоминаю" every time — try "ну чо, [task] ещё висит", "кстати, [task]", "слушай, [task] само себя не сделает".
+STYLE: vary phrasing; if you've reminded before with no response, change the ANGLE (humor, a light jab, a challenge), not the frequency. Don't open with "Напоминаю".
 </system>
 `;
-
-export const TASK_TRIGGERED_PROMPT_NO_ACTION = (memory: string, task: {id: string, name: string}, recentReminderNote = '') => `
-<system>
-${memory}
-
-Remind user about "${stripSystemTags(task.name)}" (ID: ${task.id}). This is a no-action reminder — just a heads-up.
-${recentReminderNote}
-DO NOT USE ANY TOOLS — just write a brief message.
-Vary your phrasing. Check history for what you said last time about this task and say something different.
-</system>
-`;
+};
 
 /** Silent background maintenance prompt for the reminder-collision fixer cron.
  * Runs with shouldUpdateTelegram=false — the user never sees the output; the

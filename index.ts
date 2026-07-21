@@ -17,9 +17,9 @@ import {
     GOAL_SET_PROMPT,
     GOAL_CLEAR_PROMPT,
     ERROR_MESSAGE_PROMPT,
-    DEFAULT_HELP_PROMPT, TASK_TRIGGERED_PROMPT, TASK_TRIGGERED_PROMPT_NO_ACTION,
-    RECENT_REMINDER_NOTE,
+    DEFAULT_HELP_PROMPT, BATCH_REMINDER_PROMPT,
 } from './constants';
+import type { BatchReminderTask } from './constants';
 import {
     getUser,
     setUser,
@@ -503,15 +503,15 @@ async function replyToUser(
     }
 }
 
-// Last task-reminder dispatch per user: timestamp + task name. Feeds the
-// recent-reminder note so the AI weaves a new reminder into the just-sent one
-// instead of firing dry back-to-back messages — covers routine tasks spawning
-// one tick after an ad-hoc reminder, and staggered tasks firing minutes later.
-// In-memory: a restart loses it, but the same-tick stagger below still
-// guarantees message spacing.
-const lastReminderAt = new Map<number, { at: number; taskName: string }>();
-const RECENT_REMINDER_WINDOW_MS = 15 * 60_000;
-const STAGGER_STEP_MS = 5 * 60_000;
+// Per-annoyance backoff for the recovery path — when a batch reminder turn
+// leaves an action task un-rescheduled, it's reset to pending this far out so
+// it re-pings on schedule instead of vanishing (mirrors the intervals the
+// reminder prompt asks the model to use).
+const REPING_MS: Record<string, number> = {
+    low: 150 * 60_000, // ~2.5h
+    med: 45 * 60_000,
+    high: 4 * 60_000,
+};
 
 // Check routines and tasks every minute. `isRunning` guard prevents overlap
 // if a slow AI call from a previous tick hasn't finished yet (otherwise two
@@ -593,18 +593,14 @@ cron.schedule('* * * * *', async () => {
             }
         }
 
-        // 2. Check pending tasks for pinging users. Never two reminder
-        //    messages at once: the FIRST (most overdue) due task is reminded
-        //    normally; the rest are silently staggered +5/+10/… min so each
-        //    fires alone on a later tick. A staggered task then carries a
-        //    recent-reminder note so the AI builds on the message that just
-        //    went out (or postpones again) instead of pinging back-to-back.
+        // 2. Check pending tasks. ALL tasks due this tick for a user are
+        //    reminded in ONE batch turn that groups related ones (e.g. several
+        //    doctor appointments become a single line) — so the user gets one
+        //    consolidated message, not a stagger of separate pings, and no due
+        //    task is ever silently postponed.
         const nowDate = now.toJSDate();
-        // Winner order: deadline-imminent tasks first (nearest future dueAt) —
-        // one reminder fires per tick, and draining a pile-up by pingAt age
-        // could let a nearer deadline slip past dueAt unreminded (trigger
-        // prompt would then auto-fail it). Everything else drains most-overdue
-        // first, as before.
+        // Order deadline-imminent tasks first (nearest future dueAt) so the
+        // message leads with what's urgent; everything else by most-overdue.
         const DEADLINE_IMMINENT_MS = 15 * 60_000;
         const isImminent = (t: Task) => !!t.dueAt
             && t.dueAt.getTime() > nowDate.getTime()
@@ -617,202 +613,145 @@ cron.schedule('* * * * *', async () => {
                 if (ia && ib) return a.dueAt!.getTime() - b.dueAt!.getTime();
                 return a.pingAt.getTime() - b.pingAt.getTime();
             });
-        const [dueTask, ...staggeredTasks] = dueTasks;
 
-        if (dueTask) {
-            try {
-                console.log('📱 Pinging user about pending task:', dueTask);
+        if (dueTasks.length > 0) {
+            // Pre-mark every due task so the NEXT minute tick won't re-select it
+            // while this closure is still queued (prevents double-fire). Per-task
+            // fresh-read guard: skip anything a concurrent chat reply already
+            // moved/completed. The recovery pass at the end of the closure resets
+            // any action task the model didn't reschedule, so pre-marking can't
+            // strand a task in needs_replanning.
+            const marked: Task[] = [];
+            for (const dt of dueTasks) {
+                let ok = false;
+                try {
+                    await updateUserTask(user.userId, dt.id, (t) => {
+                        if (t.status !== 'pending' || t.pingAt > nowDate) return;
+                        t.status = dt.requiresAction ? 'needs_replanning' : 'completed';
+                        ok = true;
+                    });
+                } catch (error) {
+                    console.error('❌ Error marking due task:', {
+                        userId: user.userId, taskId: dt.id,
+                        error: error instanceof Error ? error.message : String(error),
+                    });
+                }
+                if (ok) marked.push(dt);
+            }
 
-                // Re-check status inside the fresh read: an in-flight chat
-                // reply's tool call (MarkTaskComplete, UpdateTask) can land
-                // between the tick's snapshot and this write — don't resurrect
-                // a task the user just completed.
-                let marked = false;
-                await updateUserTask(user.userId, dueTask.id, (t) => {
-                    if (t.status !== 'pending') return;
-                    t.status = dueTask.requiresAction ? 'needs_replanning' : 'completed';
-                    marked = true;
-                });
-
-                // Serialize with the live bot.on('message') path via enqueuePerUser —
-                // otherwise a user typing at the same minute a routine fires produces
-                // two concurrent streams that interleave addMessageToHistory writes.
-                // Fire-and-forget: the queue itself enforces per-user serialization,
-                // so this tick can return immediately and other users' tasks can run
-                // in parallel. Awaiting here would block the whole tick on one user's
-                // AI roundtrip and cause routineTickRunning to skip the next minute
-                // for everyone.
-                if (marked) void enqueuePerUser(user.userId, async () => {
-                    try {
-                        // Re-verify at RUN time, not just mark time: this closure
-                        // may sit behind a long chat reply on the queue, and that
-                        // reply's tool calls can legitimately complete or move
-                        // this very task ("сделал!" / "перенеси на вечер"). The
-                        // prompt below MANDATES a user-visible reminder — firing
-                        // it from a stale snapshot pings about a task the user
-                        // just handled. If state moved on, the task either fires
-                        // later at its new pingAt via the normal tick, or is done.
-                        const expectedStatus = dueTask.requiresAction ? 'needs_replanning' : 'completed';
-                        const fresh = await getTask(user.userId, dueTask.id);
-                        if (!fresh || fresh.status !== expectedStatus
-                            || fresh.pingAt.getTime() !== dueTask.pingAt.getTime()) {
-                            console.log('⏭️ Reminder skipped — task changed while queued:', {
-                                userId: user.userId,
-                                taskId: dueTask.id,
-                                status: fresh?.status,
-                            });
-                            return;
+            // ONE reminder turn for the whole batch. Fire-and-forget on the
+            // per-user queue so this tick returns immediately (awaiting would
+            // stall every user's tick behind one AI roundtrip).
+            if (marked.length > 0) void enqueuePerUser(user.userId, async () => {
+                try {
+                    // Re-verify each at RUN time — this closure may sit behind a
+                    // long chat reply whose tool calls completed/moved some of
+                    // these tasks. Keep only those still in the pre-marked state
+                    // with an unchanged pingAt.
+                    const survivors: Task[] = [];
+                    for (const dt of marked) {
+                        const expected = dt.requiresAction ? 'needs_replanning' : 'completed';
+                        const fresh = await getTask(user.userId, dt.id);
+                        if (fresh && fresh.status === expected
+                            && fresh.pingAt.getTime() === dt.pingAt.getTime()) {
+                            survivors.push(dt);
                         }
-
-                        const memory = await getCurrentInfo(user.userId);
-
-                        // lastReminderAt is read AND written inside this queued
-                        // closure (per-user serialized, so no race): reading at
-                        // dispatch time would understate queue delay, and writing
-                        // at dispatch time would record reminders that never
-                        // reached the user (AI failure, or the AI obeying the
-                        // note's "postpone silently" branch). Same-task re-pings
-                        // get no note — high-annoyance nagging about one task is
-                        // deliberate, and there's no other message to weave into.
-                        const prevReminder = lastReminderAt.get(user.userId);
-                        const sinceMs = prevReminder ? Date.now() - prevReminder.at : Infinity;
-                        const note = prevReminder
-                            && prevReminder.taskName !== dueTask.name
-                            && sinceMs <= RECENT_REMINDER_WINDOW_MS
-                            // allowsPostpone follows requiresAction: the no-action
-                            // prompt forbids tools, so its note must not offer one.
-                            ? RECENT_REMINDER_NOTE(prevReminder.taskName, Math.max(1, Math.round(sinceMs / 60_000)), dueTask.requiresAction)
-                            : '';
-
-                        const taskPrompt = dueTask.requiresAction
-                            ? TASK_TRIGGERED_PROMPT(memory, dueTask, note)
-                            : TASK_TRIGGERED_PROMPT_NO_ACTION(memory, dueTask, note);
-
-                        let delivered = false;
-                        const result = await AIService.streamAIResponse({
-                            userId: user.userId,
-                            userMessage: taskPrompt,
-                            systemPromptCachePrefix: getSystemPrompt(),
-                            systemPrompt: '', // memory is already inlined into taskPrompt
-                            bot,
-                            provider,
-                            model: OPEN_AI_MODEL,
-                            addUserToHistory: false,
-                            addAssistantToHistory: true,
-                            // Bot-initiated: the user isn't waiting on this tick,
-                            // so proactive suppresses the never-silent "повтори"
-                            // fallback / consent-ask / 🐺 error line on an empty
-                            // or failed turn. But an ACTION reminder must still
-                            // reach the user — the !delivered guard below enforces
-                            // a visible line, so proactive silence never becomes a
-                            // silently-dropped task.
-                            proactive: true,
-                            // No-action heads-ups declare "DO NOT USE ANY TOOLS" —
-                            // enforce it instead of only prompting it (the task is
-                            // already auto-completed; a stray UpdateTask(ping_at)
-                            // would resurrect it to pending).
-                            enableToolCalls: dueTask.requiresAction,
-                            // Schedule-only allowlist for the action reminder run,
-                            // mirroring the collision fixer: the reminder turn's
-                            // only legitimate tools are rescheduling / closing the
-                            // task, never the full registry.
-                            allowedTools: dueTask.requiresAction
-                                ? ['UpdateTask', 'MarkTaskFailed', 'MarkTaskComplete',
-                                   'GetTaskById', 'GetTasksByIdList', 'GetTasksByStatus', 'GetTasksByRoutine']
-                                : undefined,
-                            purpose: 'task-reminder',
-                            // Confirmed-delivery callback (NOT onTextStreamed,
-                            // which is commit-on-attempt and fires even when
-                            // the Telegram send fails).
-                            onTextDelivered: () => { delivered = true; },
-                        });
-
-                        // Visible-text floor for ACTION reminders. proactive:true
-                        // suppressed aiService's never-silent floor, so a tool-only
-                        // "silent reschedule" turn would otherwise deliver nothing —
-                        // the exact silent-drop we're killing. If the model called a
-                        // scheduling tool but wrote no visible text, send a minimal
-                        // deterministic reminder so a due task is never dropped in
-                        // silence. Rate-limited by the one-winner-per-tick design,
-                        // so it can't become a nag burst.
-                        if (dueTask.requiresAction && !delivered) {
-                            console.warn(`🔇→🗣 ${user.userId}: action reminder produced no visible text — sending minimal reminder for "${dueTask.name}"`);
-                            const sent = await safeSend(bot, user.userId, `напомню: ${stripSystemTags(dueTask.name)} 🐺`);
-                            if (sent) delivered = true;
-                        }
-
-                        // Record only reminders the user actually received.
-                        if (delivered) {
-                            lastReminderAt.set(user.userId, { at: Date.now(), taskName: dueTask.name });
-                        }
-
-                        console.log(result);
-                    } catch (error) {
-                        // Action tasks are recoverable: the needs_replanning mark
-                        // already landed and getCurrentInfo re-surfaces them to every
-                        // subsequent AI call. No-action tasks were marked completed —
-                        // a failure here silently drops that heads-up (accepted; same
-                        // as pre-stagger behavior).
-                        console.error('❌ Task reminder failed:', {
-                            userId: user.userId,
-                            taskId: dueTask.id,
-                            error: error instanceof Error ? error.message : String(error),
-                        });
                     }
-                });
-            } catch (error) {
-                console.error('❌ Error pinging task:', {
-                    userId: user.userId,
-                    taskId: dueTask.id,
-                    error: error instanceof Error ? error.message : String(error),
-                    timestamp: now.toISO()
-                });
-            }
-        }
+                    if (survivors.length === 0) {
+                        console.log('⏭️ Batch reminder skipped — all tasks changed while queued:', { userId: user.userId });
+                        return;
+                    }
 
-        for (let i = 0; i < staggeredTasks.length; i++) {
-            const task = staggeredTasks[i];
-            const pingMs = nowDate.getTime() + STAGGER_STEP_MS * (i + 1);
-            // Never defer a task INTO its deadline: a clamped ping at/past dueAt
-            // means its only reminder fires when trigger-prompt rule 2 says
-            // MarkTaskFailed — the bot would fail a task the user was never
-            // reminded about, purely from its own collision avoidance. Leave
-            // pingAt untouched instead: with the oldest pingAt it wins the next
-            // tick outright and fires ~1 min after this reminder, carrying the
-            // recent-reminder note. (A dueAt already in the past changes nothing
-            // — the deadline is blown either way, so full spacing applies.)
-            if (task.dueAt && task.dueAt.getTime() > nowDate.getTime()
-                && pingMs >= task.dueAt.getTime() - 60_000) {
-                console.log('⏭️ Not staggering deadline-imminent task (fires next tick):', {
-                    userId: user.userId,
-                    taskId: task.id,
-                    dueAt: task.dueAt.toISOString(),
-                });
-                continue;
-            }
-            const newPingAt = new Date(pingMs);
-            try {
-                await updateUserTask(user.userId, task.id, (t) => {
-                    // Fresh-read re-check: skip if a concurrent tool call completed
-                    // the task or already moved its ping (e.g. user said "напомни
-                    // завтра" while this tick was running).
-                    if (t.status !== 'pending' || t.pingAt > nowDate) return;
-                    t.pingAt = newPingAt;
-                });
-                console.log('⏭️ Staggered reminder (another task due same tick):', {
-                    userId: user.userId,
-                    taskId: task.id,
-                    name: task.name,
-                    newPingAt: newPingAt.toISOString(),
-                });
-            } catch (error) {
-                console.error('❌ Error staggering task:', {
-                    userId: user.userId,
-                    taskId: task.id,
-                    error: error instanceof Error ? error.message : String(error),
-                    timestamp: now.toISO()
-                });
-            }
+                    const memory = await getCurrentInfo(user.userId);
+                    const anyAction = survivors.some(t => t.requiresAction);
+                    const batch: BatchReminderTask[] = survivors.map(t => ({
+                        id: t.id, name: t.name, requiresAction: t.requiresAction,
+                        annoyance: t.annoyance, dueAt: t.dueAt,
+                    }));
+
+                    let delivered = false;
+                    const result = await AIService.streamAIResponse({
+                        userId: user.userId,
+                        userMessage: BATCH_REMINDER_PROMPT(memory, batch),
+                        systemPromptCachePrefix: getSystemPrompt(),
+                        systemPrompt: '', // memory inlined into the batch prompt
+                        bot,
+                        provider,
+                        model: OPEN_AI_MODEL,
+                        addUserToHistory: false,
+                        addAssistantToHistory: true,
+                        // Bot-initiated: proactive suppresses the never-silent
+                        // "повтори" fallback / consent-ask / 🐺 error line. The
+                        // visible-text floor + recovery below make sure that
+                        // silence never becomes a dropped task.
+                        proactive: true,
+                        // Tools only when the batch has an action task; the model
+                        // reschedules/fails those and just mentions heads-up ones.
+                        enableToolCalls: anyAction,
+                        // Schedule-only allowlist, mirroring the collision fixer.
+                        allowedTools: anyAction
+                            ? ['UpdateTask', 'MarkTaskFailed', 'MarkTaskComplete',
+                               'GetTaskById', 'GetTasksByIdList', 'GetTasksByStatus', 'GetTasksByRoutine']
+                            : undefined,
+                        purpose: 'task-reminder',
+                        onTextDelivered: () => { delivered = true; },
+                    });
+
+                    // Visible-text floor for the whole batch: if the turn emitted
+                    // no visible text (proactive suppressed the never-silent
+                    // floor), send ONE minimal combined line so a due batch is
+                    // never dropped in silence.
+                    if (!delivered) {
+                        const names = survivors.map(t => stripSystemTags(t.name)).join(', ');
+                        console.warn(`🔇→🗣 ${user.userId}: batch reminder produced no visible text — sending minimal reminder for: ${names}`);
+                        const sent = await safeSend(bot, user.userId, `напомню: ${names} 🐺`);
+                        if (sent) delivered = true;
+                    }
+
+                    // Recovery: any ACTION task the model didn't reschedule/fail is
+                    // still needs_replanning — reset it to pending on an
+                    // annoyance-based backoff so batching never strands a task (it
+                    // re-pings on schedule instead of vanishing until the user next
+                    // chats). Deterministic backstop for "reminded but forgot to
+                    // set the next ping".
+                    for (const dt of survivors) {
+                        if (!dt.requiresAction) continue;
+                        const fresh = await getTask(user.userId, dt.id);
+                        if (fresh && fresh.status === 'needs_replanning') {
+                            const backoff = REPING_MS[fresh.annoyance] ?? REPING_MS.med;
+                            await updateUserTask(user.userId, dt.id, (t) => {
+                                if (t.status !== 'needs_replanning') return;
+                                t.status = 'pending';
+                                t.pingAt = new Date(Date.now() + backoff);
+                            });
+                            console.log(`♻️ Reset un-rescheduled task to pending (+${Math.round(backoff / 60_000)}min):`, {
+                                userId: user.userId, taskId: dt.id, name: dt.name,
+                            });
+                        }
+                    }
+
+                    console.log(result);
+                } catch (error) {
+                    console.error('❌ Batch reminder failed:', {
+                        userId: user.userId,
+                        error: error instanceof Error ? error.message : String(error),
+                    });
+                    // Hard-failure recovery: reset all pre-marked ACTION tasks to
+                    // pending so a thrown turn doesn't strand them in
+                    // needs_replanning (out of the pending pool until the user
+                    // opens a chat).
+                    for (const dt of marked) {
+                        if (!dt.requiresAction) continue;
+                        try {
+                            await updateUserTask(user.userId, dt.id, (t) => {
+                                if (t.status !== 'needs_replanning') return;
+                                t.status = 'pending';
+                                t.pingAt = new Date(Date.now() + (REPING_MS[t.annoyance] ?? REPING_MS.med));
+                            });
+                        } catch { /* best effort */ }
+                    }
+                }
+            });
         }
     }
     } catch (error) {
