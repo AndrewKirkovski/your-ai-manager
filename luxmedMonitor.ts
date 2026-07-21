@@ -91,7 +91,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
         if (botInstance) {
             safeSend(botInstance, config.userId,
                 `⏰ LuxMed мониторинг "${config.serviceName}" истёк (период до ${config.dateTo}). Деактивирован.`
-            ).catch(() => {});
+            ).catch(err => console.error(`[LuxMed Monitor] ${config.id}: notification send failed:`, err instanceof Error ? err.message : err));
         }
         return;
     }
@@ -135,7 +135,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
 
                 if (botInstance) {
                     const msg = `✅ LuxMed: Записал автоматически!\n\n${formatTermForNotification(best)}\n\nСервис: ${config.serviceName}`;
-                    safeSend(botInstance, config.userId, msg).catch(() => {});
+                    safeSend(botInstance, config.userId, msg).catch(err => console.error(`[LuxMed Monitor] ${config.id}: notification send failed:`, err instanceof Error ? err.message : err));
                 }
             } catch (err) {
                 const errMsg = err instanceof Error ? err.message : String(err);
@@ -147,17 +147,27 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
                     const slotsText = filtered.slice(0, 5).map((t, i) => `${i + 1}. ${formatTermForNotification(t)}`).join('\n');
                     // errMsg is a raw JS error string (external source), escape to avoid breaking HTML parse.
                     const msg = `⚠️ LuxMed: Нашёл слоты для "${config.serviceName}", но автозапись не удалась (${escapeHtml(errMsg)}).\n\nДоступные слоты:\n${slotsText}\n\nЗапиши вручную через бот. Мониторинг продолжает попытки автозаписи.`;
-                    safeSend(botInstance, config.userId, msg).catch(() => {});
+                    safeSend(botInstance, config.userId, msg).catch(err => console.error(`[LuxMed Monitor] ${config.id}: notification send failed:`, err instanceof Error ? err.message : err));
                 }
             }
         } else {
-            // Just notify
-            deactivateLuxmedMonitoring(config.id, config.userId);
-            autobookFailureNotified.delete(config.id);
-            if (botInstance) {
-                const slotsText = filtered.slice(0, 5).map((t, i) => `${i + 1}. ${formatTermForNotification(t)}`).join('\n');
-                const msg = `🔔 LuxMed: Нашёл ${filtered.length} слот(ов) для "${config.serviceName}"!\n\n${slotsText}${filtered.length > 5 ? `\n... и ещё ${filtered.length - 5}` : ''}\n\nИспользуй LuxmedSearchSlots чтобы найти и записаться.`;
-                safeSend(botInstance, config.userId, msg).catch(() => {});
+            // Just notify — deactivate ONLY after a confirmed send. If the
+            // notification send fails (429 / network blip), keep monitoring active
+            // so the next cycle re-notifies; deactivating first would lose BOTH the
+            // slots and the monitoring on a single hiccup.
+            const slotsText = filtered.slice(0, 5).map((t, i) => `${i + 1}. ${formatTermForNotification(t)}`).join('\n');
+            const msg = `🔔 LuxMed: Нашёл ${filtered.length} слот(ов) для "${config.serviceName}"!\n\n${slotsText}${filtered.length > 5 ? `\n... и ещё ${filtered.length - 5}` : ''}\n\nИспользуй LuxmedSearchSlots чтобы найти и записаться.`;
+            const sent = botInstance
+                ? await safeSend(botInstance, config.userId, msg).catch(err => {
+                    console.error(`[LuxMed Monitor] ${config.id}: slots notification send failed, keeping monitoring active:`, err instanceof Error ? err.message : err);
+                    return null;
+                })
+                : null;
+            // Deactivate on confirmed delivery, or if there's no bot to ever notify
+            // (avoid a monitor that loops forever finding slots it can't report).
+            if (sent || !botInstance) {
+                deactivateLuxmedMonitoring(config.id, config.userId);
+                autobookFailureNotified.delete(config.id);
             }
         }
     } catch (err) {
@@ -170,7 +180,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
             if (botInstance) {
                 safeSend(botInstance, config.userId,
                     `❌ LuxMed: Ошибка авторизации. Мониторинг "${config.serviceName}" деактивирован. Обнови логин/пароль.`
-                ).catch(() => {});
+                ).catch(err => console.error(`[LuxMed Monitor] ${config.id}: notification send failed:`, err instanceof Error ? err.message : err));
             }
         }
     }
