@@ -272,6 +272,7 @@ export const UpdateTask: Tool = {
         }
 
         // Update the task
+        let failure: string | null = null;
         await updateUserTask(userId, taskId, (task) => {
             if (args.name !== undefined) task.name = textify(args.name);
             if (args.status !== undefined) task.status = args.status as TaskStatus;
@@ -281,15 +282,36 @@ export const UpdateTask: Tool = {
             }
             // Empty string must be a full no-op — before this guard it kept
             // pingAt but still force-reset status to 'pending'.
+            let bumped = false;
             if (args.ping_at) {
-                task.pingAt = new Date(args.ping_at);
+                const newPing = new Date(args.ping_at);
+                // Don't let a reminder be scheduled PAST the deadline: it would
+                // fire after dueAt, where the trigger prompt auto-fails it — a
+                // task pushed past its own deadline, never reminded. Mirrors the
+                // ceiling RescheduleTaskPing already enforces (tools.tasks.ts).
+                // Compared against the effective dueAt (after any due_at update
+                // in this same call).
+                if (task.dueAt && newPing.getTime() > task.dueAt.getTime()) {
+                    failure = `ping_at ${args.ping_at} is after the task's dueAt ${task.dueAt.toISOString()} — the reminder would fire past the deadline. Pick an earlier time, or move due_at too.`;
+                    return;
+                }
+                task.pingAt = newPing;
                 task.status = 'pending'; // Reset status to pending if ping_at is updated
+                // postponeCount tracks how many times a reminder was pushed —
+                // the real "postponed again" signal. Previously it only bumped
+                // on due_at changes, so ping_at-only reschedules (the common
+                // postpone) left it stuck at 0.
+                task.postponeCount = (task.postponeCount ?? 0) + 1;
+                bumped = true;
             }
             if (args.requires_action !== undefined) task.requiresAction = args.requires_action;
-            if (args.due_at) {
+            if (args.due_at && !bumped) {
                 task.postponeCount = (task.postponeCount ?? 0) + 1;
             }
         });
+        if (failure) {
+            throw new Error(failure);
+        }
 
         // Get the updated task
         const updatedTask = await getTask(userId, taskId);

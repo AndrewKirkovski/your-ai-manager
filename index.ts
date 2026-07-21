@@ -416,7 +416,7 @@ ${activeRoutines.map(r => `id: ${r.id} cron: ${r.cron} defaultAnnoyance: ${r.def
 Pending Tasks:
 ${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${stripSystemTags(t.name)}`).join('\n') || 'no active tasks'}
 
-Tasks that need replanning (AI must update these):
+Tasks awaiting a reminder decision — remind the user out loud NOW, then set the next ping (or fail if the deadline passed); never change their schedule without a visible message:
 ${replanningTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${stripSystemTags(t.name)}`).join('\n') || 'none'}
 
 Memory (stale entries may not reflect current state — treat older facts with appropriate skepticism):${formatMemoryBlock(memoryRecords)}
@@ -699,23 +699,47 @@ cron.schedule('* * * * *', async () => {
                             model: OPEN_AI_MODEL,
                             addUserToHistory: false,
                             addAssistantToHistory: true,
-                            // Bot-initiated: the user isn't waiting on this tick.
-                            // If the AI reschedules quietly or has nothing to add,
-                            // that's valid — no "повтори, пожалуйста" fallback, no
-                            // consent ask, no 🐺 error line. It just stays silent
-                            // and retries next tick.
+                            // Bot-initiated: the user isn't waiting on this tick,
+                            // so proactive suppresses the never-silent "повтори"
+                            // fallback / consent-ask / 🐺 error line on an empty
+                            // or failed turn. But an ACTION reminder must still
+                            // reach the user — the !delivered guard below enforces
+                            // a visible line, so proactive silence never becomes a
+                            // silently-dropped task.
                             proactive: true,
                             // No-action heads-ups declare "DO NOT USE ANY TOOLS" —
                             // enforce it instead of only prompting it (the task is
                             // already auto-completed; a stray UpdateTask(ping_at)
                             // would resurrect it to pending).
                             enableToolCalls: dueTask.requiresAction,
+                            // Schedule-only allowlist for the action reminder run,
+                            // mirroring the collision fixer: the reminder turn's
+                            // only legitimate tools are rescheduling / closing the
+                            // task, never the full registry.
+                            allowedTools: dueTask.requiresAction
+                                ? ['UpdateTask', 'MarkTaskFailed', 'MarkTaskComplete',
+                                   'GetTaskById', 'GetTasksByIdList', 'GetTasksByStatus', 'GetTasksByRoutine']
+                                : undefined,
                             purpose: 'task-reminder',
                             // Confirmed-delivery callback (NOT onTextStreamed,
                             // which is commit-on-attempt and fires even when
                             // the Telegram send fails).
                             onTextDelivered: () => { delivered = true; },
                         });
+
+                        // Visible-text floor for ACTION reminders. proactive:true
+                        // suppressed aiService's never-silent floor, so a tool-only
+                        // "silent reschedule" turn would otherwise deliver nothing —
+                        // the exact silent-drop we're killing. If the model called a
+                        // scheduling tool but wrote no visible text, send a minimal
+                        // deterministic reminder so a due task is never dropped in
+                        // silence. Rate-limited by the one-winner-per-tick design,
+                        // so it can't become a nag burst.
+                        if (dueTask.requiresAction && !delivered) {
+                            console.warn(`🔇→🗣 ${user.userId}: action reminder produced no visible text — sending minimal reminder for "${dueTask.name}"`);
+                            const sent = await safeSend(bot, user.userId, `напомню: ${stripSystemTags(dueTask.name)} 🐺`);
+                            if (sent) delivered = true;
+                        }
 
                         // Record only reminders the user actually received.
                         if (delivered) {
