@@ -50,6 +50,13 @@ export function applyColumnMigrations(db: Database.Database): void {
         add('token_grant_budget', 'INTEGER');
         add('token_consent_pending', 'TEXT');
     }
+    // luxmed_monitorings: saved transit limit (added 2026-09-25)
+    {
+        const cols = db.prepare('PRAGMA table_info(luxmed_monitorings)').all() as { name: string }[];
+        if (!cols.some(c => c.name === 'max_transit_minutes')) {
+            db.exec('ALTER TABLE luxmed_monitorings ADD COLUMN max_transit_minutes INTEGER');
+        }
+    }
 }
 
 export const SCHEMA_SQL = `
@@ -179,6 +186,7 @@ export const SCHEMA_SQL = `
         time_to     TEXT NOT NULL DEFAULT '21:00',
         autobook    INTEGER NOT NULL DEFAULT 1,
         rebook_if_exists INTEGER NOT NULL DEFAULT 0,
+        max_transit_minutes INTEGER,
         active      INTEGER NOT NULL DEFAULT 1,
         last_check  TEXT,
         created_at  TEXT NOT NULL

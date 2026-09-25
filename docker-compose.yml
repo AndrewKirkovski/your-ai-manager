@@ -7,6 +7,7 @@ services:
       - .env
     environment:
       LUXMED_SIDECAR_URL: "http://luxmed-sidecar:8080"
+      LUXMED_SIDECAR_SECRET: "${LUXMED_SIDECAR_SECRET:?set LUXMED_SIDECAR_SECRET in .env — no default allowed}"
       # Pin Node's process timezone so cron, luxon, log timestamps, and routine
       # parsing all agree on a single wall clock. Override in .env if needed —
       # per-user TZ is not planned. Defaults to Europe/Warsaw.
@@ -16,7 +17,8 @@ services:
     volumes:
       - bot-data:/app/data
     depends_on:
-      - luxmed-sidecar
+      luxmed-sidecar:
+        condition: service_healthy
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
@@ -27,6 +29,10 @@ services:
     environment:
       DB_HOST: luxmed-db
       DB_PORT: 5432
+      DB_USER: "${LUXMED_DB_USER:-lbs}"
+      DB_PASSWORD: "${LUXMED_DB_PASSWORD:?set LUXMED_DB_PASSWORD in .env — no default allowed}"
+      DB_NAME: "${LUXMED_DB_NAME:-lbs}"
+      REST_SECRET: "${LUXMED_SIDECAR_SECRET:?set LUXMED_SIDECAR_SECRET in .env — no default allowed}"
       TELEGRAM_ENABLED: "false"
       SERVER_PORT: 8080
       # Fail-closed: compose refuses to start if LUXMED_SECURITY_SECRET is unset
@@ -37,21 +43,32 @@ services:
       # to start if LUXMED_WEBHOOK_SECRET is unset.
       MONITORING_WEBHOOK_URL: "http://bot:3000/api/luxmed/monitoring-callback?secret=${LUXMED_WEBHOOK_SECRET:?set LUXMED_WEBHOOK_SECRET in .env — no default allowed}"
     depends_on:
-      - luxmed-db
+      luxmed-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8080"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
   luxmed-db:
-    image: postgres:10.6
+    image: postgres:16
     container_name: luxmed-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: lbs
-      POSTGRES_PASSWORD: "${LUXMED_DB_PASSWORD:-lsb123}"
-      POSTGRES_DB: lbs
+      POSTGRES_USER: "${LUXMED_DB_USER:-lbs}"
+      POSTGRES_PASSWORD: "${LUXMED_DB_PASSWORD:?set LUXMED_DB_PASSWORD in .env — no default allowed}"
+      POSTGRES_DB: "${LUXMED_DB_NAME:-lbs}"
       TZ: Europe/Warsaw
     volumes:
       - luxmed-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
   watchtower:
     image: containrrr/watchtower

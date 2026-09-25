@@ -289,6 +289,7 @@ export async function getDistanceMatrix(
     origin: { lat: number; lng: number },
     destinations: { lat: number; lng: number }[],
     mode: 'transit' | 'driving' = 'transit',
+    options?: { arrivalTime?: Date; departureTime?: Date },
 ): Promise<DistanceMatrixEntry[]> {
     requireApiKey();
     if (destinations.length === 0) return [];
@@ -296,7 +297,12 @@ export async function getDistanceMatrix(
     const originStr = `${origin.lat},${origin.lng}`;
     const destStr = destinations.map(d => `${d.lat},${d.lng}`).join('|');
 
-    const cacheKey = `dm:${originStr}:${destStr}:${mode}`;
+    const timeKey = options?.arrivalTime
+        ? `a${Math.floor(options.arrivalTime.getTime() / 300000)}`
+        : options?.departureTime
+            ? `d${Math.floor(options.departureTime.getTime() / 300000)}`
+            : 'now';
+    const cacheKey = `dm:${originStr}:${destStr}:${mode}:${timeKey}`;
     const cached = cacheGet<DistanceMatrixEntry[]>(cacheKey);
     if (cached !== undefined) {
         console.log(`[Maps] Distance Matrix (cached): ${destinations.length} destinations`);
@@ -309,7 +315,12 @@ export async function getDistanceMatrix(
         const batch = destinations.slice(offset, offset + DISTANCE_MATRIX_BATCH_SIZE);
         const batchDestStr = batch.map(d => `${d.lat},${d.lng}`).join('|');
 
-        const url = `${BASE}/distancematrix/json?origins=${originStr}&destinations=${batchDestStr}&mode=${mode}&departure_time=now&language=pl&key=${API_KEY}`;
+        let url = `${BASE}/distancematrix/json?origins=${originStr}&destinations=${batchDestStr}&mode=${mode}&language=pl&key=${API_KEY}`;
+        if (mode === 'transit') {
+            if (options?.arrivalTime) url += `&arrival_time=${Math.floor(options.arrivalTime.getTime() / 1000)}`;
+            else if (options?.departureTime) url += `&departure_time=${Math.floor(options.departureTime.getTime() / 1000)}`;
+            else url += '&departure_time=now';
+        }
         console.log(`[Maps] Distance Matrix: batch ${Math.floor(offset / DISTANCE_MATRIX_BATCH_SIZE) + 1}, ${batch.length} destinations (${mode})`);
 
         const res = await fetch(url);

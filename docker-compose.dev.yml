@@ -8,6 +8,10 @@ services:
     environment:
       DB_HOST: luxmed-db
       DB_PORT: 5432
+      DB_USER: "${LUXMED_DB_USER:-lbs}"
+      DB_PASSWORD: "${LUXMED_DB_PASSWORD:-lsb123}"
+      DB_NAME: "${LUXMED_DB_NAME:-lbs}"
+      REST_SECRET: "${LUXMED_SIDECAR_SECRET:-dev-only-change-me}"
       TELEGRAM_ENABLED: "false"
       SERVER_PORT: 8080
       # Webhook URL must include ?secret=… because the bot's webhook handler
@@ -22,11 +26,11 @@ services:
     restart: unless-stopped
 
   luxmed-db:
-    image: postgres:10.6
+    image: postgres:16
     environment:
-      POSTGRES_USER: lbs
-      POSTGRES_PASSWORD: lsb123
-      POSTGRES_DB: lbs
+      POSTGRES_USER: "${LUXMED_DB_USER:-lbs}"
+      POSTGRES_PASSWORD: "${LUXMED_DB_PASSWORD:-lsb123}"
+      POSTGRES_DB: "${LUXMED_DB_NAME:-lbs}"
       TZ: Europe/Warsaw
     ports:
       - "5434:5432"

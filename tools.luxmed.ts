@@ -10,7 +10,7 @@ import {
     getLuxmedAccountId, saveLuxmedAccount, getLuxmedPreferences, saveLuxmedPreferences,
     LuxmedPreferences, generateShortId,
     createLuxmedMonitoring, getActiveLuxmedMonitoringsByUser, deactivateLuxmedMonitoring,
-    getUserAddress, getLuxmedClinicByName, saveLuxmedClinic,
+    getUserAddress, saveUserAddress, getLuxmedClinicByName, saveLuxmedClinic,
 } from './userStore';
 
 // Cache valid service IDs per account to catch AI hallucinations
@@ -52,13 +52,32 @@ function requireAccount(userId: number): number {
 function formatTerm(term: LuxmedTerm, index: number): string {
     const t = term.term;
     const dt = t.dateTimeFrom.dateTimeLocal || t.dateTimeFrom.dateTimeTz || '?';
-    const doctor = `${t.doctor.academicTitle} ${t.doctor.firstName} ${t.doctor.lastName}`.trim();
+    const doctor = [t.doctor.academicTitle, t.doctor.firstName, t.doctor.lastName].filter(Boolean).join(' ') || 'Unknown doctor';
     const tele = t.isTelemedicine ? ' (teleconsultation)' : '';
-    return `${index + 1}. ${dt} — ${doctor}, ${t.clinic}${tele}`;
+    return `${index + 1}. ${dt} — ${doctor}, ${t.clinic || 'Unknown clinic'}${tele}`;
 }
 
 // Store last search results per user for booking by index
-const lastSearchResults = new Map<number, { terms: LuxmedTerm[]; cityId: number }>();
+const lastSearchResults = new Map<number, {
+    terms: LuxmedTerm[];
+    cityId: number;
+    expiresAt: number;
+    context: string;
+}>();
+
+function searchContext(args: { cityId: number; serviceId: number; clinicId?: number; doctorId?: number; dateFrom: string; dateTo: string; timeFrom: string; timeTo: string; maxTransitMinutes?: number }): string {
+    return JSON.stringify({
+        cityId: args.cityId,
+        serviceId: args.serviceId,
+        clinicId: args.clinicId ?? null,
+        doctorId: args.doctorId ?? null,
+        dateFrom: args.dateFrom,
+        dateTo: args.dateTo,
+        timeFrom: args.timeFrom,
+        timeTo: args.timeTo,
+        maxTransitMinutes: args.maxTransitMinutes ?? null,
+    });
+}
 
 export const LuxmedLogin: Tool = {
     name: 'LuxmedLogin',
@@ -114,16 +133,24 @@ export const LuxmedSearchSlots: Tool = {
 
         const now = new Date();
         const twoWeeks = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+        const dateFrom = args.date_from || formatLocalDateTime(now);
+        const dateTo = args.date_to || formatLocalDateTime(twoWeeks);
+        const timeFrom = args.time_from || prefs.preferredTimeFrom || '07:00';
+        const timeTo = args.time_to || prefs.preferredTimeTo || '21:00';
+        const maxTransitMinutes = args.max_transit_minutes ?? prefs.maxTransitMinutes;
+        if (maxTransitMinutes != null && (!Number.isFinite(maxTransitMinutes) || maxTransitMinutes < 0)) {
+            return { success: false, message: 'max_transit_minutes must be a finite non-negative number.' };
+        }
         console.log(`[LuxMed] Search: service=${args.service_id}, city=${cityId}, time=${args.time_from || '07:00'}-${args.time_to || '21:00'}`);
         const terms = await luxmedSearchSlots(accountId, {
             cityId,
             serviceId: args.service_id,
             clinicId: args.clinic_id,
             doctorId: args.doctor_id,
-            dateFrom: args.date_from || now.toISOString().slice(0, 19),
-            dateTo: args.date_to || twoWeeks.toISOString().slice(0, 19),
-            timeFrom: args.time_from || prefs.preferredTimeFrom || '07:00',
-            timeTo: args.time_to || prefs.preferredTimeTo || '21:00',
+            dateFrom,
+            dateTo,
+            timeFrom,
+            timeTo,
         });
 
         console.log(`[LuxMed] Search returned ${terms.length} slots`);
@@ -131,68 +158,119 @@ export const LuxmedSearchSlots: Tool = {
         // Transit time filtering
         let filteredTerms = terms;
         const transitTimes = new Map<string, number>(); // clinic address → minutes
-        if (args.max_transit_minutes && terms.length > 0) {
+        if (maxTransitMinutes != null && terms.length > 0) {
             if (!isGoogleMapsConfigured()) {
                 return { success: false, message: 'Transit filtering requires GOOGLE_MAPS_API_KEY. Set it in .env.' };
             }
-            const home = getUserAddress(args.userId, 'home');
+            const home = getUserAddress(args.userId, 'home') || (
+                prefs.homeLat != null && prefs.homeLng != null
+                    ? { label: 'home', address: 'Saved LuxMed home coordinates', lat: prefs.homeLat, lng: prefs.homeLng }
+                    : null
+            );
             if (!home) {
-                return { success: false, message: 'Transit filtering requires home location. Use SaveAddress to save your home address first.' };
+                return { success: false, message: 'Transit filtering requires home location. Use SaveAddress or LuxmedSetPreferences to save it first.' };
             }
 
             // Get unique clinic addresses — check persistent cache first, then geocode
-            const uniqueClinics = [...new Set(terms.map(t => t.term.clinic))];
+            // Telemedicine appointments do not require a route to a clinic.
+            // Keep them in the result even when no physical clinic can be
+            // geocoded.
+            const uniqueClinics = [...new Set(
+                terms.filter(t => !t.term.isTelemedicine).map(t => t.term.clinic || 'Unknown clinic')
+            )];
             console.log(`[LuxMed] Transit filter: resolving ${uniqueClinics.length} unique clinics`);
 
             const clinicCoords: { clinic: string; lat: number; lng: number }[] = [];
+            const unresolvedClinics: string[] = [];
+            let cityName = prefs.defaultCityName || 'Warszawa';
+            if (args.city_id && args.city_id !== prefs.defaultCityId) {
+                try {
+                    const cities = await luxmedGetCities(accountId);
+                    cityName = cities.find(city => city.id === cityId)?.name || cityName;
+                } catch {
+                    console.warn(`[LuxMed] Could not resolve city name for city ${cityId}; using ${cityName}`);
+                }
+            }
             for (const clinicName of uniqueClinics) {
                 // Check luxmed_clinics cache first
-                const cached = getLuxmedClinicByName(clinicName);
+                const cached = getLuxmedClinicByName(clinicName, cityId);
                 if (cached) {
                     clinicCoords.push({ clinic: clinicName, lat: cached.lat, lng: cached.lng });
                     continue;
                 }
                 // Geocode and cache permanently
-                const place = await geocode(`${clinicName}, ${prefs.defaultCityName || 'Warszawa'}`);
+                const place = await geocode(`${clinicName}, ${cityName}`);
                 if (place) {
                     clinicCoords.push({ clinic: clinicName, lat: place.lat, lng: place.lng });
                     saveLuxmedClinic(clinicName, place.formattedAddress, place.lat, place.lng, cityId);
+                } else {
+                    unresolvedClinics.push(clinicName);
                 }
             }
 
             if (clinicCoords.length > 0) {
-                const distances = await getDistanceMatrix(
-                    { lat: home.lat, lng: home.lng },
-                    clinicCoords.map(c => ({ lat: c.lat, lng: c.lng })),
-                    'transit',
-                );
-
-                const maxSeconds = args.max_transit_minutes * 60;
-                const allowedClinics = new Set<string>();
-                for (const d of distances) {
-                    const clinic = clinicCoords[d.destinationIndex];
-                    const minutes = Math.ceil(d.durationSeconds / 60);
-                    transitTimes.set(clinic.clinic, minutes);
-                    if (d.status === 'OK' && d.durationSeconds <= maxSeconds) {
-                        allowedClinics.add(clinic.clinic);
+                const maxSeconds = maxTransitMinutes * 60;
+                const allowedTermKeys = new Set<string>();
+                const termsByArrival = new Map<string, Set<string>>();
+                for (const term of terms) {
+                    if (term.term.isTelemedicine) continue;
+                    const clinic = term.term.clinic || 'Unknown clinic';
+                    const rawDate = term.term.dateTimeFrom.dateTimeLocal || term.term.dateTimeFrom.dateTimeTz;
+                    const parsedDate = rawDate ? new Date(rawDate) : null;
+                    const arrivalKey = parsedDate && !Number.isNaN(parsedDate.getTime()) ? String(parsedDate.getTime()) : 'unknown';
+                    const clinics = termsByArrival.get(arrivalKey) || new Set<string>();
+                    clinics.add(clinic);
+                    termsByArrival.set(arrivalKey, clinics);
+                }
+                for (const [arrivalKey, clinics] of termsByArrival) {
+                    const groupClinics = clinicCoords.filter(c => clinics.has(c.clinic));
+                    const arrivalTime = arrivalKey === 'unknown' ? undefined : new Date(Number(arrivalKey));
+                    const distances = await getDistanceMatrix(
+                        { lat: home.lat, lng: home.lng },
+                        groupClinics.map(c => ({ lat: c.lat, lng: c.lng })),
+                        'transit',
+                        arrivalTime ? { arrivalTime } : undefined,
+                    );
+                    for (const d of distances) {
+                        const clinic = groupClinics[d.destinationIndex];
+                        if (!clinic) continue;
+                        const minutes = Math.ceil(d.durationSeconds / 60);
+                        transitTimes.set(clinic.clinic, Math.min(transitTimes.get(clinic.clinic) ?? Number.POSITIVE_INFINITY, minutes));
+                        if (d.status === 'OK' && d.durationSeconds <= maxSeconds) {
+                            allowedTermKeys.add(`${arrivalKey}:${clinic.clinic}`);
+                        }
                     }
                 }
 
-                filteredTerms = terms.filter(t => allowedClinics.has(t.term.clinic));
-                console.log(`[LuxMed] Transit filter: ${filteredTerms.length}/${terms.length} within ${args.max_transit_minutes} min`);
+                filteredTerms = terms.filter(t => {
+                    if (t.term.isTelemedicine) return true;
+                    const rawDate = t.term.dateTimeFrom.dateTimeLocal || t.term.dateTimeFrom.dateTimeTz;
+                    const parsedDate = rawDate ? new Date(rawDate) : null;
+                    const arrivalKey = parsedDate && !Number.isNaN(parsedDate.getTime()) ? String(parsedDate.getTime()) : 'unknown';
+                    return allowedTermKeys.has(`${arrivalKey}:${t.term.clinic || 'Unknown clinic'}`);
+                });
+                console.log(`[LuxMed] Transit filter: ${filteredTerms.length}/${terms.length} within ${maxTransitMinutes} min`);
+            } else if (terms.some(t => t.term.isTelemedicine)) {
+                filteredTerms = terms.filter(t => t.term.isTelemedicine);
+            } else {
+                return { success: false, message: 'Transit filtering could not resolve any clinic addresses. Search without the transit filter or check the clinic names.' };
+            }
+            if (unresolvedClinics.length > 0) {
+                console.warn(`[LuxMed] Transit filter skipped unresolved clinics: ${unresolvedClinics.join(', ')}`);
             }
         }
 
-        lastSearchResults.set(args.userId, { terms: filteredTerms, cityId });
+        const context = searchContext({ cityId, serviceId: args.service_id, clinicId: args.clinic_id, doctorId: args.doctor_id, dateFrom, dateTo, timeFrom, timeTo, maxTransitMinutes });
+        lastSearchResults.set(args.userId, { terms: filteredTerms, cityId, context, expiresAt: Date.now() + 5 * 60 * 1000 });
 
         if (filteredTerms.length === 0) {
-            const transitNote = args.max_transit_minutes ? ` within ${args.max_transit_minutes} min transit` : '';
+            const transitNote = maxTransitMinutes != null ? ` within ${maxTransitMinutes} min transit` : '';
             return { success: true, message: `No available slots found${transitNote}.`, slots: [] };
         }
 
         const summary = filteredTerms.slice(0, 10).map((t, i) => {
             const base = formatTerm(t, i);
-            const tt = transitTimes.get(t.term.clinic);
+            const tt = transitTimes.get(t.term.clinic || 'Unknown clinic');
             return tt != null ? `${base} [${tt} min]` : base;
         }).join('\n');
 
@@ -202,14 +280,20 @@ export const LuxmedSearchSlots: Tool = {
             totalSlots: filteredTerms.length,
             slots: filteredTerms.slice(0, 10).map(t => ({
                 dateTime: t.term.dateTimeFrom.dateTimeLocal || t.term.dateTimeFrom.dateTimeTz,
-                doctor: `${t.term.doctor.academicTitle} ${t.term.doctor.firstName} ${t.term.doctor.lastName}`.trim(),
-                clinic: t.term.clinic,
+                doctor: [t.term.doctor.academicTitle, t.term.doctor.firstName, t.term.doctor.lastName].filter(Boolean).join(' ') || 'Unknown doctor',
+                clinic: t.term.clinic || 'Unknown clinic',
                 isTelemedicine: t.term.isTelemedicine,
-                transitMinutes: transitTimes.get(t.term.clinic),
+                transitMinutes: transitTimes.get(t.term.clinic || 'Unknown clinic'),
             })),
         };
     },
 };
+
+function formatLocalDateTime(date: Date): string {
+    const pad = (value: number) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+        + `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
 
 export const LuxmedBookSlot: Tool = {
     name: 'LuxmedBookSlot',
@@ -228,6 +312,10 @@ export const LuxmedBookSlot: Tool = {
         if (!cached || cached.terms.length === 0) {
             return { success: false, message: 'No search results available. Use LuxmedSearchSlots first.' };
         }
+        if (cached.expiresAt <= Date.now()) {
+            lastSearchResults.delete(args.userId);
+            return { success: false, message: 'Search results expired. Search again before booking.' };
+        }
         const idx = args.slot_index - 1;
         if (idx < 0 || idx >= cached.terms.length) {
             return { success: false, message: `Invalid slot index. Choose between 1 and ${cached.terms.length}.` };
@@ -236,15 +324,15 @@ export const LuxmedBookSlot: Tool = {
         const term = cached.terms[idx];
         const rebookIfExists = args.rebook_if_exists === 'true';
         const t = term.term;
-        const doctor = `${t.doctor.academicTitle} ${t.doctor.firstName} ${t.doctor.lastName}`.trim();
+        const doctor = [t.doctor.academicTitle, t.doctor.firstName, t.doctor.lastName].filter(Boolean).join(' ') || 'Unknown doctor';
         const dt = t.dateTimeFrom.dateTimeLocal || t.dateTimeFrom.dateTimeTz;
-        console.log(`[LuxMed] Booking slot #${args.slot_index}: ${dt}, ${doctor}, ${t.clinic} (rebook=${rebookIfExists})`);
+        console.log(`[LuxMed] Booking slot #${args.slot_index}: ${dt}, ${doctor}, ${t.clinic || 'Unknown clinic'} (rebook=${rebookIfExists})`);
         await luxmedBookSlot(accountId, term, cached.cityId, rebookIfExists);
         console.log(`[LuxMed] Booking successful!`);
 
         return {
             success: true,
-            message: `Appointment booked: ${dt}, ${doctor}, ${t.clinic}`,
+            message: `Appointment booked: ${dt}, ${doctor}, ${t.clinic || 'Unknown clinic'}`,
         };
     },
 };
@@ -284,10 +372,10 @@ export const LuxmedMyBookings: Tool = {
             message: `${events.length} upcoming appointment(s)`,
             bookings: events.map(e => ({
                 date: e.date,
-                doctor: e.doctor ? `${e.doctor.academicTitle || ''} ${e.doctor.firstName} ${e.doctor.lastName}`.trim() : 'Unknown',
-                facility: e.facilityName,
-                service: e.serviceVariantName,
-                reservationId: e.reservationId,
+                doctor: e.doctor ? [e.doctor.name, e.doctor.lastname].filter(Boolean).join(' ') || 'Unknown doctor' : 'Unknown doctor',
+                facility: e.clinic ? [e.clinic.city, e.clinic.address].filter(Boolean).join(', ') || 'Unknown clinic' : 'Telemedicine',
+                service: e.title,
+                reservationId: e.eventId,
             })),
         };
     },
@@ -337,6 +425,15 @@ export const LuxmedSetPreferences: Tool = {
         },
     },
     execute: async (args: { userId: number } & Partial<LuxmedPreferences> & { default_city_id?: number; default_city_name?: string; preferred_time_from?: string; preferred_time_to?: string; home_lat?: number; home_lng?: number; max_transit_minutes?: number }) => {
+        if ((args.home_lat == null) !== (args.home_lng == null)) {
+            return { success: false, message: 'Provide both home_lat and home_lng, or use SaveAddress with the full home address.' };
+        }
+        if (args.home_lat != null && args.home_lng != null) {
+            saveUserAddress(args.userId, 'home', `${args.home_lat}, ${args.home_lng}`, args.home_lat, args.home_lng);
+        }
+        if (args.max_transit_minutes != null && (!Number.isFinite(args.max_transit_minutes) || args.max_transit_minutes < 0)) {
+            return { success: false, message: 'max_transit_minutes must be a finite non-negative number.' };
+        }
         const prefs: LuxmedPreferences = {
             defaultCityId: args.default_city_id,
             defaultCityName: textify(args.default_city_name),
@@ -368,12 +465,13 @@ export const LuxmedMonitorSlot: Tool = {
             date_to: { type: 'string', description: 'End of date range (ISO)' },
             time_from: { type: 'string', description: 'Earliest time, e.g. "10:00"' },
             time_to: { type: 'string', description: 'Latest time, e.g. "14:00"' },
+            max_transit_minutes: { type: 'number', description: 'Maximum transit time from saved home in minutes. Omit to use the saved preference.' },
             autobook: { type: 'string', description: 'Auto-book first matching slot? "true" or "false". Default "true".' },
             rebook_if_exists: { type: 'string', description: 'Replace existing booking with better slot? "true" or "false". Default "false".' },
         },
         required: ['service_id', 'service_name', 'date_from', 'date_to', 'time_from', 'time_to'],
     },
-    execute: async (args: { userId: number; service_id: number; service_name: string; city_id?: number; city_name?: string; clinic_ids?: string; doctor_ids?: string; english_only?: string; date_from: string; date_to: string; time_from: string; time_to: string; autobook?: string; rebook_if_exists?: string }) => {
+    execute: async (args: { userId: number; service_id: number; service_name: string; city_id?: number; city_name?: string; clinic_ids?: string; doctor_ids?: string; english_only?: string; date_from: string; date_to: string; time_from: string; time_to: string; max_transit_minutes?: number; autobook?: string; rebook_if_exists?: string }) => {
         const accountId = requireAccount(args.userId);
         const prefs = getLuxmedPreferences(args.userId);
         const cityId = args.city_id || prefs.defaultCityId;
@@ -385,6 +483,15 @@ export const LuxmedMonitorSlot: Tool = {
         const doctorIds = args.doctor_ids ? args.doctor_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
 
         const serviceName = textify(args.service_name);
+        const parsedDateFrom = new Date(args.date_from);
+        const parsedDateTo = new Date(args.date_to);
+        if (Number.isNaN(parsedDateFrom.getTime()) || Number.isNaN(parsedDateTo.getTime()) || parsedDateTo < parsedDateFrom) {
+            return { success: false, message: 'date_from and date_to must be valid dates, with date_to on or after date_from.' };
+        }
+        const maxTransitMinutes = args.max_transit_minutes ?? prefs.maxTransitMinutes;
+        if (maxTransitMinutes != null && (!Number.isFinite(maxTransitMinutes) || maxTransitMinutes < 0)) {
+            return { success: false, message: 'max_transit_minutes must be a finite non-negative number.' };
+        }
         const cityName = textify(args.city_name) || prefs.defaultCityName || 'Unknown';
 
         console.log(`[LuxMed] Creating monitoring: ${serviceName}, city=${cityId}, time=${args.time_from}-${args.time_to}, clinics=${clinicIds?.join(',') ?? 'any'}, doctors=${doctorIds?.join(',') ?? 'any'}, english=${args.english_only === 'true'}, autobook=${args.autobook !== 'false'}`);
@@ -405,6 +512,7 @@ export const LuxmedMonitorSlot: Tool = {
             timeTo: args.time_to,
             autobook: args.autobook !== 'false',
             rebookIfExists: args.rebook_if_exists === 'true',
+            maxTransitMinutes,
         });
 
         const filters = [];

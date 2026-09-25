@@ -38,6 +38,37 @@ export const SaveAddress: Tool = {
             return { success: false, message: `Could not find location: "${rawAddress}". Try a more specific address.` };
         }
 
+        const requested = rawAddress.toLocaleLowerCase('pl-PL');
+        const resolved = place.formattedAddress.toLocaleLowerCase('pl-PL');
+        const requestedNumber = requested.match(/(?:^|\s)(\d+[a-z]?)\b/);
+        if (requestedNumber) {
+            const exactNumber = requestedNumber[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const numberPattern = new RegExp(`(?:^|[^\\d])${exactNumber}(?=$|[^\\d])`);
+            if (!numberPattern.test(resolved)) {
+                return {
+                    success: false,
+                    message: `Google resolved "${rawAddress}" to "${place.formattedAddress}". Please confirm the building number and try again.`,
+                };
+            }
+        }
+        const requestedStreet = requested
+            .split(',')[0]
+            .replace(/\b\d+[a-z]?\b/, '')
+            .replace(/^\s*(ul\.?|al\.?|aleja|plac|pl\.?)\s+/i, '')
+            .trim();
+        if (requestedStreet && !resolved.includes(requestedStreet)) {
+            return {
+                success: false,
+                message: `Google resolved "${rawAddress}" to "${place.formattedAddress}". Please confirm the street and try again.`,
+            };
+        }
+        if (requested.includes('warszaw') && !resolved.includes('warszaw')) {
+            return {
+                success: false,
+                message: `Google resolved "${rawAddress}" outside Warszawa as "${place.formattedAddress}". Please provide the city explicitly.`,
+            };
+        }
+
         saveUserAddress(args.userId, label, place.formattedAddress, place.lat, place.lng);
         console.log(`[Address] Saved "${label}" for user ${args.userId}: ${place.formattedAddress} (${place.lat}, ${place.lng})`);
         return { success: true, message: `Address "${label}" saved: ${place.formattedAddress}` };
