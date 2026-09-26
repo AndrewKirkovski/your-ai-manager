@@ -3,8 +3,17 @@
  * All LuxMed portal operations go through this adapter.
  */
 
+import { createHmac } from 'node:crypto';
+
 const SIDECAR_URL = process.env.LUXMED_SIDECAR_URL || 'http://localhost:8080';
-const SIDECAR_SECRET = process.env.LUXMED_SIDECAR_SECRET || '';
+// Watchtower retains the old container environment. Both containers already
+// have this encryption secret under their respective Compose variable names.
+// Derive a separate REST key without transmitting the encryption secret.
+const SIDECAR_SECRET = process.env.LUXMED_SIDECAR_SECRET || (
+    process.env.LUXMED_SECURITY_SECRET
+        ? createHmac('sha256', process.env.LUXMED_SECURITY_SECRET).update('luxmed-rest-auth-v1').digest('hex')
+        : ''
+);
 
 interface ApiResponse<T> {
     success: boolean;

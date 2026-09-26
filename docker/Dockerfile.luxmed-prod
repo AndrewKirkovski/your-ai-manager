@@ -7,10 +7,8 @@ RUN ln -fs /usr/share/zoneinfo/Europe/Warsaw /etc/localtime && dpkg-reconfigure 
 
 RUN mkdir -p /app
 COPY luxmed-bot/server/build/libs/server.jar /app/server.jar
+COPY docker/luxmed-entrypoint.sh /app/luxmed-entrypoint.sh
 
 EXPOSE 8080
 
-CMD echo "Waiting for database on ${DB_HOST:-localhost}:${DB_PORT:-5432}..." && \
-    while ! nc -z ${DB_HOST:-localhost} ${DB_PORT:-5432}; do sleep 2; done && \
-    echo "Database ready, starting LuxMed sidecar..." && \
-    cd /app && java -Xmx128m -jar server.jar
+CMD ["sh", "/app/luxmed-entrypoint.sh"]
