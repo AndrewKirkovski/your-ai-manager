@@ -8,6 +8,11 @@ import db from './database';
 
 const API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
 const BASE = 'https://maps.googleapis.com/maps/api';
+const MAPS_REQUEST_TIMEOUT_MS = 15000;
+
+function mapsFetch(url: string): Promise<Response> {
+    return fetch(url, { signal: AbortSignal.timeout(MAPS_REQUEST_TIMEOUT_MS) });
+}
 
 function requireApiKey(): void {
     if (!API_KEY) throw new Error('GOOGLE_MAPS_API_KEY not configured');
@@ -60,7 +65,7 @@ export async function geocode(query: string): Promise<GeocodedPlace | null> {
     const url = `${BASE}/geocode/json?address=${encodeURIComponent(query)}&key=${API_KEY}&language=pl`;
     console.log(`[Maps] Geocoding: "${query}"`);
 
-    const res = await fetch(url);
+    const res = await mapsFetch(url);
     const data = await res.json() as any;
 
     if (data.status !== 'OK' || !data.results?.[0]) {
@@ -145,7 +150,7 @@ export async function getDirections(
     }
 
     console.log(`[Maps] Directions: ${mode} from ${originStr} to ${destStr}`);
-    const res = await fetch(url);
+    const res = await mapsFetch(url);
     const data = await res.json() as any;
 
     if (data.status !== 'OK' || !data.routes?.[0]) {
@@ -227,7 +232,7 @@ export async function getDirectionsMulti(
     }
 
     console.log(`[Maps] Directions multi: ${mode} from ${originStr} to ${destStr} (alternatives=${opts.alternatives !== false})`);
-    const res = await fetch(url);
+    const res = await mapsFetch(url);
     const data = await res.json() as any;
 
     if (data.status !== 'OK' || !data.routes?.length) {
@@ -311,6 +316,7 @@ export async function getDistanceMatrix(
 
     // Batch destinations in groups of 25 (Google API limit)
     const allResults: DistanceMatrixEntry[] = [];
+    let complete = true;
     for (let offset = 0; offset < destinations.length; offset += DISTANCE_MATRIX_BATCH_SIZE) {
         const batch = destinations.slice(offset, offset + DISTANCE_MATRIX_BATCH_SIZE);
         const batchDestStr = batch.map(d => `${d.lat},${d.lng}`).join('|');
@@ -323,11 +329,12 @@ export async function getDistanceMatrix(
         }
         console.log(`[Maps] Distance Matrix: batch ${Math.floor(offset / DISTANCE_MATRIX_BATCH_SIZE) + 1}, ${batch.length} destinations (${mode})`);
 
-        const res = await fetch(url);
+        const res = await mapsFetch(url);
         const data = await res.json() as any;
 
         if (data.status !== 'OK' || !data.rows?.[0]) {
             console.log(`[Maps] Distance Matrix batch failed: ${data.status}`);
+            complete = false;
             continue;
         }
 
@@ -344,7 +351,7 @@ export async function getDistanceMatrix(
         }
     }
 
-    cacheSet(cacheKey, allResults, DISTANCE_MATRIX_TTL);
+    if (complete) cacheSet(cacheKey, allResults, DISTANCE_MATRIX_TTL);
     return allResults;
 }
 
@@ -382,7 +389,7 @@ export async function getWeatherForecast(lat: number, lng: number, time: Date): 
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&hourly=temperature_2m,apparent_temperature,weather_code,precipitation,wind_speed_10m&start_date=${date}&end_date=${date}&timezone=Europe/Warsaw`;
 
     console.log(`[Weather] Forecast for ${lat},${lng} at ${date} ${hour}:00 Warsaw`);
-    const res = await fetch(url);
+    const res = await mapsFetch(url);
     if (!res.ok) return null;
 
     const data = await res.json() as any;

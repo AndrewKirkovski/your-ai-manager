@@ -111,20 +111,20 @@ db.prepare(
 }
 
 {
-    type ClinicRow = { id: number; name: string; lat: number | null; lng: number | null; geocoded_at: string | null };
+    type ClinicRow = { id: number; name: string; city_id: number | null; lat: number | null; lng: number | null; geocoded_at: string | null };
     const mixedClinics = db.prepare(
-        `SELECT id, name, lat, lng, geocoded_at FROM luxmed_clinics WHERE name != lower(name)`
+        `SELECT id, name, city_id, lat, lng, geocoded_at FROM luxmed_clinics WHERE name != lower(name)`
     ).all() as ClinicRow[];
     if (mixedClinics.length > 0) {
         console.log(`[migrate] Normalizing ${mixedClinics.length} mixed-case clinic names`);
         // Conflict resolution: prefer row with geocoded coords; else the more-recent `geocoded_at`.
-        const findByName = db.prepare(`SELECT id, lat, lng, geocoded_at FROM luxmed_clinics WHERE name = ?`);
+        const findByName = db.prepare(`SELECT id, lat, lng, geocoded_at FROM luxmed_clinics WHERE name = ? AND city_id IS ?`);
         const del = db.prepare(`DELETE FROM luxmed_clinics WHERE id = ?`);
         const update = db.prepare(`UPDATE luxmed_clinics SET name = ? WHERE id = ?`);
         const migrate = db.transaction((rows: ClinicRow[]) => {
             for (const r of rows) {
                 const lower = r.name.toLowerCase().trim();
-                const existing = findByName.get(lower) as { id: number; lat: number | null; lng: number | null; geocoded_at: string | null } | undefined;
+                const existing = findByName.get(lower, r.city_id) as { id: number; lat: number | null; lng: number | null; geocoded_at: string | null } | undefined;
                 if (!existing) {
                     update.run(lower, r.id);
                     continue;

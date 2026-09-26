@@ -29,6 +29,7 @@ const englishDoctorCache = new Map<string, Set<number>>();
 
 // Track monitorings that already notified about auto-book failure (avoid spam every 10 min)
 const autobookFailureNotified = new Set<string>();
+const sidecarFailureNotified = new Set<string>();
 
 async function getEnglishDoctorIds(accountId: number, cityId: number, serviceId: number): Promise<Set<number> | null> {
     const key = `${accountId}:${cityId}:${serviceId}`;
@@ -184,6 +185,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
     if (Number.isNaN(dateTo.getTime()) || dateTo < now) {
         deactivateLuxmedMonitoring(config.id, config.userId);
         autobookFailureNotified.delete(config.id);
+        sidecarFailureNotified.delete(config.id);
         if (botInstance) {
             safeSend(botInstance, config.userId,
                 `⏰ LuxMed мониторинг "${config.serviceName}" истёк (период до ${config.dateTo}). Деактивирован.`
@@ -204,6 +206,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
         });
 
         updateLuxmedMonitoringLastCheck(config.id);
+        sidecarFailureNotified.delete(config.id);
         console.log(`[LuxMed Monitor] ${config.id}: ${terms.length} raw slots for "${config.serviceName}"`);
 
         if (terms.length === 0) return;
@@ -274,16 +277,24 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
         console.error(`[LuxMed Monitor] ${config.id}: Error checking "${config.serviceName}": ${errMsg}`);
         // If auth error, notify user and deactivate
         const sidecarFailure = err instanceof LuxmedApiError && ['CLIENT_OUTDATED', 'SIDECAR_UNAVAILABLE', 'SIDECAR_TIMEOUT', 'SIDECAR_INVALID_RESPONSE'].includes(err.code);
-        if (sidecarFailure || errMsg.includes('Invalid login') || errMsg.includes('password')) {
+        const confirmedIncompatibility = err instanceof LuxmedApiError && err.code === 'CLIENT_OUTDATED';
+        const authFailure = errMsg.includes('Invalid login') || errMsg.includes('password');
+        if (confirmedIncompatibility || authFailure) {
             deactivateLuxmedMonitoring(config.id, config.userId);
             autobookFailureNotified.delete(config.id);
+            sidecarFailureNotified.delete(config.id);
             if (botInstance) {
                 safeSend(botInstance, config.userId,
-                    sidecarFailure
-                        ? `❌ LuxMed: Сервис несовместим или недоступен. Мониторинг "${config.serviceName}" деактивирован; обнови sidecar и запусти мониторинг заново.`
+                    confirmedIncompatibility
+                        ? `❌ LuxMed: Версия клиента устарела. Мониторинг "${config.serviceName}" деактивирован; обнови sidecar и запусти мониторинг заново.`
                         : `❌ LuxMed: Ошибка авторизации. Мониторинг "${config.serviceName}" деактивирован. Обнови логин/пароль.`
                 ).catch(err => console.error(`[LuxMed Monitor] ${config.id}: notification send failed:`, err instanceof Error ? err.message : err));
             }
+        } else if (sidecarFailure && botInstance && !sidecarFailureNotified.has(config.id)) {
+            sidecarFailureNotified.add(config.id);
+            safeSend(botInstance, config.userId,
+                `⚠️ LuxMed: sidecar временно недоступен. Мониторинг "${config.serviceName}" останется активным и повторит попытку.`
+            ).catch(notificationError => console.error(`[LuxMed Monitor] ${config.id}: notification send failed:`, notificationError instanceof Error ? notificationError.message : notificationError));
         }
     }
 }

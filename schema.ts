@@ -6,6 +6,30 @@ import type Database from 'better-sqlite3';
  * before CREATE INDEX statements that reference the new columns. Called by
  * database.ts on bot startup. */
 export function applyColumnMigrations(db: Database.Database): void {
+    // luxmed_clinics: the cache is scoped by normalized clinic name and city
+    // (added 2026-09-26). SQLite cannot drop the old table-level UNIQUE(name)
+    // constraint in place, so rebuild this small cache table once.
+    {
+        const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'luxmed_clinics'").get() as { sql: string } | undefined;
+        if (table?.sql && /name\s+TEXT\s+NOT NULL\s+UNIQUE/i.test(table.sql)) {
+            const migrate = db.transaction(() => {
+                db.exec('ALTER TABLE luxmed_clinics RENAME TO luxmed_clinics_legacy');
+                db.exec(`CREATE TABLE luxmed_clinics (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL,
+                    address     TEXT,
+                    lat         REAL,
+                    lng         REAL,
+                    city_id     INTEGER,
+                    geocoded_at TEXT
+                )`);
+                db.exec(`INSERT INTO luxmed_clinics (id, name, address, lat, lng, city_id, geocoded_at)
+                    SELECT id, name, address, lat, lng, city_id, geocoded_at FROM luxmed_clinics_legacy`);
+                db.exec('DROP TABLE luxmed_clinics_legacy');
+            });
+            migrate();
+        }
+    }
     // sticker_cache: short_tag + used_count (added 2026-04-24)
     {
         const cols = db.prepare('PRAGMA table_info(sticker_cache)').all() as { name: string }[];
@@ -143,7 +167,7 @@ export const SCHEMA_SQL = `
 
     CREATE TABLE IF NOT EXISTS luxmed_clinics (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        name        TEXT NOT NULL UNIQUE,
+        name        TEXT NOT NULL,
         address     TEXT,
         lat         REAL,
         lng         REAL,
@@ -234,7 +258,7 @@ export const INDEXES_SQL = `
     CREATE INDEX IF NOT EXISTS idx_stats_user_name_ts ON stat_entries(user_id, name, timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_luxmed_monitorings_active ON luxmed_monitorings(active, user_id);
     CREATE INDEX IF NOT EXISTS idx_user_addresses_user ON user_addresses(user_id);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_clinics_name ON luxmed_clinics(name);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_clinics_name_city ON luxmed_clinics(name, city_id);
     CREATE INDEX IF NOT EXISTS idx_sticker_cache_kind ON sticker_cache(kind);
     CREATE INDEX IF NOT EXISTS idx_sticker_cache_set_name ON sticker_cache(set_name);
     CREATE INDEX IF NOT EXISTS idx_sticker_cache_used_count ON sticker_cache(used_count DESC);

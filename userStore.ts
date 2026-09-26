@@ -362,7 +362,7 @@ const stmts = {
 
     // LuxMed Clinics
     upsertClinic: db.prepare(`INSERT INTO luxmed_clinics (name, address, lat, lng, city_id, geocoded_at) VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(name) DO UPDATE SET address = excluded.address, lat = excluded.lat, lng = excluded.lng, city_id = excluded.city_id, geocoded_at = excluded.geocoded_at`),
+        ON CONFLICT(name, city_id) DO UPDATE SET address = excluded.address, lat = excluded.lat, lng = excluded.lng, geocoded_at = excluded.geocoded_at`),
     getClinic: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE id = ?'),
     getClinicsByCity: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE city_id = ?'),
     getClinicByName: db.prepare<[string], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE name = ?'),
@@ -1442,8 +1442,8 @@ export function getActiveLuxmedMonitoringsByUser(userId: number): LuxmedMonitori
     return stmts.getActiveLuxmedMonitoringsByUser.all(userId).map(rowToMonitoringConfig);
 }
 
-export function deactivateLuxmedMonitoring(id: string, userId: number): void {
-    stmts.deactivateLuxmedMonitoring.run(id, userId);
+export function deactivateLuxmedMonitoring(id: string, userId: number): boolean {
+    return stmts.deactivateLuxmedMonitoring.run(id, userId).changes > 0;
 }
 
 export function updateLuxmedMonitoringLastCheck(id: string): void {

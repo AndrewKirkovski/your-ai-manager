@@ -316,6 +316,9 @@ export const LuxmedBookSlot: Tool = {
             lastSearchResults.delete(args.userId);
             return { success: false, message: 'Search results expired. Search again before booking.' };
         }
+        if (!Number.isFinite(args.slot_index) || !Number.isInteger(args.slot_index)) {
+            return { success: false, message: 'slot_index must be a whole number.' };
+        }
         const idx = args.slot_index - 1;
         if (idx < 0 || idx >= cached.terms.length) {
             return { success: false, message: `Invalid slot index. Choose between 1 and ${cached.terms.length}.` };
@@ -349,6 +352,13 @@ export const LuxmedCancelBooking: Tool = {
     },
     execute: async (args: { userId: number; reservation_id: number }) => {
         const accountId = requireAccount(args.userId);
+        if (!Number.isInteger(args.reservation_id) || args.reservation_id <= 0) {
+            return { success: false, message: 'reservation_id must be a positive whole number.' };
+        }
+        const bookings = await luxmedGetReserved(accountId);
+        if (!bookings.some(booking => booking.eventId === args.reservation_id)) {
+            return { success: false, message: `Reservation ${args.reservation_id} was not found among your upcoming appointments.` };
+        }
         await luxmedCancelVisit(accountId, args.reservation_id);
         return { success: true, message: `Appointment ${args.reservation_id} cancelled.` };
     },
@@ -428,11 +438,11 @@ export const LuxmedSetPreferences: Tool = {
         if ((args.home_lat == null) !== (args.home_lng == null)) {
             return { success: false, message: 'Provide both home_lat and home_lng, or use SaveAddress with the full home address.' };
         }
-        if (args.home_lat != null && args.home_lng != null) {
-            saveUserAddress(args.userId, 'home', `${args.home_lat}, ${args.home_lng}`, args.home_lat, args.home_lng);
-        }
         if (args.max_transit_minutes != null && (!Number.isFinite(args.max_transit_minutes) || args.max_transit_minutes < 0)) {
             return { success: false, message: 'max_transit_minutes must be a finite non-negative number.' };
+        }
+        if (args.home_lat != null && args.home_lng != null) {
+            saveUserAddress(args.userId, 'home', `${args.home_lat}, ${args.home_lng}`, args.home_lat, args.home_lng);
         }
         const prefs: LuxmedPreferences = {
             defaultCityId: args.default_city_id,
@@ -478,6 +488,8 @@ export const LuxmedMonitorSlot: Tool = {
         if (!cityId) {
             return { success: false, message: 'City not specified and no default city set.' };
         }
+        const serviceError = await validateServiceId(accountId, args.service_id);
+        if (serviceError) return { success: false, message: serviceError };
 
         const clinicIds = args.clinic_ids ? args.clinic_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
         const doctorIds = args.doctor_ids ? args.doctor_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
@@ -539,7 +551,9 @@ export const LuxmedStopMonitoring: Tool = {
         required: ['monitoring_id'],
     },
     execute: async (args: { userId: number; monitoring_id: string }) => {
-        deactivateLuxmedMonitoring(args.monitoring_id, args.userId);
+        if (!deactivateLuxmedMonitoring(args.monitoring_id, args.userId)) {
+            return { success: false, message: `Active monitoring ${args.monitoring_id} was not found.` };
+        }
         return { success: true, message: `Monitoring ${args.monitoring_id} stopped.` };
     },
 };

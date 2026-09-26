@@ -191,10 +191,15 @@ export async function luxmedSearchSlots(accountId: number, params: {
     timeFrom: string;
     timeTo: string;
 }): Promise<LuxmedTerm[]> {
-    const from = parseSearchDate(params.dateFrom);
-    const to = parseSearchDate(params.dateTo);
+    const normalizedParams = {
+        ...params,
+        dateFrom: normalizeSearchDate(params.dateFrom),
+        dateTo: normalizeSearchDate(params.dateTo),
+    };
+    const from = parseSearchDate(normalizedParams.dateFrom);
+    const to = parseSearchDate(normalizedParams.dateTo);
     if (!from || !to || to <= from || to - from <= SEARCH_WINDOW_MS) {
-        return sidecarRequest<LuxmedTerm[]>('POST', `/api/v1/accounts/${accountId}/terms/search`, params);
+        return sidecarRequest<LuxmedTerm[]>('POST', `/api/v1/accounts/${accountId}/terms/search`, normalizedParams);
     }
 
     const results: LuxmedTerm[] = [];
@@ -202,7 +207,7 @@ export async function luxmedSearchSlots(accountId: number, params: {
     while (cursor < to) {
         const windowEnd = Math.min(to, cursor + SEARCH_WINDOW_MS);
         const windowParams = {
-            ...params,
+            ...normalizedParams,
             dateFrom: formatSearchDate(cursor),
             dateTo: formatSearchDate(windowEnd),
         };
@@ -245,6 +250,12 @@ function parseSearchDate(value: string): number | null {
 
 function formatSearchDate(timestamp: number): string {
     return new Date(timestamp).toISOString().slice(0, 19);
+}
+
+function normalizeSearchDate(value: string): string {
+    if (!/[zZ]|[+-]\d{2}:?\d{2}$/.test(value)) return value;
+    const parsed = parseSearchDate(value);
+    return parsed == null ? value : formatSearchDate(parsed);
 }
 
 function termTimestamp(term: LuxmedTerm): number {
