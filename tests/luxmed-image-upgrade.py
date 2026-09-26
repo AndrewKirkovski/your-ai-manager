@@ -17,6 +17,7 @@ NETWORK = PREFIX
 DB = PREFIX + '-db'
 SIDECAR = PREFIX + '-sidecar'
 VOLUME = PREFIX + '-postgres'
+BOT_VOLUME = PREFIX + '-sqlite'
 TAG = PREFIX + ':sidecar'
 ROOT = Path(__file__).resolve().parents[1]
 ENCRYPTION_SECRET = secrets.token_hex(32)
@@ -70,6 +71,14 @@ def client(secret=None, expected_failure=False):
 try:
     docker('network', 'create', NETWORK)
     docker('volume', 'create', VOLUME)
+    docker('volume', 'create', BOT_VOLUME)
+    legacy_bot = os.environ['LEGACY_BOT_IMAGE']
+    docker('pull', legacy_bot)
+    for bot_image, seed in [(legacy_bot, 'true'), (BOT_IMAGE, 'false'), (BOT_IMAGE, 'false')]:
+        result = docker('run', '--rm', '--network', 'none', '-e', f'SEED_LEGACY={seed}',
+                        '-v', f'{BOT_VOLUME}:/app/data', '-v', f'{ROOT / "tests"}:/app/tests:ro',
+                        bot_image, 'node', '--import', 'tsx', '/app/tests/luxmed-bot-upgrade-state.ts')
+        print(result.stdout, flush=True)
     docker('run', '-d', '--name', DB, '--network', NETWORK, '--network-alias', 'luxmed-db',
            '-e', 'POSTGRES_USER=lbs', '-e', 'POSTGRES_PASSWORD=lsb123', '-e', 'POSTGRES_DB=lbs',
            '-v', f'{VOLUME}:/var/lib/postgresql/data', 'postgres:10.6')
@@ -93,7 +102,8 @@ try:
     docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-v', 'ON_ERROR_STOP=1', '-c',
            "INSERT INTO credentials (account_id, user_id, username, password) VALUES (424242,424242,'fixture-user','fixture-ciphertext');")
     old_db_id = docker('inspect', '--format', '{{.Id}}', DB).stdout.strip()
-    original_env = docker('inspect', '--format', '{{json .Config.Env}}', SIDECAR).stdout
+    original_env = dict(item.split('=', 1) for item in json.loads(
+        docker('inspect', '--format', '{{json .Config.Env}}', SIDECAR).stdout))
 
     # Exercise Watchtower itself, including CMD adoption and environment reuse.
     docker('tag', NEW_IMAGE, TAG)
@@ -103,10 +113,16 @@ try:
     print(result.stdout + result.stderr, flush=True)
     expected_id = docker('image', 'inspect', '--format', '{{.Id}}', NEW_IMAGE).stdout.strip()
     assert docker('inspect', '--format', '{{.Image}}', SIDECAR).stdout.strip() == expected_id
-    assert docker('inspect', '--format', '{{json .Config.Env}}', SIDECAR).stdout == original_env
+    updated_env = dict(item.split('=', 1) for item in json.loads(
+        docker('inspect', '--format', '{{json .Config.Env}}', SIDECAR).stdout))
+    for key in ('DB_HOST', 'DB_PORT', 'SERVER_PORT', 'TELEGRAM_ENABLED', 'SECURITY_SECRET', 'MONITORING_WEBHOOK_URL'):
+        assert updated_env[key] == original_env[key], f'Configured variable changed: {key}'
+    for key in ('REST_SECRET', 'DB_PASSWORD', 'DB_USER', 'DB_NAME'):
+        assert key not in updated_env, f'New configuration was unexpectedly injected: {key}'
     wait_health()
     client()
     client('incorrect-key', expected_failure=True)
+    client(ENCRYPTION_SECRET, expected_failure=True)
     assert docker('inspect', '--format', '{{.Id}}', DB).stdout.strip() == old_db_id
     assert docker('exec', DB, 'cat', '/var/lib/postgresql/data/PG_VERSION').stdout.strip() == '10'
     row = docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-Atc',
@@ -127,4 +143,5 @@ finally:
     for container in (SIDECAR, DB):
         docker('rm', '-f', container, check=False)
     docker('volume', 'rm', VOLUME, check=False)
+    docker('volume', 'rm', BOT_VOLUME, check=False)
     docker('network', 'rm', NETWORK, check=False)

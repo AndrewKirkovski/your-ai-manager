@@ -79,6 +79,7 @@ jobs:
       - name: Rehearse unattended upgrade from deployed configuration
         env:
           LEGACY_SIDECAR_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager-luxmed-sidecar:71d61a0
+          LEGACY_BOT_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager:71d61a0
         run: python3 tests/luxmed-image-upgrade.py
 
       - name: Publish tested images
