@@ -1,4 +1,4 @@
-import {ChatCompletionTool} from "openai/src/resources/chat/completions/completions";
+import {ChatCompletionTool} from "openai/resources/chat/completions";
 import {get_current_time} from "./tools.meta";
 import {
     AddTask,
