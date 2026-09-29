@@ -128,13 +128,12 @@ export class SmartBookingCoordinator {
     private attemptAckCapability: { expires: number; value: boolean } | null = null;
     private legacySweepCursor = 0;
     private lastLegacySweep = new Map<number, number>();
-    private warmed = new Set<string>();
     private resolving = new Map<string, Promise<void>>();
     private capability: { expires: number; value: boolean } | null = null;
     private sweepRunning = false;
     private lastTravelReview = new Map<string, number>();
     private reviewedReservationRevisions = new Map<string, string>();
-    private lastBackgroundReservationAttempt = new Map<number, number>();
+    private backgroundReservationNextAttempt = new Map<number, number>();
     private intervalIndex = new Map<string, BusyInterval[]>();
     private candidateScans = new Map<string, { key: string; next: number; cold: number[]; unresolved: number[]; candidates: FeasibleSlot[] }>();
     constructor(readonly store: SmartBookingStore = smartStore, private api: Dependencies = smartDependencies, private configured = smartConfigurationIssue) { }
@@ -329,12 +328,13 @@ export class SmartBookingCoordinator {
         for (const row of rows) {
             let config: LuxmedMonitoringConfig;
             try { config = rowToMonitoringConfig(row); } catch { continue; }
-            if (!this.activeAccount(userId, config.accountId) || !this.activeMonitor(config)) continue;
+            // Unfiltered monitors would warm every saved clinic in the city; prepareClinics warms clinics that appear in results.
+            if (config.clinicIds === null || !this.activeAccount(userId, config.accountId) || !this.activeMonitor(config)) continue;
             const prefix = `clinic:${config.cityId}:`;
             for (const clinic of places.values()) {
                 if (!clinic.id.startsWith(prefix)) continue;
                 const clinicId = Number(clinic.id.slice(prefix.length));
-                if (!Number.isSafeInteger(clinicId) || clinicId <= 0 || config.clinicIds !== null && !config.clinicIds.includes(clinicId)) continue;
+                if (!Number.isSafeInteger(clinicId) || clinicId <= 0 || !config.clinicIds.includes(clinicId)) continue;
                 const binding = this.store.db.prepare(`SELECT source_label FROM luxmed_smart_clinic_bindings
                     WHERE user_id=? AND location_id=? AND place_revision=?`).get(userId, clinic.id, clinic.revision) as { source_label: string } | undefined;
                 if (binding && this.store.clinicVerified(userId, clinic.id, binding.source_label, clinic.revision)) clinics.add(clinic.id);
@@ -371,10 +371,17 @@ export class SmartBookingCoordinator {
         await Promise.all([...coverageByAccount].map(async ([accountId, coverage]) => {
             const now = Date.now();
             if (snapshotUsable(this.store.snapshot(accountId), coverage.from, coverage.to, now, 50000)
-                || now - (this.lastBackgroundReservationAttempt.get(accountId) ?? 0) < 10000) return;
-            this.lastBackgroundReservationAttempt.set(accountId, now);
-            try { await this.refreshReservations(accountId, coverage, false, 50000); }
-            catch { console.warn('[LuxMed smart] Background reservation refresh deferred', { accountId }); }
+                || now < (this.backgroundReservationNextAttempt.get(accountId) ?? 0)) return;
+            this.backgroundReservationNextAttempt.set(accountId, now + 10000);
+            try {
+                await this.refreshReservations(accountId, coverage, false, 50000);
+                this.backgroundReservationNextAttempt.delete(accountId);
+            } catch (error) {
+                const retryAfter = error instanceof LuxmedApiError && Number.isFinite(error.retryAfterMs)
+                    ? error.retryAfterMs! : 0;
+                this.backgroundReservationNextAttempt.set(accountId, Date.now() + Math.max(10000, retryAfter));
+                console.warn('[LuxMed smart] Background reservation refresh deferred', { accountId });
+            }
         }));
     }
     async english(config: LuxmedMonitoringConfig): Promise<Set<number> | undefined> {
@@ -469,9 +476,6 @@ export class SmartBookingCoordinator {
             const places = this.store.places(config.userId);
             for (const originId of new Set([policy.originLocationId, ...commitments.map(c => c.locationId).filter((v): v is string => !!v)])) {
                 const origin = places.get(originId); if (!origin) continue;
-                const warmKey = digest([config.userId, origin.id, origin.revision, place.id, place.revision, DateTime.now().toISODate()]);
-                if (this.warmed.has(warmKey)) continue;
-                this.warmed.add(warmKey);
                 const additional: TravelQuery[] = [];
                 const until = Math.min(zonedTime(config.dateTo), Date.now() + 14 * 86400000);
                 for (const c of commitments.filter(c => c.locationId === originId)) for (const interval of expandRule(c, Date.now(), until)) {

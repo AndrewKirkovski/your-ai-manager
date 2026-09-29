@@ -1370,10 +1370,34 @@ test('active smart monitoring refreshes reservation coverage before it reaches o
     await f.coordinator.refreshActiveReservations([f.config]);
     assert.equal(calls, 1);
     f.store.db.prepare('UPDATE luxmed_reservation_snapshots SET fetched_at=? WHERE account_id=?').run(Date.now() - 51000, 1);
-    (f.coordinator as any).lastBackgroundReservationAttempt.set(1, Date.now() - 11000);
+    (f.coordinator as any).backgroundReservationNextAttempt.delete(1);
     await f.coordinator.refreshActiveReservations([f.config]);
     assert.equal(calls, 2);
     f.store.db.close();
+});
+test('background reservation refresh honors provider Retry-After', async () => {
+    const f = coordinatorFixture(); const { LuxmedApiError } = await import('../luxmedAdapter.ts');
+    const originalNow = Date.now; let clock = originalNow(); let calls = 0;
+    Date.now = () => clock;
+    f.api.reserved = async () => {
+        calls++;
+        if (calls === 1) {
+            const error = new LuxmedApiError('Rate limited', 'RATE_LIMIT', 429);
+            error.retryAfterMs = 60000;
+            throw error;
+        }
+        return [];
+    };
+    try {
+        await f.coordinator.refreshActiveReservations([f.config]);
+        await f.coordinator.refreshActiveReservations([f.config]);
+        clock += 59999;
+        await f.coordinator.refreshActiveReservations([f.config]);
+        assert.equal(calls, 1);
+        clock++;
+        await f.coordinator.refreshActiveReservations([f.config]);
+        assert.equal(calls, 2);
+    } finally { Date.now = originalNow; f.store.db.close(); }
 });
 test('Jev can rank soft preferences but cannot promote another day or a taxi', async () => {
     const a = (await evaluateSlot(slot(), policy, places, [], async q => estimate(q), now))!;
@@ -1671,8 +1695,14 @@ test('a changed route duration warns after booking even when departure and arriv
     f.store.db.close();
 });
 
+function selectFixtureClinics(f: ReturnType<typeof coordinatorFixture>, ids: number[]) {
+    f.config.clinicIds = ids;
+    f.store.db.prepare('UPDATE luxmed_monitorings SET clinic_ids=? WHERE id=?').run(JSON.stringify(ids), 'm1');
+    f.store.db.prepare("UPDATE luxmed_smart_monitors SET confirmed_fingerprint=?,confirmed_clinic_fingerprint=? WHERE monitoring_id='m1'")
+        .run(monitorRulesFingerprint(f.config), digest(f.store.selectedClinicIdentities(1, 1, ids)!));
+}
 test('route preparation warms only verified clinics used by an active smart monitor', () => {
-    const f = coordinatorFixture();
+    const f = coordinatorFixture(); selectFixtureClinics(f, [2]);
     const other = f.store.place(1, 'clinic:2:9', 'Other 9, Kraków', 50, 19);
     f.store.verifyClinic(1, other.id, 'Clinic - Other 9', other.revision);
     const warmed: string[] = [];
@@ -1683,6 +1713,22 @@ test('route preparation warms only verified clinics used by an active smart moni
     warmed.length = 0;
     f.coordinator.warmKnownLocations(1);
     assert.deepEqual(warmed, []);
+    f.store.db.close();
+});
+test('unfiltered monitors skip background route warm-up while filtered monitors warm only selected clinics', () => {
+    const f = coordinatorFixture();
+    const other = f.store.place(1, 'clinic:1:9', 'Zimna 4, Warszawa', 52.3, 21.3);
+    f.store.verifyClinic(1, other.id, 'Other - Zimna 4', other.revision);
+    const cache = new TravelCache('1', f.store.db, true, async q => estimate(q));
+    const routes: string[] = [];
+    cache.refresh = q => { routes.push(q.from.id.startsWith('clinic:') ? q.from.id : q.to.id); return Promise.resolve(null); };
+    f.coordinator.cache = () => cache;
+    f.coordinator.warmKnownLocations(1);
+    assert.equal(routes.length, 0);
+    selectFixtureClinics(f, [2]);
+    f.coordinator.warmKnownLocations(1);
+    assert.equal(routes.filter(id => id === 'clinic:1:2').length, 36);
+    assert.equal(routes.length, 36);
     f.store.db.close();
 });
 
