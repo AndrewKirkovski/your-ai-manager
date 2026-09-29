@@ -161,12 +161,12 @@ export class SmartBookingCoordinator {
             && enrollment.confirmed_fingerprint === monitorRulesFingerprint(current)
             && monitorRulesFingerprint(current) === monitorRulesFingerprint(config);
     }
-    private async providerIdentityIssue(config: LuxmedMonitoringConfig, candidateDoctorId: number): Promise<string | null> {
+    private async providerIdentityIssue(config: LuxmedMonitoringConfig): Promise<string | null> {
         const expected = this.store.enrollment(config.id)?.confirmed_provider_fingerprint;
         if (!expected) return 'The confirmed LuxMed service, city and doctor identities are missing. Request a new preview.';
         const [services, cities, doctors] = await Promise.all([
             this.api.services(config.accountId), this.api.cities(config.accountId),
-            config.doctorIds === null && !config.englishOnly ? Promise.resolve([]) : this.api.doctors(config.accountId, config.cityId, config.serviceId),
+            config.doctorIds === null ? Promise.resolve([]) : this.api.doctors(config.accountId, config.cityId, config.serviceId),
         ]);
         const serviceName = uniqueServiceName(services, config.serviceId);
         const cityName = uniqueCityName(cities, config.cityId);
@@ -177,12 +177,6 @@ export class SmartBookingCoordinator {
             this.store.db.prepare("UPDATE luxmed_smart_monitors SET state='paused',status='LuxMed service, city or doctor identity changed; confirm a new preview' WHERE monitoring_id=? AND state='active' AND confirmed_provider_fingerprint=?")
                 .run(config.id, expected);
             return 'LuxMed changed a selected service, city or doctor. Smart booking is paused until a new preview is confirmed.';
-        }
-        const matchingDoctor = doctors.filter(doctor => doctor?.id === candidateDoctorId);
-        if (config.englishOnly && (matchingDoctor.length !== 1 || matchingDoctor[0].isEnglishSpeaker !== true)) {
-            this.store.db.prepare("UPDATE luxmed_smart_monitors SET state='paused',status='LuxMed doctor language status changed; confirm a new preview' WHERE monitoring_id=? AND state='active' AND confirmed_provider_fingerprint=?")
-                .run(config.id, expected);
-            return 'The selected doctor is not currently verified as English-speaking by LuxMed. Smart booking is paused until a new preview is confirmed.';
         }
         return null;
     }
@@ -646,9 +640,8 @@ export class SmartBookingCoordinator {
                     remaining = remaining.map(value => value === candidate ? rechecked : value);
                     continue;
                 }
-                const term = terms.find(t => slotFromTerm(t, config.cityId).id === candidate.slot.id)!;
                 if (!manual) {
-                    const providerIssue = await this.providerIdentityIssue(config, term.term.doctor.id)
+                    const providerIssue = await this.providerIdentityIssue(config)
                         .catch(() => 'LuxMed provider identities could not be verified. Smart booking is waiting.');
                     if (providerIssue) return { state: 'waiting', message: providerIssue };
                 }
@@ -662,6 +655,7 @@ export class SmartBookingCoordinator {
                     ...this.store.scheduleAppointments(config.userId).map(c => c.locationId)];
                 if (submissionLocations.some(id => !id || !this.store.locationVerified(config.userId, id, submissionPlaces.get(id)?.revision || '')))
                     throw new Error('A travel location changed before submission.');
+                const term = terms.find(t => slotFromTerm(t, config.cityId).id === candidate.slot.id)!;
                 if (!term.term.isTelemedicine && !this.store.clinicVerified(config.userId, candidate.slot.locationId!, term.term.clinic || '',
                     this.store.places(config.userId).get(candidate.slot.locationId!)?.revision || '')) throw new Error('Clinic address changed before submission.');
                 if (!term.term.isTelemedicine && !providerCityMatches(this.cityNames.get(`${config.accountId}:${config.cityId}`)?.name || '',
@@ -867,15 +861,22 @@ export class SmartBookingCoordinator {
             this.lastTravelReview.set(attempt.id, Date.now());
             try {
                 const policy = this.store.policy(attempt.user_id); if (!policy) continue;
-                await this.refreshReservations(attempt.account_id, reservationCoverage(payload.slot.start, payload.slot.end));
                 const currentSnapshot = this.store.snapshot(attempt.account_id);
                 const reservationChanged = !currentSnapshot || currentSnapshot.revision
                     !== (this.reviewedReservationRevisions.get(attempt.id) ?? payload.reservationRevision);
-                const refreshed = await Promise.all(payload.journey.legs.map(l => this.cache(attempt.user_id).refresh(l.query, 1)));
-                // Any newer route must be checked again. Duration and route
-                // details can change even when departure and arrival do not.
+                // Reviews consume facts refreshed by active monitoring or an
+                // address change. A completed booking must not poll Google or
+                // LuxMed every five minutes for weeks until the appointment.
+                const refreshed = payload.journey.legs.map(l => this.cache(attempt.user_id).previous(l.query));
+                const routeChanged = refreshed.some((estimate, i) => {
+                    const booked = payload.journey.legs[i];
+                    return !!estimate && estimate.fetchedAt > booked.fetchedAt
+                        && (estimate.status !== booked.status || estimate.departure !== booked.departure
+                            || estimate.arrival !== booked.arrival || estimate.durationSeconds !== booked.durationSeconds
+                            || estimate.distanceMeters !== booked.distanceMeters);
+                });
                 const changed = policy.revision !== attempt.policy_revision || reservationChanged
-                    || refreshed.some((e, i) => e && e.fetchedAt > payload.journey.legs[i].fetchedAt);
+                    || routeChanged;
                 if (!changed) continue;
                 const existing = (await this.intervals(attempt.user_id, attempt.account_id, payload.cityId)).filter(b => b.id !== `reservation:${attempt.reservation_id}`);
                 const effectivePolicy = { ...policy.policy, commitments: [...policy.policy.commitments, ...this.store.scheduleAppointments(attempt.user_id)] };
