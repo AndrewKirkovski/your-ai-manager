@@ -44,7 +44,11 @@ Set `GOOGLE_ROUTES_CACHE_PERMITTED=true` only after confirming that the applicab
 Google agreement permits the stored travel estimates. Lazy refresh is still
 caching. The [published Routes terms](https://cloud.google.com/maps-platform/terms/maps-service-terms)
 explicitly cover temporary coordinate caching, so permission for duration
-profiles must not be assumed.
+profiles must not be assumed. The published [EEA Routes terms](https://cloud.google.com/terms/maps-platform/eea/maps-service-terms)
+likewise list coordinates, not route durations. Leave this flag unset unless
+the applicable agreement separately permits storing duration and route details
+for this use and retention period. Record that permission in the operator's
+deployment records before enabling it.
 Set `GOOGLE_GEOCODING_CACHE_PERMITTED=true` only after confirming that the
 applicable agreement permits storing the resolved addresses and coordinates for
 the required period. The [published EEA Geocoding terms](https://cloud.google.com/terms/maps-platform/eea/maps-service-terms)
@@ -171,7 +175,8 @@ the operator must inspect the result in LuxMed.
 Smart searches target 30 seconds plus jitter. Requests are serialised per account,
 with bookings ahead of queued searches. Effective polling intervals and decision
 times are logged separately. `pollGapMs` measures time between actual search
-starts, and `searchMs` records the upstream request duration. The portal does not
+starts, `searchMs` records the upstream search duration, and `bookingMs` records
+the bot-to-sidecar booking request, including the LuxMed provider wait. The portal does not
 report when a slot first became available, so the polling gap is the observable
 discovery bound, not a measured publication timestamp. Throttling and failures
 increase the retry interval.

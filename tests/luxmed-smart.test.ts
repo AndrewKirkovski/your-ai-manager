@@ -466,6 +466,23 @@ test('a fresh slot explicitly marked non-English cannot pass an English-only doc
     assert.equal(matchesMonitor(f.term, f.config, new Set([f.term.term.doctor.id])), true);
     f.store.db.close();
 });
+test('a stale English doctor dictionary cannot authorize booking after LuxMed changes language status', async () => {
+    const f = coordinatorFixture();
+    f.config.englishOnly = true;
+    f.store.db.prepare("UPDATE luxmed_monitorings SET english_only=1 WHERE id='m1'").run();
+    f.store.db.prepare("UPDATE luxmed_smart_monitors SET confirmed_fingerprint=? WHERE monitoring_id='m1'")
+        .run(monitorRulesFingerprint(f.config));
+    let english = true;
+    f.api.doctors = async () => [{ id: 3, name: 'Doctor', isEnglishSpeaker: english }];
+    assert.equal((await f.coordinator.english(f.config))?.has(3), true);
+    english = false;
+    const result = await f.coordinator.process(f.config, [f.term]);
+    assert.equal(result.state, 'waiting');
+    assert.match(result.message, /not currently verified as English-speaking/);
+    assert.equal(f.store.enrollment('m1')?.state, 'paused');
+    assert.equal(f.books(), 0);
+    f.store.db.close();
+});
 test('a clinic group ID cannot satisfy an explicit clinic ID restriction', async () => {
     const f = coordinatorFixture();
     f.config.clinicIds = [42];
@@ -1652,6 +1669,38 @@ test('a late travel conflict queues a warning without another booking or cancell
     await f.coordinator.reconcile();
     const messages = f.store.db.prepare('SELECT message FROM luxmed_notification_outbox').all() as { message: string }[];
     assert.ok(messages.some(m => m.message.includes('has not been cancelled'))); assert.equal(f.books(), 1); f.store.db.close();
+});
+
+test('a changed route duration warns after booking even when departure and arrival match', async () => {
+    const f = coordinatorFixture();
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'booked');
+    const row = f.store.db.prepare("SELECT payload FROM luxmed_booking_attempts WHERE state='succeeded'").get() as { payload: string };
+    const original = JSON.parse(row.payload).journey.legs as TravelEstimate[];
+    await new Promise(resolve => setTimeout(resolve, 3));
+    f.coordinator.cache(1).refresh = async q => {
+        const prior = original.find(leg => leg.query.kind === q.kind && leg.query.mode === q.mode)!;
+        return { ...prior, query: q, durationSeconds: 60 * 60, fetchedAt: Date.now(), cached: false };
+    };
+    await f.coordinator.reconcile();
+    const messages = f.store.db.prepare('SELECT message FROM luxmed_notification_outbox').all() as { message: string }[];
+    assert.ok(messages.some(message => message.message.includes('Please review the journey')));
+    assert.equal(f.books(), 1);
+    f.store.db.close();
+});
+
+test('route preparation warms only verified clinics used by an active smart monitor', () => {
+    const f = coordinatorFixture();
+    const other = f.store.place(1, 'clinic:2:9', 'Other 9, Kraków', 50, 19);
+    f.store.verifyClinic(1, other.id, 'Clinic - Other 9', other.revision);
+    const warmed: string[] = [];
+    f.coordinator.cache(1).warm = (from, to) => { warmed.push(`${from.id}->${to.id}`); };
+    f.coordinator.warmKnownLocations(1);
+    assert.deepEqual(warmed, ['home->clinic:1:2']);
+    f.store.db.prepare("UPDATE luxmed_smart_monitors SET state='paused' WHERE monitoring_id='m1'").run();
+    warmed.length = 0;
+    f.coordinator.warmKnownLocations(1);
+    assert.deepEqual(warmed, []);
+    f.store.db.close();
 });
 
 test('a reservation appearing during submission is reported with the successful booking', async () => {

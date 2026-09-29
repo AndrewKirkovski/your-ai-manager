@@ -164,6 +164,8 @@ export function initSmartBookingTools(bot: TelegramBot): void {
                 })();
                 if (!activated) throw new Error('Availability changed during activation. Smart booking remains paused.');
                 activatingMonitorId = null;
+                try { smartBooking.warmKnownLocations(userId); }
+                catch { console.warn('[LuxMed smart] Route preparation deferred after activation'); }
                 await bot.answerCallbackQuery(query.id, { text: 'Availability confirmed. Smart monitoring is active.' }).catch(() => { });
             } catch (error) {
                 const message = error instanceof Error ? error.message : 'Confirmation failed';
@@ -185,7 +187,6 @@ export const LuxmedDraftAvailability: Tool = {
     execute: async ({ userId, policy_json }: { userId: number; policy_json: string }) => {
         requireCurrentConversation(userId);
         const saved = smartStore.draft(userId, JSON.parse(policy_json));
-        smartBooking.warmKnownLocations(userId);
         return { success: true, state: saved.state, summary: availabilitySummary(userId), next: 'Clarify unresolved details, then call LuxmedPreviewAvailability. The user must click Confirm.' };
     },
 };
@@ -200,7 +201,6 @@ export const LuxmedSaveBookingLocation: Tool = {
         requireCurrentConversation(userId);
         const location = smartStore.place(userId, location_id, place.address, place.lat, place.lng);
         smartStore.verifyLocation(userId, location_id, location.revision);
-        smartBooking.warmKnownLocations(userId);
         return { success: true, location };
     },
 };
