@@ -667,7 +667,7 @@ export class SmartBookingCoordinator {
                 if (candidate.slot.preparationRequired && !this.store.isPreparationConfirmed(config.userId, current.revision, term))
                     throw new Error('Appointment preparation changed before submission.');
                 if (!config.autobook && !manual) {
-                    this.store.notify(`candidate:${config.id}:${candidate.slot.id}`, config.userId, `LuxMed нашёл подходящий слот: ${DateTime.fromMillis(candidate.slot.start, { zone: BOOKING_ZONE }).setLocale('ru').toFormat('ccc dd LLL yyyy HH:mm')} (${BOOKING_ZONE}). этот мониторинг только уведомляет, сам я не записал. скажи, если записать.`);
+                    this.store.notify(`candidate:${config.id}:${candidate.slot.id}`, config.userId, `LuxMed нашёл подходящий слот: ${DateTime.fromMillis(candidate.slot.start, { zone: BOOKING_ZONE }).setLocale('ru').toFormat('ccc dd LLL yyyy HH:mm')} по варшавскому времени. я только сообщаю о слотах и сам не записывал. скажи, если записать.`);
                     return { state: 'notified', message: 'Suitable appointment notification queued.' };
                 }
                 const allReservations = snapshot.value as LuxmedEvent[];
@@ -726,7 +726,7 @@ export class SmartBookingCoordinator {
                                     AND monitoring_id IN (SELECT id FROM luxmed_monitorings WHERE account_id=? AND user_id=? AND active=1)`)
                                     .run(message, config.userId, config.accountId, config.userId);
                                 this.store.notify(`booking-review:${attempt.id}`, config.userId,
-                                    `LuxMed требует ручной проверки перед следующей записью (${outcome.errorCode}). умный мониторинг на этом аккаунте на паузе. проверь визит, подготовку и брони, включая оплату или направление, потом попроси новое превью. возможно, ещё висит временная бронь, которую надо снять.`);
+                                    `LuxMed просит проверить кое-что вручную перед следующей записью, поэтому автозапись на этом аккаунте на паузе. проверь в LuxMed визит, подготовку и брони, включая оплату или направление, потом попроси меня заново показать правила записи. возможно, там ещё висит временная бронь, её надо снять. техническая причина: ${outcome.errorCode}.`);
                             })();
                             return { state: 'waiting', message };
                         }
@@ -793,7 +793,7 @@ export class SmartBookingCoordinator {
         const time = DateTime.fromMillis(p.slot.start, { zone: BOOKING_ZONE }).setLocale('ru').toFormat('ccc dd LLL HH:mm');
         const leave = DateTime.fromMillis(p.journey.leaveAt, { zone: BOOKING_ZONE }).toFormat('HH:mm');
         this.store.succeed(attempt.id, reservationId, { id: `reservation:${reservationId}`, start: p.slot.start - (p.slot.telemedicine ? 0 : 10 * 60000), end: p.slot.end + 10 * 60000, transitionMinutes: 0, locationId: p.journey.legs[0]?.query.to.id },
-            `записал тебя в LuxMed: ${time}. бронь ${reservationId}. выходить не позже ${leave}. ${p.journey.taxiLegs ? 'на часть пути нужно такси.' : 'успеваешь на общественном транспорте.'}${providerWarning ? ' LuxMed вернул предупреждение по записи, глянь визит и его инструкции в портале LuxMed.' : ''}${conflict ? ' пока отправлял запись, поменялись твоё расписание, мониторинг, аккаунт или брони LuxMed. проверь эту запись.' : ''}`);
+            `записал тебя в LuxMed: ${time}. бронь ${reservationId}. выходить не позже ${leave}. ${p.journey.taxiLegs ? 'на часть пути нужно такси.' : 'успеваешь на общественном транспорте.'}${providerWarning ? ' LuxMed вернул предупреждение по записи, глянь визит и его инструкции в портале LuxMed.' : ''}${conflict ? ' пока отправлял запись, поменялись твоё расписание, настройки поиска записи, аккаунт или брони LuxMed. проверь эту запись.' : ''}`);
         void this.refreshReservations(attempt.account_id, reservationCoverage(p.slot.start, p.slot.end), true).catch(() => console.warn('[LuxMed smart] Post-booking reservation refresh deferred'));
     }
     private async acknowledgeCompletedAttempt(id: string, accountId: number, reservationId: number): Promise<void> {

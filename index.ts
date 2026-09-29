@@ -261,7 +261,7 @@ function serialTextHandler(handler: TextHandler, holdOnReceipt: boolean | ((matc
             try { await handler(msg, match); }
             finally {
                 if (holdToken && smartStore.policy(userId)?.holdToken === holdToken)
-                    await safeSend(bot, msg.chat.id, 'Smart booking is paused while your schedule may have changed. Send the booking change as a new message, or say that your availability is unchanged.');
+                    await safeSend(bot, msg.chat.id, 'поставил автозапись LuxMed на паузу: похоже, у тебя могло поменяться расписание. напиши, что поменялось, отдельным сообщением, или скажи, что всё по-старому.');
             }
         });
     };
@@ -1344,7 +1344,7 @@ bot.on('message', (msg) => {
     if (msg.text?.startsWith('/')) {
         if (slashMessageNeedsIngressHold(msg.text) && smartStore.hold(userId)) {
             void safeSend(bot, msg.chat.id,
-                'Smart booking is paused while your schedule may have changed. Send the booking change as an ordinary message, or say that your availability is unchanged.')
+                'поставил автозапись LuxMed на паузу: похоже, у тебя могло поменяться расписание. напиши, что поменялось, обычным сообщением без / в начале, или скажи, что всё по-старому.')
                 .catch(error => console.error('[LuxMed smart] Could not report command hold:', error instanceof Error ? error.message : String(error)));
         }
         return;
@@ -1442,7 +1442,7 @@ bot.on('edited_message', (msg) => {
     if (!userId || !isAllowedUser(userId)) return;
     if (!smartStore.hold(userId)) return;
     void safeSend(bot, msg.chat.id,
-        'I saw an edited message and paused smart booking. Please send the schedule change as a new message so I can review it.')
+        'вижу, ты отредактировал сообщение, поэтому поставил автозапись LuxMed на паузу. если поменялось расписание, напиши это новым сообщением, я разберу.')
         .catch(error => console.error('[LuxMed smart] Could not report edited-message hold:', error instanceof Error ? error.message : String(error)));
 });
 

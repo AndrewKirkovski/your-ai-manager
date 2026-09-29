@@ -602,8 +602,9 @@ test('explicit clinic preview requires and displays verified identity even with 
         const clinicPlace = store.place(userId, 'clinic:1:2', 'Testowa 2, Warszawa', 52.1, 21.1);
         store.verifyClinic(userId, clinicPlace.id, 'Clinic - Testowa 2', clinicPlace.revision);
         assert.equal((await preview() as any).success, true);
-        assert.match(sent.join('\n'), /услуга LuxMed Visit \(ID 6\)/);
-        assert.match(sent.join('\n'), /выбранная клиника 2, Clinic - Testowa 2: Testowa 2, Warszawa/);
+        assert.match(sent.join('\n'), /<b>что ищу:<\/b> Visit, Warszawa, только клиника: Clinic - Testowa 2/);
+        assert.match(sent.join('\n'), /• Clinic - Testowa 2 — Testowa 2, Warszawa/);
+        assert.doesNotMatch(sent.join('\n'), /старые автозаписи/);
         const confirmation = globalDb.prepare('SELECT confirmation_token AS token,revision FROM luxmed_availability WHERE user_id=?')
             .get(userId) as { token: string; revision: number };
         const staged = store.sidecarMonitorPreview(userId, monitor.id, monitor.accountId, confirmation);
@@ -638,12 +639,81 @@ test('explicit monitor booleans cannot silently change doctor or automatic booki
     for (const value of ['False', 'True', 'no', 'yes', '', 0, 1])
         assert.throws(() => parseMonitorBoolean(value, 'autobook', true), /must be/);
 });
-test('confirmation preview states exact clinic, doctor and language filters', async () => {
-    const { monitorFilterSummary } = await import('../tools.luxmedSmart.ts');
-    const summary = monitorFilterSummary({ clinicIds: [2, 7], doctorIds: [3], englishOnly: true }, new Map(), 'ru');
-    assert.match(summary, /ID клиник: 2, 7/);
-    assert.match(summary, /ID врачей: 3/);
-    assert.match(summary, /только англоговорящие врачи: да/);
+test('confirmation preview states exact clinic, doctor and language filters in plain Russian', async () => {
+    const { smartPreviewLinesRu, htmlChunks } = await import('../tools.luxmedSmart.ts');
+    const start = zonedTime('2026-10-08T14:30:00');
+    const lines = smartPreviewLinesRu({ serviceName: 'Konsultacja', cityName: 'Warszawa', englishOnly: true,
+        doctorNames: ['Dr Test'], clinicFilterNames: ['LX Wola', 'LX Mokotów'],
+        dateFrom: '2026-10-01T00:00:00', dateTo: '2026-10-31T23:59:59', timeFrom: '00:00', timeTo: '23:59',
+        policy: { ...policy, windows: [{ weekdays: [1, 2], from: '10:00', to: '19:00' }, { weekdays: [4], from: '11:00', to: '19:00' }, { weekdays: [3], from: '10:00', to: '19:00' }] },
+        places, scheduleAppointments: [],
+        clinics: [{ name: 'LX Wola', address: 'Wolska 1, Warszawa' }, { name: 'LX Unknown', address: null }],
+        preparations: [{ clinicName: 'LX Wola', items: [{ header: 'Na czczo', text: 'Nie jeść 8 godzin' }] }],
+        incompletePreparation: 2, legacyNames: ['Old visit'], rebookIfExists: false, autobook: true, slotCount: 1,
+        examples: [{ start, leaveAt: start - 45 * 60000, travelSeconds: 25 * 60, taxiLegs: 1, telemedicine: false, clinicName: null }] });
+    const text = lines.join('\n');
+    assert.match(text, /<b>что ищу:<\/b> Konsultacja, Warszawa, только англоговорящие врачи, только врач: Dr Test, только клиники: LX Wola, LX Mokotów/);
+    assert.match(text, /<b>период:<\/b> с 1 окт( 2026)? по 31 окт( 2026)?\n/);
+    assert.match(text, /• пн, вт, ср — 10:00–19:00\n• чт — 11:00–19:00/);
+    assert.match(text, /• LX Wola — Wolska 1, Warszawa/);
+    assert.match(text, /• LX Unknown — адрес не нашёл, туда не запишу/);
+    assert.match(text, /<i>LX Wola:<\/i>\n• <b>Na czczo<\/b>: Nie jeść 8 godzin/);
+    assert.match(text, /к 2 слотам LuxMed не дал полных инструкций по подготовке/);
+    assert.match(text, /<b>старые автозаписи<\/b>, которые я выключу, чтобы не записать тебя дважды: Old visit/);
+    assert.match(text, /1 подходящий слот\n• чт, 8 окт( 2026)?, 14:30 — выйти в 13:45, 25 мин в пути, часть пути на такси/);
+    assert.doesNotMatch(text, /ID|сайдкар|мониторинг|заменю/);
+    const chunks = htmlChunks([...lines, `<b>x</b> ${'&amp;'.repeat(900)}`], 3500);
+    for (const chunk of chunks) {
+        assert.ok(chunk.length <= 3500);
+        assert.equal((chunk.match(/<b>/g) || []).length, (chunk.match(/<\/b>/g) || []).length);
+        assert.doesNotMatch(chunk, /&[a-z]*$|^[a-z]*;/m);
+    }
+});
+test('preview is Telegram HTML, escapes provider text and lists legacy automatic bookings in plain words', async () => {
+    const { initSmartBookingTools, LuxmedPreviewAvailability } = await import('../tools.luxmedSmart.ts');
+    const { smartBooking } = await import('../luxmedSmartBooking.ts');
+    const { availabilityTurn } = await import('../luxmedConversation.ts');
+    const userId = 141, store = new SmartBookingStore(globalDb);
+    globalDb.prepare('INSERT INTO users(user_id) VALUES (?)').run(userId);
+    globalDb.prepare("INSERT INTO luxmed_accounts(user_id,account_id,username,created_at) VALUES (141,141,'fixture','2026-10-01')").run();
+    const savedHome = store.place(userId, 'home', 'Testowa 1, Warszawa', 52, 21);
+    store.verifyLocation(userId, 'home', savedHome.revision);
+    store.draft(userId, policy);
+    const future = DateTime.now().setZone('Europe/Warsaw').plus({ days: 3 }).toISODate()!;
+    const monitor = createLuxmedMonitoring({ id: 'html-preview', userId, accountId: userId,
+        serviceId: 6, serviceName: 'Wrong display label', cityId: 1, cityName: 'Warszawa', clinicIds: [2], doctorIds: null,
+        englishOnly: true, dateFrom: `${future}T00:00:00`, dateTo: `${future}T23:59:59`, timeFrom: '08:00',
+        timeTo: '20:00', autobook: true, rebookIfExists: false });
+    const clinicPlace = store.place(userId, 'clinic:1:2', 'Testowa 2, Warszawa', 52.1, 21.1);
+    store.verifyClinic(userId, clinicPlace.id, 'Clinic <2> & co - Testowa 2', clinicPlace.revision);
+    const sent: { text: string; options: any }[] = [];
+    initSmartBookingTools({ on: () => { }, answerCallbackQuery: async () => { },
+        sendMessage: async (_id: number, text: string, options: any) => { sent.push({ text, options }); return {} as any; } } as any);
+    const oldReady = smartBooking.readiness, oldFetch = globalThis.fetch;
+    smartBooking.readiness = async () => null;
+    globalThis.fetch = async url => new Response(JSON.stringify({ success: true, data:
+        String(url).endsWith('/services') ? [{ id: 6, name: 'Derm <b>&' }] :
+        String(url).endsWith('/cities') ? [{ id: 1, name: 'Warszawa' }] :
+        String(url).endsWith('/monitorings') ? [{ recordId: 9, serviceName: 'Old <i> visit', cityName: 'Warszawa', clinicName: '',
+            doctorName: '', dateFrom: future, dateTo: future, timeFrom: '08:00', timeTo: '20:00', autobook: true, active: true }] : [] }));
+    try {
+        const result = await availabilityTurn.run({ userId, holdToken: null }, () =>
+            LuxmedPreviewAvailability.execute({ userId, monitoring_id: monitor.id }));
+        assert.equal((result as any).success, true);
+        assert.ok(sent.length >= 2);
+        for (const message of sent) assert.equal(message.options?.parse_mode, 'HTML');
+        const text = sent.map(message => message.text).join('\n');
+        assert.match(text, /<b>Derm &lt;b&gt;&amp; — правила записи<\/b>/);
+        assert.match(text, /Derm &lt;b&gt;&amp;, Warszawa, только англоговорящие врачи/);
+        assert.match(text, /• Clinic &lt;2&gt; &amp; co - Testowa 2 — Testowa 2, Warszawa/);
+        assert.match(text, /<b>старые автозаписи<\/b>, которые я выключу, чтобы не записать тебя дважды: Old &lt;i&gt; visit/);
+        assert.doesNotMatch(text, /Derm <b>&|<i> visit/);
+        assert.doesNotMatch(text, /сайдкар|sidecar/i);
+        assert.equal(sent.at(-1)!.options.reply_markup.inline_keyboard[0][0].text, 'подтверждаю');
+    } finally {
+        smartBooking.readiness = oldReady; globalThis.fetch = oldFetch;
+        (await import('../userStore.ts')).deactivateLuxmedMonitoring(monitor.id, userId); // keep later scheduler tests isolated
+    }
 });
 test('Google transit duration before the first stop counts against a tight commitment', async () => {
     const appointment = slot('11:40', '12:10');
@@ -1350,7 +1420,7 @@ test('a booking completed after its monitor was stopped reports the conflict', a
     };
     assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'booked');
     const outbox = f.store.db.prepare("SELECT message FROM luxmed_notification_outbox WHERE id LIKE 'booked:%'").get() as { message: string };
-    assert.match(outbox.message, /пока отправлял запись, поменялись.*мониторинг/);
+    assert.match(outbox.message, /пока отправлял запись, поменялись.*настройки поиска записи/);
     assert.equal(f.store.blocks(1).length, 1);
     f.store.db.close();
 });
@@ -1538,8 +1608,8 @@ test('confirmation requires the owning private chat and cannot be replayed', asy
         assert.equal(enrolled, 1);
         assert.match(store.enrollment(monitor.id)?.status || '', /Monitoring with confirmed availability/);
         const notices = globalDb.prepare("SELECT message FROM luxmed_notification_outbox WHERE user_id=10 AND id LIKE 'activation-%'").all() as { message: string }[];
-        assert.equal(notices.filter(notice => notice.message.includes('умный мониторинг LuxMed включён')).length, 1);
-        assert.equal(notices.some(notice => notice.message.includes('остался на паузе')), false);
+        assert.equal(notices.filter(notice => notice.message.includes('автозапись LuxMed включена')).length, 1);
+        assert.equal(notices.some(notice => notice.message.includes('пока не включилась')), false);
     } finally { smartBooking.readiness = oldReady; globalThis.fetch = oldFetch; }
 });
 test('failed sidecar enrollment leaves the confirmed monitor held before activation', async () => {
@@ -1771,7 +1841,7 @@ test('a reservation appearing during submission is reported with the successful 
     finish();
     assert.equal((await booking).state, 'booked');
     const messages = f.store.db.prepare('SELECT message FROM luxmed_notification_outbox').all() as { message: string }[];
-    assert.ok(messages.some(row => row.message.includes('пока отправлял запись, поменялись твоё расписание, мониторинг, аккаунт или брони LuxMed')));
+    assert.ok(messages.some(row => row.message.includes('пока отправлял запись, поменялись твоё расписание, настройки поиска записи, аккаунт или брони LuxMed')));
     f.store.db.close();
 });
 
