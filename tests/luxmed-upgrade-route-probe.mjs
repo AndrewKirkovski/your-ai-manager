@@ -36,6 +36,16 @@ if (expected === 'present') {
     assert.equal(result.data?.state, 'failed');
     assert.equal(result.data?.errorCode, 'BOT_UPGRADE_REQUIRED');
 } else {
-    assert.ok([404, 405].includes(response.status), `Expected an absent POST route, got HTTP ${response.status}`);
+    const text = await response.text();
+    let result = null;
+    try { result = JSON.parse(text); } catch { result = null; }
+    // The legacy image's catch-all exception handler turns Spring's unmapped-path
+    // exception into HTTP 500, so a 500 counts as absent only with that exact message.
+    const unmappedOn500 = response.status === 500 && result?.success === false
+        && typeof result.error === 'string' && /^No static resource |^No endpoint /.test(result.error);
+    assert.ok(
+        [404, 405].includes(response.status) || unmappedOn500,
+        `Expected an absent POST route, got HTTP ${response.status}: ${text.slice(0, 300)}`,
+    );
 }
 console.log(`Fixture smart booking POST route ${expected}: HTTP ${response.status}`);
