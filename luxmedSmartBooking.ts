@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon';
-import { BOOKING_ZONE, busyIntervals, evaluateSlot, expandRule, usableEstimate, zonedTime, type BusyInterval, type FeasibleSlot, type Slot, type TravelQuery } from './luxmedAvailability';
+import { BOOKING_ZONE, busyIntervals, evaluateSlot, expandRule, usableEstimate, validBookingTimeRange, zonedTime, type BusyInterval, type FeasibleSlot, type Slot, type TravelQuery } from './luxmedAvailability';
 import { smartStore, SmartBookingStore, digest, requiresPreparation, snapshotCovers, snapshotUsable, type BookingAttempt, type ReservationCoverage } from './luxmedSmartStore';
 import { TravelCache, queueTravelRequest } from './luxmedTravel';
 import { rankWithJev } from './luxmedJev';
@@ -99,10 +99,11 @@ export function matchesMonitor(term: LuxmedTerm, c: LuxmedMonitoringConfig, engl
         || !Array.isArray(term.additionalData.preparationItems)) return false;
     const time = DateTime.fromMillis(s.start, { zone: BOOKING_ZONE }).toFormat('HH:mm');
     const dateTo = /^\d{4}-\d{2}-\d{2}$/.test(c.dateTo) ? zonedTime(`${c.dateTo}T23:59:59`) : zonedTime(c.dateTo);
-    return t.serviceId === c.serviceId && Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start
+    const permitsId = (ids: number[] | null, value: number): boolean => ids === null
+        || Array.isArray(ids) && ids.length > 0 && ids.every(id => Number.isSafeInteger(id) && id > 0) && ids.includes(value);
+    return validBookingTimeRange(c.timeFrom, c.timeTo) && t.serviceId === c.serviceId && Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start
         && s.start >= zonedTime(c.dateFrom) && s.end <= dateTo && time >= c.timeFrom && time <= c.timeTo
-        && (!c.clinicIds?.length || c.clinicIds.includes(t.clinicId))
-        && (!c.doctorIds?.length || c.doctorIds.includes(t.doctor.id))
+        && permitsId(c.clinicIds, t.clinicId) && permitsId(c.doctorIds, t.doctor.id)
         && (!c.englishOnly || (t.doctor.isEnglishSpeaker !== false && !!englishIds?.has(t.doctor.id)));
 }
 
@@ -126,6 +127,7 @@ export class SmartBookingCoordinator {
     private sweepRunning = false;
     private lastTravelReview = new Map<string, number>();
     private reviewedReservationRevisions = new Map<string, string>();
+    private lastBackgroundReservationAttempt = new Map<number, number>();
     private intervalIndex = new Map<string, BusyInterval[]>();
     private candidateScans = new Map<string, { key: string; next: number; cold: number[]; unresolved: number[]; candidates: FeasibleSlot[] }>();
     constructor(readonly store: SmartBookingStore = smartStore, private api: Dependencies = smartDependencies, private configured = smartConfigurationIssue) { }
@@ -148,7 +150,7 @@ export class SmartBookingCoordinator {
         const config = this.configured(); if (config) return config;
         if (force || !this.capability || this.capability.expires < Date.now()) {
             const caps = await this.api.capabilities();
-            this.capability = { expires: Date.now() + 60000, value: caps.includes('smart-booking-v1') && caps.includes('reservation-end-times-v1') && caps.includes('smart-booking-attempts-v3') && caps.includes('smart-booking-attempts-v4') && caps.includes('monitor-quiesce-v1') && caps.includes('reservation-range-complete-v1') && caps.includes('legacy-monitor-fence-v1') && caps.includes('legacy-booking-barrier-v2') && caps.includes('smart-booking-enrollment-fence-v2') && caps.includes('smart-booking-identity-fence-v1') && caps.includes('cancellation-receipts-v3') };
+            this.capability = { expires: Date.now() + 60000, value: caps.includes('smart-booking-v1') && caps.includes('reservation-end-times-v1') && caps.includes('smart-booking-attempts-v3') && caps.includes('smart-booking-attempts-v4') && caps.includes('smart-booking-lockterm-review-v1') && caps.includes('monitor-quiesce-v1') && caps.includes('reservation-range-complete-v1') && caps.includes('legacy-monitor-fence-v1') && caps.includes('legacy-booking-barrier-v2') && caps.includes('smart-booking-enrollment-fence-v2') && caps.includes('smart-booking-identity-fence-v1') && caps.includes('cancellation-receipts-v3') };
             this.legacyCapability = { expires: Date.now() + 60000, version: caps.includes('legacy-booking-barrier-v2') ? 2 : caps.includes('legacy-booking-barrier-v1') ? 1 : 0 };
         }
         return this.capability.value ? null : 'Waiting for the sidecar smart booking update.';
@@ -282,17 +284,37 @@ export class SmartBookingCoordinator {
             const origin = places.get(id); if (origin) this.cache(userId).warm(origin, clinic);
         }
     }
-    async refreshReservations(accountId: number, coverage: ReservationCoverage, force = false): Promise<void> {
+    async refreshReservations(accountId: number, coverage: ReservationCoverage, force = false, maxAgeMs = 60000): Promise<void> {
         const running = this.snapshots.get(accountId);
         if (running) {
             await running;
-            if (!force && snapshotUsable(this.store.snapshot(accountId), coverage.from, coverage.to, Date.now(), 60000)) return;
-            return this.refreshReservations(accountId, coverage, force);
+            if (!force && snapshotUsable(this.store.snapshot(accountId), coverage.from, coverage.to, Date.now(), maxAgeMs)) return;
+            return this.refreshReservations(accountId, coverage, force, maxAgeMs);
         }
         const old = this.store.snapshot(accountId);
-        if (!force && snapshotUsable(old, coverage.from, coverage.to, Date.now(), 60000)) return;
+        if (!force && snapshotUsable(old, coverage.from, coverage.to, Date.now(), maxAgeMs)) return;
         const job = this.api.reserved(accountId, coverage).then(value => { this.store.saveSnapshot(accountId, value, coverage); }).finally(() => this.snapshots.delete(accountId));
         this.snapshots.set(accountId, job); return job;
+    }
+    async refreshActiveReservations(configs: LuxmedMonitoringConfig[]): Promise<void> {
+        const coverageByAccount = new Map<number, ReservationCoverage>();
+        for (const config of configs) {
+            if (this.store.enrollment(config.id)?.state !== 'active' || !this.activeAccount(config.userId, config.accountId)) continue;
+            let coverage: ReservationCoverage;
+            try { coverage = monitorReservationCoverage(config); }
+            catch { console.warn('[LuxMed smart] Invalid monitor reservation range', { monitorId: config.id }); continue; }
+            const current = coverageByAccount.get(config.accountId);
+            coverageByAccount.set(config.accountId, current
+                ? { from: Math.min(current.from, coverage.from), to: Math.max(current.to, coverage.to) } : coverage);
+        }
+        await Promise.all([...coverageByAccount].map(async ([accountId, coverage]) => {
+            const now = Date.now();
+            if (snapshotUsable(this.store.snapshot(accountId), coverage.from, coverage.to, now, 50000)
+                || now - (this.lastBackgroundReservationAttempt.get(accountId) ?? 0) < 10000) return;
+            this.lastBackgroundReservationAttempt.set(accountId, now);
+            try { await this.refreshReservations(accountId, coverage, false, 50000); }
+            catch { console.warn('[LuxMed smart] Background reservation refresh deferred', { accountId }); }
+        }));
     }
     async english(config: LuxmedMonitoringConfig): Promise<Set<number> | undefined> {
         if (!config.englishOnly) return undefined;
@@ -539,7 +561,7 @@ export class SmartBookingCoordinator {
                 const rechecked = await evaluateSlot(candidate.slot, effectivePolicy, this.store.places(config.userId), busy, async q => {
                     const prior = candidate.legs.find(l => digest(l.query) === digest(q));
                     const refreshed = this.cache(config.userId).previous(q);
-                    if (refreshed && refreshed.fetchedAt > (prior?.fetchedAt ?? started)) return { ...refreshed, cached: false };
+                    if (refreshed && refreshed.fetchedAt > (prior?.fetchedAt ?? started)) return refreshed;
                     return prior || refreshed;
                 });
                 if (!rechecked) {
@@ -613,7 +635,7 @@ export class SmartBookingCoordinator {
                             && (!candidate.slot.preparationRequired || this.store.isPreparationConfirmed(config.userId, current.revision, term));
                     }, baselineIds, baselineFacts) as BookingOutcome;
                     if (outcome.state === 'succeeded' && Number.isSafeInteger(outcome.reservationId) && outcome.reservationId! > 0) {
-                        this.complete(attempt, outcome.reservationId!);
+                        this.complete(attempt, outcome.reservationId!, !!outcome.errorCode);
                         await this.acknowledgeCompletedAttempt(attempt.id, config.accountId, outcome.reservationId!);
                         return { state: 'booked', message: `Appointment booked. Reservation ${outcome.reservationId}.` };
                     }
@@ -663,7 +685,7 @@ export class SmartBookingCoordinator {
             return { state: 'waiting', message: 'No verified slot fits the confirmed schedule and travel limits.' };
         } finally { this.accounts.delete(config.accountId); this.users.delete(config.userId); }
     }
-    private complete(attempt: BookingAttempt, reservationId: number): void {
+    private complete(attempt: BookingAttempt, reservationId: number, providerWarning = false): void {
         const p = JSON.parse(attempt.payload) as { slot: Slot; journey: FeasibleSlot; reservationRevision?: string };
         const policy = this.store.policy(attempt.user_id);
         const currentSnapshot = this.store.snapshot(attempt.account_id);
@@ -676,7 +698,7 @@ export class SmartBookingCoordinator {
         const time = DateTime.fromMillis(p.slot.start, { zone: BOOKING_ZONE }).toFormat('ccc dd LLL HH:mm');
         const leave = DateTime.fromMillis(p.journey.leaveAt, { zone: BOOKING_ZONE }).toFormat('HH:mm');
         this.store.succeed(attempt.id, reservationId, { id: `reservation:${reservationId}`, start: p.slot.start - (p.slot.telemedicine ? 0 : 10 * 60000), end: p.slot.end + 10 * 60000, transitionMinutes: 0, locationId: p.journey.legs[0]?.query.to.id },
-            `LuxMed booked ${time}. Reservation ${reservationId}. Leave by ${leave}. ${p.journey.taxiLegs ? 'Taxi is needed for part of the journey.' : 'Public transport fits.'}${conflict ? ' Your schedule, monitor, account or LuxMed reservations changed while booking was submitted. Please review this appointment.' : ''}`);
+            `LuxMed booked ${time}. Reservation ${reservationId}. Leave by ${leave}. ${p.journey.taxiLegs ? 'Taxi is needed for part of the journey.' : 'Public transport fits.'}${providerWarning ? ' LuxMed returned a booking warning. Review the appointment and its instructions in the LuxMed portal.' : ''}${conflict ? ' Your schedule, monitor, account or LuxMed reservations changed while booking was submitted. Please review this appointment.' : ''}`);
         void this.refreshReservations(attempt.account_id, reservationCoverage(p.slot.start, p.slot.end), true).catch(() => console.warn('[LuxMed smart] Post-booking reservation refresh deferred'));
     }
     private async acknowledgeCompletedAttempt(id: string, accountId: number, reservationId: number): Promise<void> {
@@ -721,7 +743,7 @@ export class SmartBookingCoordinator {
                     // A missing sidecar record does not prove the upstream request was never sent.
                     const settled = outcome;
                     if (settled.state === 'succeeded' && Number.isSafeInteger(settled.reservationId) && settled.reservationId! > 0) {
-                        this.complete(attempt, settled.reservationId!);
+                        this.complete(attempt, settled.reservationId!, !!settled.errorCode);
                         await this.acknowledgeCompletedAttempt(attempt.id, attempt.account_id, settled.reservationId!);
                     }
                     else if (settled.state === 'failed') this.store.outcome(attempt.id, 'failed');

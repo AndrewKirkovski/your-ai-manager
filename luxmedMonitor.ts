@@ -339,9 +339,12 @@ const lastAccountMonitor=new Map<number,string>();
 const recentSearches=new Map<string,{started:number;result:Promise<LuxmedTerm[]>}>();
 export async function runLuxmedMonitoringCycle(): Promise<void> {
     void smartBooking.reconcile();
+    const activeConfigs = getActiveLuxmedMonitorings();
+    void smartBooking.refreshActiveReservations(activeConfigs).catch(error =>
+        console.warn('[LuxMed smart] Periodic reservation refresh deferred', error));
     if(botInstance)await smartStore.deliver((userId,message)=>safeSend(botInstance!,userId,message));
     const groups=new Map<number,LuxmedMonitoringConfig[]>();
-    for(const config of getActiveLuxmedMonitorings()) {
+    for(const config of activeConfigs) {
         const smart=smartStore.enrollment(config.id);
         if(smart ? smart.state!=='active'||smart.next_check>Date.now() : config.lastCheck&&Date.now()-Date.parse(config.lastCheck)<600000)continue;
         const group=groups.get(config.accountId)||[];group.push(config);groups.set(config.accountId,group);

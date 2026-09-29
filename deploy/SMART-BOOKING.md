@@ -4,6 +4,8 @@ New monitors ask when appointments can be booked. The user describes free times,
 recurring commitments, exceptions and locations in chat. The bot saves a draft,
 shows a decision preview and sends a **Confirm availability** button. Automatic
 booking starts only after the user clicks that button in their private chat.
+The preview states the exact clinic IDs, doctor IDs, language filter, booking
+mode, and travel rules that will apply.
 Existing monitors retain their previous behaviour until explicitly enrolled.
 Chat booking through the new bot also requires a confirmed availability policy.
 The bot uses the same durable booking coordinator for a selected slot, so a
@@ -79,6 +81,9 @@ An old v2 bot cannot supply the exact reservation facts required by a v4
 sidecar. A sidecar-first update therefore pauses its automatic smart booking
 until Watchtower replaces the bot. This is a safe service pause, not continuous
 booking availability.
+The current bot also requires the sidecar's `smart-booking-lockterm-review-v1`
+capability. A bot-first update pauses smart booking until the sidecar checks
+LuxMed's lockterm warnings, doctor identity, referral and procedure flags.
 Smart booking waits if configuration or sidecar capabilities are missing.
 Enrolment stores the intended auto-book setting in smart-monitor state and clears
 the old monitor's auto-book flag. An older bot image therefore cannot resume
@@ -203,6 +208,11 @@ Notifications retry independently of booking. Confirmed cancellations remain
 recorded so a late success receipt or a stale reservation feed cannot restore
 the cancelled visit. Later travel or schedule conflicts generate a warning
 without cancelling a visit.
+If LuxMed returns a warning after a confirmed booking, the sidecar saves that
+warning state with the successful outcome. The bot records the reservation and
+asks the user to review its instructions in the LuxMed portal. Active smart
+monitors request a reservation refresh before their snapshot reaches one minute
+old, independently of the next appointment search.
 
 ## Verification
 

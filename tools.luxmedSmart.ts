@@ -4,7 +4,7 @@ import { smartStore, preparationFacts, requiresPreparation } from './luxmedSmart
 import { smartBooking, smartConfigurationIssue, matchesMonitor, monitorReservationCoverage } from './luxmedSmartBooking';
 import { BOOKING_ZONE, compareFeasible, type TimeRule } from './luxmedAvailability';
 import { DateTime } from 'luxon';
-import { getActiveLuxmedMonitoringsByUser, getLuxmedAccountId } from './userStore';
+import { getActiveLuxmedMonitoringsByUser, getLuxmedAccountId, type LuxmedMonitoringConfig } from './userStore';
 import { luxmedSearchSlots, luxmedGetMonitorings, luxmedEnrollSmartAccount, luxmedLegacyBookingBarrier, luxmedSmartEnrollment } from './luxmedAdapter';
 import { resolveStreetAddress } from './googleRoutes';
 import { availabilityTurn, requireCurrentAvailabilityTurn } from './luxmedConversation';
@@ -37,6 +37,10 @@ export function availabilitySummary(userId: number): string {
     `Preferences: ${p.softPreferences.join('; ') || 'none'}. Required preparation is confirmed for each exact service, clinic and instruction set.`,
     ...(p.unresolved.length ? [`Please clarify: ${p.unresolved.join('; ')}`] : []),
     ].join('\n');
+}
+export function monitorFilterSummary(monitor: Pick<LuxmedMonitoringConfig, 'clinicIds' | 'doctorIds' | 'englishOnly'>): string {
+    const ids = (value: number[] | null) => value === null ? 'any' : value.length ? value.join(', ') : 'invalid empty filter';
+    return `Clinic IDs: ${ids(monitor.clinicIds)}.\nDoctor IDs: ${ids(monitor.doctorIds)}.\nEnglish-speaking doctors only: ${monitor.englishOnly ? 'yes' : 'no'}.`;
 }
 export function availabilityContext(userId: number): string {
     const saved = smartStore.policy(userId);
@@ -193,7 +197,7 @@ export const LuxmedPreviewAvailability: Tool = {
             const leave = DateTime.fromMillis(c.leaveAt, { zone: BOOKING_ZONE }).toFormat('HH:mm');
             return `${time}: leave by ${leave}, ${Math.ceil(c.travelSeconds / 60)} minutes travelling, ${c.taxiLegs} taxi legs.`;
         });
-        const text = `${availabilitySummary(userId)}\n\nMonitor: ${monitor.serviceName}, ${monitor.dateFrom} to ${monitor.dateTo}, ${monitor.timeFrom} to ${monitor.timeTo}. ${monitor.autobook ? 'Automatic booking' : 'Notifications only'}. Replace an existing appointment: ${monitor.rebookIfExists ? 'yes' : 'no'}.\nSidecar automatic monitors that will be stopped: ${legacy.map(m => `#${m.recordId} ${m.serviceName}`).join(', ') || 'none'}.\n${clinicText ? `Clinics and verified street addresses:\n${clinicText}\n` : ''}${preparationText ? `Confirm these exact preparation instructions:\n${preparationText}\n` : ''}${incompletePreparation ? `${incompletePreparation} slot(s) have incomplete preparation details and cannot be booked automatically.\n` : ''}Preview: ${preview.candidates.length} currently verified suitable slots.\n${examples.join('\n')}\nConfirm these rules to activate this monitor.`;
+         const text = `${availabilitySummary(userId)}\n\nMonitor: ${monitor.serviceName}, ${monitor.dateFrom} to ${monitor.dateTo}, ${monitor.timeFrom} to ${monitor.timeTo}. ${monitor.autobook ? 'Automatic booking' : 'Notifications only'}. Replace an existing appointment: ${monitor.rebookIfExists ? 'yes' : 'no'}.\n${monitorFilterSummary(monitor)}\nSidecar automatic monitors that will be stopped: ${legacy.map(m => `#${m.recordId} ${m.serviceName}`).join(', ') || 'none'}.\n${clinicText ? `Clinics and verified street addresses:\n${clinicText}\n` : ''}${preparationText ? `Confirm these exact preparation instructions:\n${preparationText}\n` : ''}${incompletePreparation ? `${incompletePreparation} slot(s) have incomplete preparation details and cannot be booked automatically.\n` : ''}Preview: ${preview.candidates.length} currently verified suitable slots.\n${examples.join('\n')}\nConfirm these rules to activate this monitor.`;
         const chunks:string[] = []; let chunk = '';
         for (const line of text.split('\n')) {
             if (chunk.length + line.length > 3500) { chunks.push(chunk); chunk = ''; }

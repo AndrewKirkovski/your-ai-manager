@@ -4,7 +4,7 @@ import { performance } from 'node:perf_hooks';
 import Database from 'better-sqlite3';
 import { DateTime } from 'luxon';
 import { SCHEMA_SQL, INDEXES_SQL, applyColumnMigrations } from '../schema.ts';
-import { validatePolicy, evaluateSlot, busyIntervals, expandRule, zonedTime, usableEstimate, compareFeasible, type AvailabilityPolicy, type Place, type Slot, type TravelQuery, type TravelEstimate } from '../luxmedAvailability.ts';
+import { validatePolicy, evaluateSlot, busyIntervals, expandRule, zonedTime, usableEstimate, compareFeasible, validBookingTimeRange, type AvailabilityPolicy, type Place, type Slot, type TravelQuery, type TravelEstimate } from '../luxmedAvailability.ts';
 import { TravelCache, profileQueries } from '../luxmedTravel.ts';
 import { computeGoogleRoute, providerStreetMatches, providerCityMatches, resolveStreetAddress } from '../googleRoutes.ts';
 import { rankWithJev } from '../luxmedJev.ts';
@@ -16,8 +16,8 @@ import type { LuxmedEvent, LuxmedTerm } from '../luxmedAdapter.ts';
 process.env.DB_PATH = ':memory:';
 const { SmartBookingStore } = await import('../luxmedSmartStore.ts');
 const { SmartBookingCoordinator, smartDependencies, slotFromTerm, matchesMonitor, smartBookingTimezoneIssue, smartConfigurationIssue, reservationBaselineFacts } = await import('../luxmedSmartBooking.ts');
-const { saveUserAddress, saveLuxmedAccount } = await import('../userStore.ts');
-const { LuxmedBookSlot } = await import('../tools.luxmed.ts');
+const { saveUserAddress, saveLuxmedAccount, createLuxmedMonitoring } = await import('../userStore.ts');
+const { LuxmedBookSlot, parseMonitorIds, parseMonitorBoolean } = await import('../tools.luxmed.ts');
 const globalDb = (await import('../database.ts')).default;
 const now = zonedTime('2026-10-05T07:00:00');
 const at = (value: string) => zonedTime(`2026-10-06T${value}:00`);
@@ -218,10 +218,10 @@ test('no caching permission means no persistent Google estimates', async () => {
     assert.equal(store.db.prepare('SELECT count(*) AS n FROM luxmed_travel_estimates').get().n, 0);
     store.db.close();
 });
-test('Google transit parser includes initial/final walks and actual service departure', async () => {
+test('Google transit parser includes walks and full provider journey duration', async () => {
     const q: TravelQuery = { from: home, to: clinic, mode: 'transit', kind: 'depart', at: at('11:00') };
     const e = await computeGoogleRoute(q, { apiKey: 'fixture', now: () => now, fetch: async () => new Response(JSON.stringify({ routes: [{ duration: '2100s', distanceMeters: 4000, legs: [{ steps: [{ travelMode: 'WALK', staticDuration: '300s' }, { travelMode: 'TRANSIT', transitDetails: { stopDetails: { departureTime: new Date(at('11:10')).toISOString(), arrivalTime: new Date(at('11:30')).toISOString() } } }, { travelMode: 'WALK', staticDuration: '300s' }] }] }] })) });
-    assert.equal(e.departure, at('11:05')); assert.equal(e.arrival, at('11:35')); assert.equal(e.durationSeconds, 2100);
+    assert.equal(e.departure, at('11:00')); assert.equal(e.arrival, at('11:35')); assert.equal(e.durationSeconds, 2100);
 });
 test('Google driving request includes departure time and traffic model', async () => {
     let body: any;
@@ -336,7 +336,7 @@ function coordinatorFixture() {
         .run(config.dateFrom, config.dateTo, config.createdAt);
     store.enroll('m1', 1); store.db.prepare("UPDATE luxmed_smart_monitors SET state='active' WHERE monitoring_id='m1'").run();
     let books = 0;
-    const api = { ...smartDependencies, capabilities: async () => ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v3', 'smart-booking-attempts-v4', 'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1', 'legacy-booking-barrier-v2', 'smart-booking-enrollment-fence-v2', 'smart-booking-identity-fence-v1', 'cancellation-receipts-v3'], reserved: async () => [], doctors: async () => [], cities: async () => [{ id: 1, name: 'Warszawa' }], monitorings: async () => [], cancellations: async () => [], acknowledgeMove: async () => { }, book: async () => { books++; return { state: 'succeeded', reservationId: 77 }; }, attempt: async () => ({ state: 'succeeded' as const, reservationId: 77 }), acknowledgeAttempt: async () => { }, legacyBarrier: async () => ({ state: 'clear' as const }), acknowledgeLegacy: async () => { }, resolve: async () => null };
+    const api = { ...smartDependencies, capabilities: async () => ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v3', 'smart-booking-attempts-v4', 'smart-booking-lockterm-review-v1', 'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1', 'legacy-booking-barrier-v2', 'smart-booking-enrollment-fence-v2', 'smart-booking-identity-fence-v1', 'cancellation-receipts-v3'], reserved: async () => [], doctors: async () => [], cities: async () => [{ id: 1, name: 'Warszawa' }], monitorings: async () => [], cancellations: async () => [], acknowledgeMove: async () => { }, book: async () => { books++; return { state: 'succeeded', reservationId: 77 }; }, attempt: async () => ({ state: 'succeeded' as const, reservationId: 77 }), acknowledgeAttempt: async () => { }, legacyBarrier: async () => ({ state: 'clear' as const }), acknowledgeLegacy: async () => { }, resolve: async () => null };
     const coordinator = new SmartBookingCoordinator(store, api, () => null);
     const cache = { lookup: async (q: TravelQuery) => estimate(q, 1500, false, Date.now()), prepared: () => null, previous: () => null, key: (q: TravelQuery) => JSON.stringify(q), warm: () => { }, metrics: {} };
     coordinator.cache = () => cache as any;
@@ -393,6 +393,62 @@ test('a clinic group ID cannot satisfy an explicit clinic ID restriction', async
     f.config.clinicIds = [f.term.term.clinicId];
     assert.equal(matchesMonitor(f.term, f.config), true);
     f.store.db.close();
+});
+test('malformed or empty clinic and doctor filters never broaden a smart monitor', () => {
+    assert.deepEqual(parseMonitorIds('5, 7,5', 'clinic_ids'), [5, 7]);
+    for (const value of ['', 'abc', '5,abc', '0', '-1', '1,,2', '9007199254740992'])
+        assert.throws(() => parseMonitorIds(value, 'clinic_ids'), /positive IDs/);
+    const f = coordinatorFixture();
+    assert.equal(matchesMonitor(f.term, { ...f.config, clinicIds: [] }), false);
+    assert.equal(matchesMonitor(f.term, { ...f.config, doctorIds: [] }), false);
+    assert.equal(matchesMonitor(f.term, { ...f.config, clinicIds: '2' as any }), false);
+    assert.equal(matchesMonitor(f.term, { ...f.config, doctorIds: [3, 0] }), false);
+    const { lastCheck, createdAt, ...config } = f.config;
+    assert.throws(() => createLuxmedMonitoring({ ...config, id: 'invalid-filter', clinicIds: [] }), /positive IDs/);
+    f.store.db.close();
+});
+test('malformed monitor time bounds never broaden a smart monitor', () => {
+    assert.equal(validBookingTimeRange('09:00', '14:00'), true);
+    for (const [from, to] of [['', 'zz'], ['9:00', '14:00'], ['14:00', '09:00'], ['09:00', '25:00']]) {
+        assert.equal(validBookingTimeRange(from, to), false);
+        const f = coordinatorFixture();
+        assert.equal(matchesMonitor(f.term, { ...f.config, timeFrom: from, timeTo: to }), false);
+        const { lastCheck, createdAt, ...config } = f.config;
+        assert.throws(() => createLuxmedMonitoring({ ...config, id: 'invalid-time', timeFrom: from, timeTo: to }), /valid HH:mm/);
+        f.store.db.close();
+    }
+});
+test('explicit monitor booleans cannot silently change doctor or automatic booking rules', () => {
+    assert.equal(parseMonitorBoolean(undefined, 'autobook', true), true);
+    assert.equal(parseMonitorBoolean('false', 'autobook', true), false);
+    assert.equal(parseMonitorBoolean('true', 'english_only', false), true);
+    for (const value of ['False', 'True', 'no', 'yes', '', 0, 1])
+        assert.throws(() => parseMonitorBoolean(value, 'autobook', true), /must be/);
+});
+test('confirmation preview states exact clinic, doctor and language filters', async () => {
+    const { monitorFilterSummary } = await import('../tools.luxmedSmart.ts');
+    const summary = monitorFilterSummary({ clinicIds: [2, 7], doctorIds: [3], englishOnly: true });
+    assert.match(summary, /Clinic IDs: 2, 7/);
+    assert.match(summary, /Doctor IDs: 3/);
+    assert.match(summary, /English-speaking doctors only: yes/);
+});
+test('Google transit duration before the first stop counts against a tight commitment', async () => {
+    const appointment = slot('11:40', '12:10');
+    const busy = [{ id: 'call', start: at('10:00'), end: at('11:00'), locationId: home.id }];
+    const route = async (q: TravelQuery): Promise<TravelEstimate | null> => {
+        if (q.mode !== 'transit') return null;
+        if (q.kind === 'depart') return estimate(q, 1500, false, now);
+        return computeGoogleRoute(q, { apiKey: 'fixture', now: () => now, fetch: async () => new Response(JSON.stringify({
+            routes: [{ duration: '1800s', distanceMeters: 6000, legs: [{ steps: [
+                { travelMode: 'WALK', staticDuration: '600s' },
+                { travelMode: 'TRANSIT', transitDetails: { stopDetails: {
+                    departureTime: new Date(at('11:15')).toISOString(), arrivalTime: new Date(at('11:30')).toISOString()
+                } } }
+            ] }] }]
+        })) });
+    };
+    const result = await evaluateSlot(appointment, { ...policy, maxTaxiMinutes: 0 }, places, busy, route, now);
+    assert.equal(result, null);
 });
 test('concurrent decisions produce one booking and durable notification even when delivery fails', async () => {
     const f = coordinatorFixture();
@@ -865,6 +921,16 @@ test('a v3 sidecar that ignores exact reservation facts cannot enable smart book
     assert.equal(f.books(), 0);
     f.store.db.close();
 });
+test('a v4 sidecar without strict lockterm review cannot enable smart booking', async () => {
+    const f = coordinatorFixture();
+    const current = await f.api.capabilities();
+    f.api.capabilities = async () => current.filter(capability => capability !== 'smart-booking-lockterm-review-v1');
+    const result = await f.coordinator.process(f.config, [f.term]);
+    assert.equal(result.state, 'waiting');
+    assert.match(result.message, /sidecar smart booking update/);
+    assert.equal(f.books(), 0);
+    f.store.db.close();
+});
 test('smart replacement waits until the old visit is identified before any booking work', async () => {
     const f = coordinatorFixture();
     f.config.rebookIfExists = true;
@@ -888,6 +954,18 @@ test('Jev uses earliest day and transport priority; timeout or malformed output 
     assert.equal(timed?.source, 'rules'); assert.ok(performance.now() - start < 200);
     const laterDay = { ...b, day: '2026-10-07' };
     assert.equal((await rankWithJev([laterDay, a], [], 1))!.candidate.slot.id, a.slot.id);
+});
+test('Jev rejects a wrong model or malformed probability labels', async () => {
+    const a = (await evaluateSlot(slot(), policy, places, [], async q => estimate(q), now))!;
+    const b = { ...a, slot: { ...a.slot, id: 'later', start: a.slot.start + 3600000 } };
+    const answers = { c0: { type: 'score', score: 4, confidence: 1, probabilities: { a: 0, b: 0, c: 0, d: 0, e: 1 } },
+        c1: { type: 'score', score: 4, confidence: 1, probabilities: { a: 0, b: 0, c: 0, d: 0, e: 1 } } };
+    for (const model of ['typesafe/jev-1.13-20260917', 'another/model']) {
+        const result = await rankWithJev([a, b], ['Prefer afternoon'], 1, {
+            key: 'fixture', fetch: async () => new Response(JSON.stringify({ model, answers }))
+        });
+        assert.equal(result?.source, 'rules');
+    }
 });
 test('account queue prioritises bookings and releases after synchronous guard failure', async () => {
     const queue = new AccountQueue(), order: string[] = []; let release!: () => void;
@@ -922,6 +1000,17 @@ test('a newer live route that no longer fits prevents submission', async () => {
     const f = coordinatorFixture(); const cache = f.coordinator.cache(1);
     cache.previous = (q) => ({ ...estimate(q, 1500, false, Date.now() + 1), departure: q.at - 3 * 3600000, arrival: q.at + 2 * 3600000 });
     assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting'); assert.equal(f.books(), 0); f.store.db.close();
+});
+test('a newer cached route keeps its booking allowance during the final recheck', async () => {
+    const f = coordinatorFixture(); const cache = f.coordinator.cache(1);
+    cache.lookup = async q => estimate(q, 1500, false, Date.now() - 60000);
+    const inboundArrivalBy = slotFromTerm(f.term, f.config.cityId).start - 10 * 60000;
+    cache.previous = q => q.kind === 'arrive' && q.mode === 'transit'
+        ? estimate({ ...q, at: inboundArrivalBy }, 1500, true, Date.now() - 1000) : null;
+    const result = await f.coordinator.process(f.config, [f.term]);
+    assert.equal(result.state, 'waiting');
+    assert.equal(f.books(), 0);
+    f.store.db.close();
 });
 test('a route that expires while queued cannot pass the final submit guard', async () => {
     const f = coordinatorFixture();
@@ -970,6 +1059,27 @@ test('a booking completed after its monitor was stopped reports the conflict', a
     assert.equal(f.store.blocks(1).length, 1);
     f.store.db.close();
 });
+test('a confirmed provider warning is delivered with the booked reservation', async () => {
+    const f = coordinatorFixture();
+    f.api.book = async () => ({ state: 'succeeded', reservationId: 77, errorCode: 'BOOKING_WARNINGS_REVIEW' });
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'booked');
+    const outbox = f.store.db.prepare("SELECT message FROM luxmed_notification_outbox WHERE id LIKE 'booked:%'").get() as { message: string };
+    assert.match(outbox.message, /LuxMed returned a booking warning/);
+    assert.equal(f.store.blocks(1).length, 1);
+    f.store.db.close();
+});
+test('active smart monitoring refreshes reservation coverage before it reaches one minute old', async () => {
+    const f = coordinatorFixture(); let calls = 0;
+    f.api.reserved = async () => { calls++; return []; };
+    await f.coordinator.refreshActiveReservations([f.config]);
+    await f.coordinator.refreshActiveReservations([f.config]);
+    assert.equal(calls, 1);
+    f.store.db.prepare('UPDATE luxmed_reservation_snapshots SET fetched_at=? WHERE account_id=?').run(Date.now() - 51000, 1);
+    (f.coordinator as any).lastBackgroundReservationAttempt.set(1, Date.now() - 11000);
+    await f.coordinator.refreshActiveReservations([f.config]);
+    assert.equal(calls, 2);
+    f.store.db.close();
+});
 test('Jev can rank soft preferences but cannot promote another day or a taxi', async () => {
     const a = (await evaluateSlot(slot(), policy, places, [], async q => estimate(q), now))!;
     const b = { ...a, slot: { ...a.slot, id: 'second', start: a.slot.start + 3600000 }, travelSeconds: a.travelSeconds + 60 };
@@ -977,7 +1087,7 @@ test('Jev can rank soft preferences but cannot promote another day or a taxi', a
     const fetch = async (_url: any, init: any) => {
         const body = JSON.parse(init.body); assert.equal(body.state.candidates.length, 2);
         assert.deepEqual(body.state.preferences, ['afternoon']);
-        return new Response(JSON.stringify({ answers: { c0: { type: 'score', score: 1, confidence: 1, probabilities }, c1: { type: 'score', score: 4, confidence: 1, probabilities } } }));
+        return new Response(JSON.stringify({ model: 'typesafe/jev-1.13-20260917', answers: { c0: { type: 'score', score: 1, confidence: 1, probabilities }, c1: { type: 'score', score: 4, confidence: 1, probabilities } } }));
     };
     const ranked = await rankWithJev([a, b, { ...a, slot: { ...a.slot, id: 'taxi' }, taxiLegs: 1 }, { ...a, slot: { ...a.slot, id: 'tomorrow' }, day: '2026-10-07' }], ['Prefer afternoon'], 99, { key: 'fixture', fetch });
     assert.equal(ranked?.source, 'jev'); assert.equal(ranked?.candidate.slot.id, 'second');

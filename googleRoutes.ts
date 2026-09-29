@@ -79,8 +79,11 @@ export async function computeGoogleRoute(q: TravelQuery, options: { apiKey?: str
         }
         const before = steps.slice(0, first).reduce((sum: number, s: any) => sum + seconds(s.staticDuration), 0);
         const after = steps.slice(last + 1).reduce((sum: number, s: any) => sum + seconds(s.staticDuration), 0);
-        const start = Date.parse(steps[first].transitDetails.stopDetails.departureTime) - before * 1000;
+        const walkedStart = Date.parse(steps[first].transitDetails.stopDetails.departureTime) - before * 1000;
         const end = Date.parse(steps[last].transitDetails.stopDetails.arrivalTime) + after * 1000;
+        // The route duration can include waiting that is not represented by
+        // the first and last stop times. Preserve that time before departure.
+        const start = Math.min(walkedStart, end - duration * 1000);
         if (!Number.isFinite(start) || !Number.isFinite(end) || end < start || (q.kind === 'depart' && start < q.at) || (q.kind === 'arrive' && end > q.at)) return base;
         return { ...base, status: 'ok', departure: start, arrival: end, durationSeconds: Math.max(duration, (end - (q.kind === 'depart' ? q.at : start)) / 1000), distanceMeters: r.distanceMeters, fetchedAt: now() };
     }

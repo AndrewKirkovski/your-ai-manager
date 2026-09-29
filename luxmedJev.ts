@@ -42,11 +42,15 @@ export async function rankWithJev(candidates: FeasibleSlot[], preferences: strin
             })(),
             new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Jev deadline')); }, options.timeoutMs ?? 800); }),
         ]);
+        if (typeof result.model !== 'string' || !/^typesafe\/jev-1\.13(?:-|$)/.test(result.model))
+            throw new Error('Unexpected Jev model');
         const scores = facts.map(c => {
             const a = result.answers?.[c.id];
-            const probabilities = Object.values(a?.probabilities || {}) as number[];
+            const keys = Object.keys(a?.probabilities || {});
+            const probabilities = keys.map(key => a.probabilities[key]) as number[];
             if (a?.type !== 'score' || !Number.isFinite(a.score) || a.score < 0 || a.score > 4 || !Number.isFinite(a.confidence) || a.confidence < 0.6 || a.confidence > 1
-                || probabilities.length !== 5 || probabilities.some(p => !Number.isFinite(p) || p < 0 || p > 1) || Math.abs(probabilities.reduce((a, b) => a + b, 0) - 1) > 0.02) throw new Error('Invalid Jev ranking');
+                || keys.length !== 5 || ['0', '1', '2', '3', '4'].some(key => !keys.includes(key))
+                || probabilities.some(p => !Number.isFinite(p) || p < 0 || p > 1) || Math.abs(probabilities.reduce((a, b) => a + b, 0) - 1) > 0.02) throw new Error('Invalid Jev ranking');
             return { id: c.id, score: a.score as number };
         }).sort((a, b) => b.score - a.score);
         return { candidate: group[Number(scores[0].id.slice(1))], source: 'jev' };

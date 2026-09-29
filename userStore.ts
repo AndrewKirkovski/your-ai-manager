@@ -1,6 +1,7 @@
 import db from './database';
 import { smartStore } from './luxmedSmartStore';
 import {DateTime} from 'luxon';
+import { validBookingTimeRange } from './luxmedAvailability';
 import {estimateCostUsd, pricingFor} from './pricing';
 
 // Generate shorter IDs (8 characters)
@@ -1421,6 +1422,13 @@ function rowToMonitoringConfig(row: any): LuxmedMonitoringConfig {
 }
 
 export function createLuxmedMonitoring(config: Omit<LuxmedMonitoringConfig, 'lastCheck' | 'createdAt'>): LuxmedMonitoringConfig {
+    if (!validBookingTimeRange(config.timeFrom, config.timeTo))
+        throw new Error('Monitoring times must be valid HH:mm values in ascending order.');
+    for (const ids of [config.clinicIds, config.doctorIds]) {
+        if (ids !== null && (!Array.isArray(ids) || ids.length === 0
+            || ids.some(id => !Number.isSafeInteger(id) || id <= 0)))
+            throw new Error('Clinic and doctor filters must contain positive IDs or be omitted.');
+    }
     if (config.maxTransitMinutes != null && (!Number.isFinite(config.maxTransitMinutes) || config.maxTransitMinutes < 0)) {
         throw new Error('maxTransitMinutes must be a finite non-negative number');
     }

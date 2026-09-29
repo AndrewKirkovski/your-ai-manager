@@ -35,7 +35,7 @@ if (process.env.EXPECT_LEGACY_BOT_AUTH_FAILURE === 'true') {
         assert.ok(!capabilities.includes('smart-booking-attempts-v4'));
     } else if(process.env.EXPECT_SMART_CAPABILITIES==='true') {
         const capabilities = await api.luxmedCapabilities();
-        for (const required of ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v3', 'smart-booking-attempts-v4', 'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1', 'legacy-booking-barrier-v2', 'smart-booking-enrollment-fence-v2', 'smart-booking-identity-fence-v1', 'cancellation-receipts-v3'])
+        for (const required of ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v3', 'smart-booking-attempts-v4', 'smart-booking-lockterm-review-v1', 'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1', 'legacy-booking-barrier-v2', 'smart-booking-enrollment-fence-v2', 'smart-booking-identity-fence-v1', 'cancellation-receipts-v3'])
             assert.ok(capabilities.includes(required), `missing ${required}`);
         assert.equal((await api.luxmedLegacyBookingBarrier(424242)).state, 'clear');
         assert.equal((await api.luxmedSmartEnrollment(424242)).enrolled, false);

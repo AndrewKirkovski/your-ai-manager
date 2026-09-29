@@ -82,6 +82,12 @@ export interface FeasibleSlot {
 export type RouteLookup = (query: TravelQuery) => Promise<TravelEstimate | null>;
 export const BUFFERS = { transition: 5 * 60000, checkIn: 10 * 60000, after: 10 * 60000, pickup: 5 * 60000 };
 
+export function validBookingTimeRange(from: unknown, to: unknown): boolean {
+    return typeof from === 'string' && typeof to === 'string'
+        && /^([01]\d|2[0-3]):[0-5]\d$/.test(from)
+        && /^([01]\d|2[0-3]):[0-5]\d$/.test(to) && from <= to;
+}
+
 function assert(condition: unknown, message: string): asserts condition {
     if (!condition) throw new Error(message);
 }

@@ -1,7 +1,7 @@
 import { Tool } from './tool.types';
 import { smartStore } from './luxmedSmartStore';
 import { smartBooking } from './luxmedSmartBooking';
-import { zonedTime } from './luxmedAvailability';
+import { validBookingTimeRange, zonedTime } from './luxmedAvailability';
 import { textify } from './telegramFormat';
 import {
     luxmedLogin, luxmedGetCities, luxmedGetServices,
@@ -50,6 +50,22 @@ function requireAccount(userId: number): number {
         throw new Error('LuxMed account not configured. Ask the user to provide their LuxMed login and password first.');
     }
     return accountId;
+}
+
+export function parseMonitorIds(value: unknown, field: string): number[] | null {
+    if (value == null) return null;
+    if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} must be a comma-separated list of positive IDs.`);
+    const parts = value.split(',').map(part => part.trim());
+    if (parts.some(part => !/^\d+$/.test(part) || !Number.isSafeInteger(Number(part)) || Number(part) <= 0))
+        throw new Error(`${field} must be a comma-separated list of positive IDs.`);
+    return [...new Set(parts.map(Number))];
+}
+
+export function parseMonitorBoolean(value: unknown, field: string, fallback: boolean): boolean {
+    if (value == null) return fallback;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    throw new Error(`${field} must be "true" or "false".`);
 }
 
 function formatTerm(term: LuxmedTerm, index: number): string {
@@ -550,10 +566,21 @@ export const LuxmedMonitorSlot: Tool = {
         const serviceError = await validateServiceId(accountId, args.service_id);
         if (serviceError) return { success: false, message: serviceError };
 
-        const clinicIds = args.clinic_ids ? args.clinic_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
-        const doctorIds = args.doctor_ids ? args.doctor_ids.split(',').map(Number).filter(n => !isNaN(n)) : null;
+        let clinicIds: number[] | null, doctorIds: number[] | null;
+        let englishOnly: boolean, autobook: boolean, rebookIfExists: boolean;
+        try {
+            clinicIds = parseMonitorIds(args.clinic_ids, 'clinic_ids');
+            doctorIds = parseMonitorIds(args.doctor_ids, 'doctor_ids');
+            englishOnly = parseMonitorBoolean(args.english_only, 'english_only', false);
+            autobook = parseMonitorBoolean(args.autobook, 'autobook', true);
+            rebookIfExists = parseMonitorBoolean(args.rebook_if_exists, 'rebook_if_exists', false);
+        } catch (error) {
+            return { success: false, message: error instanceof Error ? error.message : 'Invalid clinic or doctor IDs.' };
+        }
 
         const serviceName = textify(args.service_name);
+        if (!validBookingTimeRange(args.time_from, args.time_to))
+            return { success: false, message: 'time_from and time_to must be valid HH:mm values in ascending order.' };
         const parsedDateFrom = new Date(args.date_from);
         const parsedDateTo = new Date(args.date_to);
         if (Number.isNaN(parsedDateFrom.getTime()) || Number.isNaN(parsedDateTo.getTime()) || parsedDateTo < parsedDateFrom) {
@@ -565,7 +592,7 @@ export const LuxmedMonitorSlot: Tool = {
         }
         const cityName = textify(args.city_name) || prefs.defaultCityName || 'Unknown';
 
-        console.log(`[LuxMed] Creating monitoring: ${serviceName}, city=${cityId}, time=${args.time_from}-${args.time_to}, clinics=${clinicIds?.join(',') ?? 'any'}, doctors=${doctorIds?.join(',') ?? 'any'}, english=${args.english_only === 'true'}, autobook=${args.autobook !== 'false'}`);
+        console.log(`[LuxMed] Creating monitoring: ${serviceName}, city=${cityId}, time=${args.time_from}-${args.time_to}, clinics=${clinicIds?.join(',') ?? 'any'}, doctors=${doctorIds?.join(',') ?? 'any'}, english=${englishOnly}, autobook=${autobook}`);
         const monitoring = smartStore.db.transaction(() => {
         const created = createLuxmedMonitoring({
             id: generateShortId(),
@@ -577,13 +604,13 @@ export const LuxmedMonitorSlot: Tool = {
             cityName,
             clinicIds,
             doctorIds,
-            englishOnly: args.english_only === 'true',
+            englishOnly,
             dateFrom: args.date_from,
             dateTo: args.date_to,
             timeFrom: args.time_from,
             timeTo: args.time_to,
-            autobook: args.autobook !== 'false',
-            rebookIfExists: args.rebook_if_exists === 'true',
+            autobook,
+            rebookIfExists,
             maxTransitMinutes,
         });
         smartStore.enroll(created.id,args.userId);

@@ -834,7 +834,7 @@ cron.schedule('0 4 * * *', async () => {
     }
 }, { timezone: BOT_TZ });
 
-// LuxMed monitoring — check every 10 minutes
+// LuxMed monitoring checks due smart searches every five seconds.
 cron.schedule('*/5 * * * * *', async () => {
     try {
         await runLuxmedMonitoringCycle();
