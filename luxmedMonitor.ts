@@ -1,6 +1,6 @@
 /**
  * LuxMed appointment monitoring loop.
- * Runs every 10 minutes, searches for slots matching active monitorings,
+ * Schedules smart searches every 30 seconds and legacy searches every 10 minutes,
  * applies client-side filters (clinic list, doctor list, english-speaking),
  * and auto-books or notifies the user.
  */
@@ -14,9 +14,13 @@ import {
     getActiveLuxmedMonitorings, updateLuxmedMonitoringLastCheck,
     deactivateLuxmedMonitoring, LuxmedMonitoringConfig, getUserAddress,
     getLuxmedClinicByName, saveLuxmedClinic, getLuxmedPreferences,
+    getLuxmedAccountId,
 } from './userStore';
 import { geocode, getDistanceMatrix, isGoogleMapsConfigured } from './googleMapsService';
 import { safeSend, escapeHtml } from './telegramFormat';
+import { smartStore } from './luxmedSmartStore';
+import { smartBooking, monitorReservationCoverage } from './luxmedSmartBooking';
+import { zonedTime } from './luxmedAvailability';
 
 let botInstance: TelegramBot | null = null;
 
@@ -25,7 +29,7 @@ export function initLuxmedMonitor(bot: TelegramBot): void {
 }
 
 // Cache english-speaking doctor IDs per city+service (refreshed each cycle)
-const englishDoctorCache = new Map<string, Set<number>>();
+const englishDoctorCache = new Map<string, {ids:Set<number>;expires:number}>();
 
 // Track monitorings that already notified about auto-book failure (avoid spam every 10 min)
 const autobookFailureNotified = new Set<string>();
@@ -33,12 +37,13 @@ const sidecarFailureNotified = new Set<string>();
 
 async function getEnglishDoctorIds(accountId: number, cityId: number, serviceId: number): Promise<Set<number> | null> {
     const key = `${accountId}:${cityId}:${serviceId}`;
-    if (englishDoctorCache.has(key)) return englishDoctorCache.get(key)!;
+    const cached=englishDoctorCache.get(key);
+    if(cached&&cached.expires>Date.now())return cached.ids;
 
     try {
         const doctors = await luxmedGetDoctors(accountId, cityId, serviceId);
         const englishIds = new Set(doctors.filter(d => d.isEnglishSpeaker).map(d => d.id));
-        englishDoctorCache.set(key, englishIds);
+        englishDoctorCache.set(key, {ids:englishIds,expires:Date.now()+3600000});
         return englishIds;
     } catch {
         return null;
@@ -178,10 +183,17 @@ function formatTermForNotification(t: LuxmedTerm): string {
     return `${escapeHtml(dt)} — ${escapeHtml(doctor)}, ${escapeHtml(clinic)}${tele}`;
 }
 
-async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> {
+async function processMonitoring(config: LuxmedMonitoringConfig, search:typeof luxmedSearchSlots = luxmedSearchSlots): Promise<void> {
+    const smart=smartStore.enrollment(config.id);
+    if(smart&&smart.state!=='active')return;
+    if (getLuxmedAccountId(config.userId) !== config.accountId) {
+        deactivateLuxmedMonitoring(config.id, config.userId);
+        if (smart) smartStore.status(config.id, 'LuxMed account changed; create and confirm a new monitor');
+        return;
+    }
     // Check if monitoring date range is still valid
     const now = new Date();
-    const dateTo = new Date(config.dateTo);
+    const dateTo = new Date(zonedTime(/^\d{4}-\d{2}-\d{2}$/.test(config.dateTo)?`${config.dateTo}T23:59:59`:config.dateTo));
     if (Number.isNaN(dateTo.getTime()) || dateTo < now) {
         deactivateLuxmedMonitoring(config.id, config.userId);
         autobookFailureNotified.delete(config.id);
@@ -196,7 +208,14 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
 
     try {
         // Search with broad params — filtering happens client-side
-        const terms = await luxmedSearchSlots(config.accountId, {
+        if(smart) {
+            const policy=smartStore.policy(config.userId);
+            if(!policy||policy.state!=='confirmed'||policy.holdToken){smartStore.status(config.id,'Availability needs review or confirmation');return;}
+            const issue=await smartBooking.readiness();if(issue){smartStore.status(config.id,issue);return;}
+            if(config.autobook){const legacy=await smartBooking.legacyMonitorIssue(config.accountId);if(legacy){smartStore.status(config.id,legacy);return;}}
+            await smartBooking.refreshReservations(config.accountId, monitorReservationCoverage(config));
+        }
+        const terms = await search(config.accountId, {
             cityId: config.cityId,
             serviceId: config.serviceId,
             dateFrom: config.dateFrom,
@@ -206,6 +225,12 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
         });
 
         updateLuxmedMonitoringLastCheck(config.id);
+        if(smart) {
+            const result=await smartBooking.process(config,terms);
+            smartStore.status(config.id,result.message);
+            smartStore.db.prepare('UPDATE luxmed_smart_monitors SET failures=0 WHERE monitoring_id=?').run(config.id);
+            return;
+        }
         sidecarFailureNotified.delete(config.id);
         console.log(`[LuxMed Monitor] ${config.id}: ${terms.length} raw slots for "${config.serviceName}"`);
 
@@ -231,6 +256,10 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
             // Auto-book the first matching slot
             const best = filtered[0];
             try {
+                if (getLuxmedAccountId(config.userId) !== config.accountId) {
+                    deactivateLuxmedMonitoring(config.id, config.userId);
+                    return;
+                }
                 await luxmedBookSlot(config.accountId, best, config.cityId, config.rebookIfExists);
                 deactivateLuxmedMonitoring(config.id, config.userId);
                 autobookFailureNotified.delete(config.id);
@@ -274,6 +303,11 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
         }
     } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
+        if(smart) {
+            const failures=(smartStore.enrollment(config.id)?.failures||0)+1;
+            const delay=err instanceof LuxmedApiError&&Number.isFinite(err.retryAfterMs)?err.retryAfterMs!:Math.min(600000,30000*2**Math.min(failures-1,5));
+            smartStore.db.prepare('UPDATE luxmed_smart_monitors SET status=?,failures=?,next_check=? WHERE monitoring_id=?').run(errMsg,failures,Date.now()+delay,config.id);
+        }
         console.error(`[LuxMed Monitor] ${config.id}: Error checking "${config.serviceName}": ${errMsg}`);
         // If auth error, notify user and deactivate
         const sidecarFailure = err instanceof LuxmedApiError && ['CLIENT_OUTDATED', 'SIDECAR_UNAVAILABLE', 'SIDECAR_TIMEOUT', 'SIDECAR_INVALID_RESPONSE'].includes(err.code);
@@ -299,33 +333,47 @@ async function processMonitoring(config: LuxmedMonitoringConfig): Promise<void> 
     }
 }
 
-// Overlap guard: N monitorings × ~32s upper bound (30s sidecar timeout + 2s
-// delay) can exceed the 10-min cron interval. Skip overlapping ticks.
-let cycleRunning = false;
+// Accounts progress independently. An account never starts an overlapping cycle.
+const runningAccounts=new Set<number>();
+const lastAccountMonitor=new Map<number,string>();
+const recentSearches=new Map<string,{started:number;result:Promise<LuxmedTerm[]>}>();
 export async function runLuxmedMonitoringCycle(): Promise<void> {
-    if (cycleRunning) {
-        console.warn('[LuxMed Monitor] Previous cycle still running, skipping this tick');
-        return;
+    void smartBooking.reconcile();
+    if(botInstance)await smartStore.deliver((userId,message)=>safeSend(botInstance!,userId,message));
+    const groups=new Map<number,LuxmedMonitoringConfig[]>();
+    for(const config of getActiveLuxmedMonitorings()) {
+        const smart=smartStore.enrollment(config.id);
+        if(smart ? smart.state!=='active'||smart.next_check>Date.now() : config.lastCheck&&Date.now()-Date.parse(config.lastCheck)<600000)continue;
+        const group=groups.get(config.accountId)||[];group.push(config);groups.set(config.accountId,group);
     }
-    cycleRunning = true;
-    try {
-        const monitorings = getActiveLuxmedMonitorings();
-        if (monitorings.length === 0) return;
-
-        console.log(`[LuxMed Monitor] Checking ${monitorings.length} active monitoring(s)...`);
-
-        // Clear english doctor cache each cycle (refreshes every 10 min)
-        englishDoctorCache.clear();
-
-        // Process sequentially to avoid rate limiting
-        for (const config of monitorings) {
-            await processMonitoring(config);
-            // Small delay between checks to be gentle on the API
-            if (monitorings.length > 1) {
-                await new Promise(resolve => setTimeout(resolve, 2000));
+    await Promise.all([...groups].map(async([accountId,configs])=>{
+        if(runningAccounts.has(accountId))return;
+        runningAccounts.add(accountId);
+        const last=lastAccountMonitor.get(accountId);
+        if(last){const index=configs.findIndex(c=>c.id===last);configs.push(...configs.splice(0,index+1));}
+        const search:typeof luxmedSearchSlots=(id,params)=>{
+            const key=JSON.stringify([id,params]);
+            let pending=recentSearches.get(key);
+            if(!pending||Date.now()-pending.started>=30000){
+                const started=Date.now(),pollGapMs=pending?started-pending.started:null;
+                const result=luxmedSearchSlots(id,params).then(terms=>{
+                    console.log('[LuxMed monitor] Search timing',{accountId:id,pollGapMs,searchMs:Date.now()-started,slots:terms.length});
+                    return terms;
+                });
+                pending={started,result};recentSearches.set(key,pending);
+                if(recentSearches.size>1000)recentSearches.delete(recentSearches.keys().next().value!);
             }
-        }
-    } finally {
-        cycleRunning = false;
-    }
+            return pending.result;
+        };
+        try {
+            for(const config of configs) {
+                const started=Date.now();
+                const smart=smartStore.enrollment(config.id);
+                if(smart)smartStore.db.prepare('UPDATE luxmed_smart_monitors SET next_check=? WHERE monitoring_id=?').run(started+30000+Math.floor(Math.random()*3000),config.id);
+                if(config.lastCheck)console.log('[LuxMed monitor] Time since previous result',{monitorId:config.id,sinceResultMs:started-Date.parse(config.lastCheck)});
+                await processMonitoring(config,search);
+                lastAccountMonitor.set(accountId,config.id);
+            }
+        }finally{runningAccounts.delete(accountId);}
+    }));
 }

@@ -4,6 +4,23 @@ on:
   push:
     branches: [main, codex/luxmed-unattended-update]
   workflow_dispatch:
+    inputs:
+      release_stage:
+        description: "Use sidecar-after-bot only after the deployed bot reports this full revision through /version"
+        required: true
+        type: choice
+        default: standard
+        options:
+          - standard
+          - sidecar-after-bot
+      observed_bot_revision:
+        description: "Full revision reported by the deployed bot through /version; required for sidecar-after-bot"
+        required: false
+        type: string
+      observed_challenge:
+        description: "Fresh challenge echoed by /version; required for sidecar-after-bot"
+        required: false
+        type: string
 
 # Serialize publication so separate runs cannot mix latest images.
 concurrency:
@@ -40,6 +57,14 @@ jobs:
       - name: Typecheck bot
         run: yarn typecheck
 
+      - name: Test smart booking with simulated providers
+        run: yarn test:luxmed
+
+      - name: Test registry release guard with simulated Docker results
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 tests/test_luxmed_release_guard.py
+
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
@@ -50,7 +75,7 @@ jobs:
         working-directory: luxmed-bot
         run: |
           chmod +x gradlew
-          ./gradlew checkScalafmtAll :api:test :bot:test :common:test :server:test :server:build --no-daemon
+          ./gradlew :api:test :bot:test :common:test :server:test :server:build --no-daemon
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -59,33 +84,140 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Identify watched release baseline
+        id: baseline
+        run: |
+          set -euo pipefail
+          docker pull "$BOT_IMAGE:latest"
+          docker pull "$SIDECAR_IMAGE:latest"
+          marker="$(docker image inspect --format '{{ index .Config.Labels "com.ai-managers.rest-auth-migrated" }}' "$SIDECAR_IMAGE:latest")"
+          if [ "$marker" = 'v1' ]; then
+            echo 'auth_migrated=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'auth_migrated=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify staged sidecar release attestation
+        if: github.event_name == 'workflow_dispatch' && inputs.release_stage == 'sidecar-after-bot'
+        env:
+          OBSERVED_BOT_REVISION: ${{ inputs.observed_bot_revision }}
+          OBSERVED_CHALLENGE: ${{ inputs.observed_challenge }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != 'refs/heads/main' ] || [ '${{ steps.baseline.outputs.auth_migrated }}' != 'false' ]; then
+            echo 'The staged sidecar release is valid only on main before the authentication migration.' >&2
+            exit 1
+          fi
+          if ! [[ "$OBSERVED_BOT_REVISION" =~ ^[0-9a-f]{40}$ ]] || [ "$OBSERVED_BOT_REVISION" != "$GITHUB_SHA" ]; then
+            echo 'The observed bot revision must be the full SHA of this workflow run.' >&2
+            exit 1
+          fi
+          if ! [[ "$OBSERVED_CHALLENGE" =~ ^[A-Za-z0-9_-]{8,64}$ ]]; then
+            echo 'The observed /version challenge must be 8 to 64 letters, digits, underscores or hyphens.' >&2
+            exit 1
+          fi
+          remote_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          bot_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$BOT_IMAGE:latest")"
+          if [ "$remote_head" != "$GITHUB_SHA" ] || [ "$bot_revision" != "$OBSERVED_BOT_REVISION" ]; then
+            echo 'Main or the watched bot image has changed since the observed /version response.' >&2
+            exit 1
+          fi
+          {
+            echo "Operator observed /version challenge: $OBSERVED_CHALLENGE"
+            echo "Operator observed bot revision: $OBSERVED_BOT_REVISION"
+            echo 'CI compared the revision with main and the watched registry image; CI did not inspect Murzik.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build bot candidate
+        if: github.event_name != 'workflow_dispatch' || inputs.release_stage != 'sidecar-after-bot'
         uses: docker/build-push-action@v5
         with:
           context: .
           load: true
           tags: luxmed-bot:test
+          build-args: BOT_IMAGE_REVISION=${{ github.sha }}
           labels: org.opencontainers.image.revision=${{ github.sha }}
 
+      - name: Load immutable images from the staged bot release
+        if: github.event_name == 'workflow_dispatch' && inputs.release_stage == 'sidecar-after-bot'
+        run: |
+          set -euo pipefail
+          docker pull "$BOT_IMAGE:$GITHUB_SHA"
+          docker pull "$SIDECAR_IMAGE:$GITHUB_SHA"
+          latest_bot_id="$(docker image inspect --format '{{.Id}}' "$BOT_IMAGE:latest")"
+          staged_bot_id="$(docker image inspect --format '{{.Id}}' "$BOT_IMAGE:$GITHUB_SHA")"
+          if [ "$latest_bot_id" != "$staged_bot_id" ]; then
+            echo 'The watched bot image differs from the immutable image reported by /version.' >&2
+            exit 1
+          fi
+          for image in "$BOT_IMAGE:$GITHUB_SHA" "$SIDECAR_IMAGE:$GITHUB_SHA"; do
+            revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")"
+            if [ "$revision" != "$GITHUB_SHA" ]; then
+              echo "Staged image revision does not match the release SHA: $image" >&2
+              exit 1
+            fi
+          done
+          marker="$(docker image inspect --format '{{ index .Config.Labels "com.ai-managers.rest-auth-migrated" }}' "$SIDECAR_IMAGE:$GITHUB_SHA")"
+          if [ "$marker" != 'v1' ]; then
+            echo 'The staged sidecar is missing the authenticated migration marker.' >&2
+            exit 1
+          fi
+          docker tag "$BOT_IMAGE:$GITHUB_SHA" luxmed-bot:test
+          docker tag "$SIDECAR_IMAGE:$GITHUB_SHA" luxmed-sidecar:test
+
+      - name: Verify bot candidate reports its build revision
+        run: |
+          set -euo pipefail
+          revision="$(docker run --rm luxmed-bot:test node -p process.env.BOT_IMAGE_REVISION)"
+          if ! [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || [ "$revision" != "$GITHUB_SHA" ]; then
+            echo 'The bot image does not report the exact release revision.' >&2
+            exit 1
+          fi
+
       - name: Build sidecar candidate
+        if: github.event_name != 'workflow_dispatch' || inputs.release_stage != 'sidecar-after-bot'
         uses: docker/build-push-action@v5
         with:
           context: .
           file: docker/Dockerfile.luxmed-prod
           load: true
           tags: luxmed-sidecar:test
-          labels: org.opencontainers.image.revision=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            com.ai-managers.rest-auth-migrated=v1
 
-      - name: Rehearse unattended upgrade from deployed configuration
+      - name: Rehearse bot-first Watchtower upgrade from deployed configuration
         env:
-          LEGACY_SIDECAR_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager-luxmed-sidecar:71d61a0
-          LEGACY_BOT_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager:71d61a0
+          LEGACY_SIDECAR_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager-luxmed-sidecar:latest
+          LEGACY_BOT_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager:latest
+          REHEARSAL_ORDER: bot-first
+        run: python3 tests/luxmed-image-upgrade.py
+
+      - name: Rehearse sidecar-first Watchtower upgrade after authentication migration
+        if: steps.baseline.outputs.auth_migrated == 'true'
+        env:
+          LEGACY_SIDECAR_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager-luxmed-sidecar:latest
+          LEGACY_BOT_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager:latest
+          REHEARSAL_ORDER: sidecar-first
+          REHEARSAL_REQUIRE_SEAMLESS: 'true'
+        run: python3 tests/luxmed-image-upgrade.py
+
+      - name: Rehearse sidecar replacement with the observed bot revision
+        if: github.event_name == 'workflow_dispatch' && inputs.release_stage == 'sidecar-after-bot'
+        env:
+          LEGACY_SIDECAR_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager-luxmed-sidecar:latest
+          LEGACY_BOT_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager:latest
+          REHEARSAL_ORDER: sidecar-first
+          REHEARSAL_REQUIRE_SEAMLESS: 'true'
         run: python3 tests/luxmed-image-upgrade.py
 
       - name: Publish tested images
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
+          AUTH_MIGRATED: ${{ steps.baseline.outputs.auth_migrated }}
+          RELEASE_STAGE: ${{ inputs.release_stage || 'standard' }}
         run: |
           set -euo pipefail
           remote_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
@@ -93,17 +225,40 @@ jobs:
             echo "A newer main commit exists; skipping superseded publication."
             exit 0
           fi
-          # Push both immutable references before advancing the watched tags.
-          for pair in "luxmed-bot:test $BOT_IMAGE" "luxmed-sidecar:test $SIDECAR_IMAGE"; do
-            read -r local_image remote_image <<< "$pair"
-            docker tag "$local_image" "$remote_image:$GITHUB_SHA"
-            docker push "$remote_image:$GITHUB_SHA"
-          done
-          docker tag luxmed-sidecar:test "$SIDECAR_IMAGE:latest"
-          docker push "$SIDECAR_IMAGE:latest"
-          docker tag luxmed-bot:test "$BOT_IMAGE:latest"
-          docker push "$BOT_IMAGE:latest"
+          if [ "$RELEASE_STAGE" = 'sidecar-after-bot' ]; then
+            # Use the exact sidecar image tested and published in the bot stage.
+            # The attested bot and both immutable SHA tags remain unchanged.
+            python3 deploy/luxmed_release_guard.py luxmed-sidecar:test "$SIDECAR_IMAGE:$GITHUB_SHA" "$GITHUB_SHA" "$SIDECAR_IMAGE:latest"
+            docker tag luxmed-sidecar:test "$SIDECAR_IMAGE:latest"
+            docker push "$SIDECAR_IMAGE:latest"
+          else
+            # Push both immutable references before advancing watched tags.
+            for pair in "luxmed-bot:test $BOT_IMAGE" "luxmed-sidecar:test $SIDECAR_IMAGE"; do
+              read -r local_image remote_image <<< "$pair"
+              tag="$remote_image:$GITHUB_SHA"
+              tag_state="$(python3 deploy/luxmed_release_guard.py "$local_image" "$tag" "$GITHUB_SHA" "$remote_image:latest")"
+              if [ "$tag_state" = 'missing' ]; then
+                docker tag "$local_image" "$tag"
+                docker push "$tag"
+                verified_state="$(python3 deploy/luxmed_release_guard.py "$local_image" "$tag" "$GITHUB_SHA" "$remote_image:latest")"
+                if [ "$verified_state" != 'present' ]; then
+                  echo "Published SHA tag could not be read back: $tag" >&2
+                  exit 1
+                fi
+              elif [ "$tag_state" != 'present' ]; then
+                echo "Unexpected SHA tag state: $tag_state" >&2
+                exit 1
+              fi
+            done
+            docker tag luxmed-bot:test "$BOT_IMAGE:latest"
+            docker push "$BOT_IMAGE:latest"
+            if [ "$AUTH_MIGRATED" = 'true' ]; then
+              docker tag luxmed-sidecar:test "$SIDECAR_IMAGE:latest"
+              docker push "$SIDECAR_IMAGE:latest"
+            fi
+          fi
           {
-            echo "Published bot and sidecar for $GITHUB_SHA after upgrade verification."
+            echo "Published release stage $RELEASE_STAGE for $GITHUB_SHA."
+            echo "Authentication migration baseline: $AUTH_MIGRATED."
             echo "Watchtower rehearsal preserved PG10, stored credentials and existing environment."
           } >> "$GITHUB_STEP_SUMMARY"

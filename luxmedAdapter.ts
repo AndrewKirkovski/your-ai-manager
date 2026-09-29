@@ -4,6 +4,7 @@
  */
 
 import { createHmac } from 'node:crypto';
+import { luxmedAccountQueue } from './luxmedAccountQueue';
 
 const SIDECAR_URL = process.env.LUXMED_SIDECAR_URL || 'http://localhost:8080';
 // Watchtower retains the old container environment. Both containers already
@@ -24,6 +25,7 @@ interface ApiResponse<T> {
 export class LuxmedApiError extends Error {
     readonly code: string;
     readonly status?: number;
+    retryAfterMs?: number;
 
     constructor(message: string, code = 'LUXMED_API_ERROR', status?: number) {
         super(message);
@@ -79,6 +81,7 @@ export interface LuxmedTerm {
         doctor: LuxmedDoctor;
         isTelemedicine: boolean;
         isAdditional: boolean;
+        isImpediment?: boolean;
         roomId: number;
         scheduleId: number;
         serviceId: number;
@@ -88,15 +91,33 @@ export interface LuxmedTerm {
 
 export interface LuxmedEvent {
     date: string;
-    clinic?: { address?: string; city?: string } | null;
+    dateTo?: string | null;
+    eventType?: string | null;
+    clinic?: { address?: string; city?: string; id?: number; name?: string } | null;
     doctor?: { name?: string; lastname?: string } | null;
     eventId: number;
     status: string;
     title: string;
 }
 
+export interface LuxmedCancellationReceipt {
+    accountId: number;
+    reservationId: number;
+    startAt: number;
+    state: 'pending' | 'confirmed' | 'verified_still_reserved';
+    confirmedAt?: number | null;
+    reviewedAt?: number | null;
+    reviewedBy?: string | null;
+    reviewReason?: string | null;
+    reviewAction?: string | null;
+}
+
 export interface LuxmedMonitoring {
     recordId: number;
+    cityId?: number;
+    serviceId?: number;
+    clinicId?: number | null;
+    doctorId?: number | null;
     cityName: string;
     clinicName: string;
     serviceName: string;
@@ -109,7 +130,33 @@ export interface LuxmedMonitoring {
     active: boolean;
 }
 
-async function sidecarRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
+const accountBackoff = new Map<string,{until:number;failures:number}>();
+async function sidecarRequest<T>(method: string, path: string, body?: unknown, guard?:()=>boolean): Promise<T> {
+    const accountId=/\/accounts\/(\d+)\//.exec(path)?.[1];
+    const run=async()=>{
+        if(guard&&!guard())throw new LuxmedApiError('Availability changed before submission','BOOKING_GUARD_CHANGED');
+        const backoff=accountId ? accountBackoff.get(accountId) : undefined;
+        const upstream=!!accountId&&!path.includes('/booking-attempts/');
+        if(upstream&&backoff&&backoff.until>Date.now()) {
+            const error=new LuxmedApiError('LuxMed account is waiting before another request','ACCOUNT_BACKOFF',429);
+            error.retryAfterMs=backoff.until-Date.now();throw error;
+        }
+        try {
+            const result=await requestSidecar<T>(method,path,body);
+            if(upstream)accountBackoff.delete(accountId!);
+            return result;
+        }catch(error) {
+            if(upstream&&error instanceof LuxmedApiError) {
+                const failures=(backoff?.failures||0)+1;
+                const retry=error.retryAfterMs ?? (error.status===429||failures>=2 ? Math.min(600000,30000*2**Math.min(failures-1,5)) : 0);
+                accountBackoff.set(accountId!,{until:Date.now()+retry,failures});
+            }
+            throw error;
+        }
+    };
+    return accountId ? luxmedAccountQueue.run(Number(accountId),path.endsWith('/book')||path.endsWith('/booking-attempts')?10:path.includes('visits/reserved')?5:0,run) : run();
+}
+async function requestSidecar<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${SIDECAR_URL}${path}`;
     const start = Date.now();
     console.log(`[LuxMed API] ${method} ${path}`);
@@ -145,11 +192,14 @@ async function sidecarRequest<T>(method: string, path: string, body?: unknown): 
     } catch {
         const elapsed = Date.now() - start;
         console.error(`[LuxMed API] ${method} ${path} ${response.status} non-JSON (${elapsed}ms)`);
-        throw new LuxmedApiError(`LuxMed API error (${response.status}): non-JSON response`, 'SIDECAR_INVALID_RESPONSE', response.status);
+        const error=new LuxmedApiError(`LuxMed API error (${response.status}): non-JSON response`, 'SIDECAR_INVALID_RESPONSE', response.status);
+        const retry=response.headers.get('Retry-After');
+        if(retry)error.retryAfterMs=/^\d+$/.test(retry)?Number(retry)*1000:Math.max(0,Date.parse(retry)-Date.now());
+        throw error;
     }
 
     const elapsed = Date.now() - start;
-    if (!result.success) {
+    if (!response.ok || !result.success) {
         const error = typeof result.error === 'string' ? result.error : result.error?.message;
         const normalizedError = (error || '').toLocaleLowerCase('pl-PL');
         const responseCode = typeof result.error === 'object' ? result.error?.code : undefined;
@@ -157,7 +207,10 @@ async function sidecarRequest<T>(method: string, path: string, body?: unknown): 
             ? 'CLIENT_OUTDATED'
             : undefined);
         console.error(`[LuxMed API] ${method} ${path} FAILED (${elapsed}ms): ${error}`);
-        throw new LuxmedApiError(error || `LuxMed API error (${response.status})`, code || 'LUXMED_API_ERROR', response.status);
+        const apiError = new LuxmedApiError(error || `LuxMed API error (${response.status})`, code || 'LUXMED_API_ERROR', response.status);
+        const retryAfter = response.headers.get('retry-after');
+        if (retryAfter) apiError.retryAfterMs = /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now());
+        throw apiError;
     }
 
     console.log(`[LuxMed API] ${method} ${path} OK (${elapsed}ms)`);
@@ -271,11 +324,11 @@ function termTimestamp(term: LuxmedTerm): number {
     return parseSearchDate(term.term.dateTimeFrom.dateTimeLocal || term.term.dateTimeFrom.dateTimeTz || '') || Number.MAX_SAFE_INTEGER;
 }
 
-export async function luxmedBookSlot(accountId: number, term: LuxmedTerm, cityId: number, rebookIfExists: boolean = false): Promise<unknown> {
+export async function luxmedBookSlot(accountId: number, term: LuxmedTerm, cityId: number, rebookIfExists: boolean = false, attemptId?: string, guard?:()=>boolean): Promise<unknown> {
     const t = term.term;
     const dateTimeFrom = t.dateTimeFrom.dateTimeLocal || t.dateTimeFrom.dateTimeTz || '';
     const dateTimeTo = t.dateTimeTo.dateTimeLocal || t.dateTimeTo.dateTimeTz || '';
-    return sidecarRequest('POST', `/api/v1/accounts/${accountId}/book`, {
+    return sidecarRequest('POST', `/api/v1/accounts/${accountId}/${attemptId ? 'booking-attempts' : 'book'}`, {
         cityId,
         clinicId: t.clinicId,
         clinicGroupId: t.clinicGroupId,
@@ -291,23 +344,61 @@ export async function luxmedBookSlot(accountId: number, term: LuxmedTerm, cityId
         dateTimeTo,
         isTelemedicine: t.isTelemedicine,
         isAdditional: t.isAdditional,
+        isImpediment: t.isImpediment,
+        impedimentText: t.impedimentText || '',
         isPreparationRequired: term.additionalData.isPreparationRequired,
+        preparationItems: term.additionalData.preparationItems,
         rebookIfExists,
-    });
+        ...(attemptId ? { attemptId } : {}),
+    },guard);
+}
+
+export interface BookingOutcome { state: 'pending' | 'unknown' | 'succeeded' | 'failed' | 'blocked' | 'not_found'; reservationId?: number; errorCode?: string; }
+export function luxmedCapabilities(): Promise<string[]> { return sidecarRequest('GET', '/api/v1/capabilities'); }
+export function luxmedBookingAttempt(accountId: number, attemptId: string): Promise<BookingOutcome> {
+    return sidecarRequest('GET', `/api/v1/accounts/${accountId}/booking-attempts/${encodeURIComponent(attemptId)}`);
+}
+export interface LegacyBookingBarrier { state: 'clear' | 'pending' | 'succeeded'; reservationId?: number; start?: number; }
+export function luxmedLegacyBookingBarrier(accountId: number): Promise<LegacyBookingBarrier> {
+    return sidecarRequest('GET', `/api/v1/accounts/${accountId}/legacy-booking-barrier`);
+}
+export async function luxmedAcknowledgeLegacyBooking(accountId: number, reservationId: number): Promise<void> {
+    await sidecarRequest('POST', `/api/v1/accounts/${accountId}/legacy-booking-barrier/acknowledge`, { reservationId });
+}
+export function luxmedSmartEnrollment(accountId: number): Promise<{ enrolled: boolean }> {
+    return sidecarRequest('GET', `/api/v1/accounts/${accountId}/smart-booking-enrollment`);
+}
+export async function luxmedEnrollSmartAccount(accountId: number, expectedAutoMonitorIds: number[]): Promise<void> {
+    const expected = [...expectedAutoMonitorIds].sort((a, b) => a - b);
+    const result = await sidecarRequest<{ enrolled: boolean; stoppedAutoMonitorIds: number[] }>('POST',
+        `/api/v1/accounts/${accountId}/smart-booking-enrollment`, { expectedAutoMonitorIds: expected });
+    const stopped = result?.stoppedAutoMonitorIds;
+    if (result?.enrolled !== true || !Array.isArray(stopped) || stopped.length !== expected.length
+        || [...stopped].sort((a, b) => a - b).some((id, index) => id !== expected[index])) {
+        throw new LuxmedApiError('Sidecar did not confirm the exact automatic monitors stopped during enrollment.', 'SMART_ENROLLMENT_UNCONFIRMED');
+    }
 }
 
 // === Visits ===
 
-export async function luxmedGetReserved(accountId: number): Promise<LuxmedEvent[]> {
-    return sidecarRequest<LuxmedEvent[]>('GET', `/api/v1/accounts/${accountId}/visits/reserved`);
+export async function luxmedGetReserved(accountId: number, coverage?: { from: number; to: number }): Promise<LuxmedEvent[]> {
+    if (!coverage) return sidecarRequest<LuxmedEvent[]>('GET', `/api/v1/accounts/${accountId}/visits/reserved`);
+    const from = encodeURIComponent(new Date(coverage.from).toISOString());
+    const to = encodeURIComponent(new Date(coverage.to).toISOString());
+    return sidecarRequest<LuxmedEvent[]>('GET', `/api/v1/accounts/${accountId}/visits/reserved/verified?from=${from}&to=${to}`);
 }
 
 export async function luxmedGetHistory(accountId: number): Promise<LuxmedEvent[]> {
     return sidecarRequest<LuxmedEvent[]>('GET', `/api/v1/accounts/${accountId}/visits/history`);
 }
 
-export async function luxmedCancelVisit(accountId: number, reservationId: number): Promise<void> {
-    await sidecarRequest('DELETE', `/api/v1/accounts/${accountId}/visits/${reservationId}`);
+export async function luxmedCancelVisit(accountId: number, reservationId: number, expectedStartAt: number): Promise<void> {
+    if (!Number.isSafeInteger(expectedStartAt) || expectedStartAt <= 0) throw new Error('Invalid expected reservation start.');
+    await sidecarRequest('DELETE', `/api/v1/accounts/${accountId}/visits/${reservationId}?expectedStartAt=${expectedStartAt}`);
+}
+
+export async function luxmedCancellationReceipts(accountId: number): Promise<LuxmedCancellationReceipt[]> {
+    return sidecarRequest<LuxmedCancellationReceipt[]>('GET', `/api/v1/accounts/${accountId}/visits/cancellation-receipts`);
 }
 
 // === Monitoring ===
@@ -340,6 +431,10 @@ export async function luxmedGetMonitorings(accountId: number): Promise<LuxmedMon
 
 export async function luxmedDeactivateMonitoring(accountId: number, monitoringId: number): Promise<void> {
     await sidecarRequest('DELETE', `/api/v1/accounts/${accountId}/monitorings/${monitoringId}`);
+}
+
+export async function luxmedQuiesceMonitoring(accountId: number, monitoringId: number): Promise<void> {
+    await sidecarRequest('POST', `/api/v1/accounts/${accountId}/monitorings/${monitoringId}/quiesce`);
 }
 
 // === Health ===

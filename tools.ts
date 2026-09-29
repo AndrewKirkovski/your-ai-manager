@@ -62,6 +62,8 @@ import {
     SuggestExpressions,
 } from "./tools.stickercache";
 import { GetTokenUsage } from "./tools.tokens";
+import { LuxmedDraftAvailability, LuxmedSaveBookingLocation, LuxmedAvailabilityStatus, LuxmedPreviewAvailability, LuxmedPauseSmartBooking, LuxmedAvailabilityReviewed } from './tools.luxmedSmart';
+import { LuxmedSetScheduleAppointment, LuxmedListScheduleAppointments, LuxmedDeleteScheduleAppointment } from './tools.scheduleAppointments';
 
 export const tools = {
     get_current_time,
@@ -125,6 +127,15 @@ export const tools = {
     LuxmedMonitorSlot,
     LuxmedStopMonitoring,
     LuxmedListMonitorings,
+    LuxmedDraftAvailability,
+    LuxmedSaveBookingLocation,
+    LuxmedAvailabilityStatus,
+    LuxmedPreviewAvailability,
+    LuxmedPauseSmartBooking,
+    LuxmedAvailabilityReviewed,
+    LuxmedSetScheduleAppointment,
+    LuxmedListScheduleAppointments,
+    LuxmedDeleteScheduleAppointment,
     // Directions & Maps
     GetDirections,
     // Address management

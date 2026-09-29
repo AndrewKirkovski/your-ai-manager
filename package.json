@@ -31,7 +31,8 @@
   },
   "scripts": {
     "start": "tsx index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:luxmed": "node --import tsx --test tests/luxmed-smart.test.ts tests/luxmed-defender.test.ts tests/luxmed-rollback.test.ts tests/luxmed-ingress.test.ts tests/luxmed-travel-cooldown.test.ts tests/release-version.test.ts"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

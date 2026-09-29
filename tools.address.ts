@@ -5,24 +5,27 @@ import { textify } from './telegramFormat';
 
 export const SaveAddress: Tool = {
     name: 'SaveAddress',
-    description: 'Save a named address for the user (e.g., home, work, gym, friend name). Geocodes the address automatically. Use when user says "my home is at...", "I live at...", "save address...", or shares a location.',
+    description: 'Save a named address for the user (e.g., home, work, gym, friend name). Geocodes a street address or saves a shared Telegram location. Smart LuxMed booking needs separate street-address verification.',
     parameters: {
         type: 'object',
         properties: {
             label: { type: 'string', description: 'Address label, e.g. "home", "work", "gym", "zapaven". Lowercase.' },
             address: { type: 'string', description: 'Full address to geocode, e.g. "ul. Marszałkowska 1, Warszawa"' },
-            lat: { type: 'number', description: 'Latitude (use if user shared Telegram location, skip geocoding)' },
-            lng: { type: 'number', description: 'Longitude (use if user shared Telegram location, skip geocoding)' },
+            lat: { type: 'number', description: 'Latitude from a shared Telegram location, without address text' },
+            lng: { type: 'number', description: 'Longitude from a shared Telegram location, without address text' },
         },
         required: ['label'],
     },
     execute: async (args: { userId: number; label: string; address?: string; lat?: number; lng?: number }) => {
         const label = textify(args.label);
         const rawAddress = textify(args.address);
-        if (args.lat != null && args.lng != null) {
-            const address = rawAddress || `${args.lat.toFixed(4)}, ${args.lng.toFixed(4)}`;
+        if (args.lat != null || args.lng != null) {
+            if (args.lat == null || args.lng == null || rawAddress || !Number.isFinite(args.lat) || !Number.isFinite(args.lng)
+                || Math.abs(args.lat) > 90 || Math.abs(args.lng) > 180)
+                return { success: false, message: 'Provide either a street address or valid coordinates from a shared location, not both.' };
+            const address = `${args.lat.toFixed(4)}, ${args.lng.toFixed(4)}`;
             saveUserAddress(args.userId, label, address, args.lat, args.lng);
-            return { success: true, message: `Address "${label}" saved: ${address}` };
+            return { success: true, message: `Location "${label}" saved: ${address}. Confirm a street address separately for smart LuxMed booking.` };
         }
 
         if (!rawAddress) {

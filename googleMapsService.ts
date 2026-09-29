@@ -5,6 +5,7 @@
  */
 
 import db from './database';
+export { computeGoogleRoute, resolveStreetAddress } from './googleRoutes';
 
 const API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
 const BASE = 'https://maps.googleapis.com/maps/api';
@@ -42,7 +43,7 @@ function cacheSet<T>(key: string, data: T, ttl: number): void {
 }
 
 // Prune expired entries every hour
-setInterval(() => { stmts.prune.run(Date.now()); }, 60 * 60 * 1000);
+setInterval(() => { stmts.prune.run(Date.now()); }, 60 * 60 * 1000).unref();
 
 // === Geocoding ===
 

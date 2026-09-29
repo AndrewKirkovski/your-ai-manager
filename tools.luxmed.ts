@@ -1,9 +1,12 @@
 import { Tool } from './tool.types';
+import { smartStore } from './luxmedSmartStore';
+import { smartBooking } from './luxmedSmartBooking';
+import { zonedTime } from './luxmedAvailability';
 import { textify } from './telegramFormat';
 import {
     luxmedLogin, luxmedGetCities, luxmedGetServices,
-    luxmedSearchSlots, luxmedBookSlot, luxmedCancelVisit, luxmedGetReserved,
-    LuxmedTerm,
+    luxmedSearchSlots, luxmedCancelVisit, luxmedCancellationReceipts, luxmedGetReserved, luxmedCapabilities,
+    LuxmedTerm, LuxmedMonitoring, LuxmedApiError, luxmedGetMonitorings, luxmedQuiesceMonitoring,
 } from './luxmedAdapter';
 import { geocode, getDistanceMatrix, isGoogleMapsConfigured } from './googleMapsService';
 import {
@@ -59,6 +62,7 @@ function formatTerm(term: LuxmedTerm, index: number): string {
 
 // Store last search results per user for booking by index
 const lastSearchResults = new Map<number, {
+    accountId: number;
     terms: LuxmedTerm[];
     cityId: number;
     expiresAt: number;
@@ -79,6 +83,31 @@ function searchContext(args: { cityId: number; serviceId: number; clinicId?: num
     });
 }
 
+export async function settleLuxmedAccountTransitions(userId: number, sidecar: {
+    list: (accountId: number) => Promise<LuxmedMonitoring[]>;
+    quiesce: (accountId: number, monitorId: number) => Promise<void>;
+} = { list: luxmedGetMonitorings, quiesce: luxmedQuiesceMonitoring }): Promise<string[]> {
+    const failures: string[] = [];
+    for (const transition of smartStore.accountTransitions(userId)) {
+        try {
+            const oldMonitors = await sidecar.list(transition.oldAccountId);
+            for (const monitor of oldMonitors.filter(m => m.active)) {
+                await sidecar.quiesce(transition.oldAccountId, monitor.recordId);
+            }
+            const remaining = (await sidecar.list(transition.oldAccountId)).filter(m => m.active);
+            if (remaining.length) throw new Error(`${remaining.length} old monitor(s) remain active`);
+            smartStore.clearAccountTransition(userId, transition.oldAccountId);
+        } catch (error) {
+            const status = error instanceof LuxmedApiError ? error.code
+                : error instanceof Error && /old monitor\(s\) remain active/.test(error.message) ? error.message
+                    : 'SIDECAR_CLEANUP_FAILED';
+            smartStore.failAccountTransition(userId, transition.oldAccountId, status);
+            failures.push(`account ${transition.oldAccountId}: ${status}`);
+        }
+    }
+    return failures;
+}
+
 export const LuxmedLogin: Tool = {
     name: 'LuxmedLogin',
     description: 'Store LuxMed portal credentials. Call this when user provides their LuxMed email and password. Tests the login and saves credentials for future use.',
@@ -92,11 +121,19 @@ export const LuxmedLogin: Tool = {
     },
     execute: async (args: { userId: number; username: string; password: string }) => {
         const chatId = String(args.userId);
+        const previousAccountId = getLuxmedAccountId(args.userId);
         console.log(`[LuxMed] Login attempt for user ${args.userId} (${args.username})`);
         const result = await luxmedLogin(args.username, args.password, chatId);
         saveLuxmedAccount(args.userId, result.accountId, result.username);
+        lastSearchResults.delete(args.userId);
+        const cleanupFailures = await settleLuxmedAccountTransitions(args.userId);
         console.log(`[LuxMed] Login success: userId=${result.userId}, accountId=${result.accountId}`);
-        return { success: true, message: `LuxMed login successful. Account linked (${result.username}).` };
+        const switched = previousAccountId !== null && previousAccountId !== result.accountId;
+        if (cleanupFailures.length) {
+            return { success: false, accountLinked: true, smartBookingSafe: false,
+                message: `LuxMed account linked, but old sidecar monitors could not be confirmed stopped (${cleanupFailures.join('; ')}). New smart booking is blocked. An old monitor may still book; retry LuxmedLogin after fixing the sidecar or stop those monitors manually.` };
+        }
+        return { success: true, message: `LuxMed login successful. Account linked (${result.username}).${switched ? ' Monitors for the previous account were stopped. Create and confirm new monitors for this account.' : ''}` };
     },
 };
 
@@ -261,7 +298,10 @@ export const LuxmedSearchSlots: Tool = {
         }
 
         const context = searchContext({ cityId, serviceId: args.service_id, clinicId: args.clinic_id, doctorId: args.doctor_id, dateFrom, dateTo, timeFrom, timeTo, maxTransitMinutes });
-        lastSearchResults.set(args.userId, { terms: filteredTerms, cityId, context, expiresAt: Date.now() + 5 * 60 * 1000 });
+        if (getLuxmedAccountId(args.userId) !== accountId) {
+            return { success: false, message: 'LuxMed account changed during search. Search again.' };
+        }
+        lastSearchResults.set(args.userId, { accountId, terms: filteredTerms, cityId, context, expiresAt: Date.now() + 5 * 60 * 1000 });
 
         if (filteredTerms.length === 0) {
             const transitNote = maxTransitMinutes != null ? ` within ${maxTransitMinutes} min transit` : '';
@@ -297,7 +337,7 @@ function formatLocalDateTime(date: Date): string {
 
 export const LuxmedBookSlot: Tool = {
     name: 'LuxmedBookSlot',
-    description: 'Book a specific LuxMed appointment slot. Use the slot index from the last search results (1-based), or provide full slot details.',
+    description: 'Book a specific LuxMed appointment slot after confirming availability. Use the slot index from the last search results (1-based).',
     parameters: {
         type: 'object',
         properties: {
@@ -308,7 +348,15 @@ export const LuxmedBookSlot: Tool = {
     },
     execute: async (args: { userId: number; slot_index: number; rebook_if_exists?: string }) => {
         const accountId = requireAccount(args.userId);
+        const policy = smartStore.policy(args.userId);
+        if (!policy || policy.state !== 'confirmed' || policy.holdToken) {
+            return { success: false, message: 'Confirm your LuxMed availability and travel rules before booking a slot. Use LuxmedDraftAvailability and LuxmedPreviewAvailability first.' };
+        }
         const cached = lastSearchResults.get(args.userId);
+        if (cached && cached.accountId !== accountId) {
+            lastSearchResults.delete(args.userId);
+            return { success: false, message: 'LuxMed account changed since that search. Search again before booking.' };
+        }
         if (!cached || cached.terms.length === 0) {
             return { success: false, message: 'No search results available. Use LuxmedSearchSlots first.' };
         }
@@ -327,16 +375,9 @@ export const LuxmedBookSlot: Tool = {
         const term = cached.terms[idx];
         const rebookIfExists = args.rebook_if_exists === 'true';
         const t = term.term;
-        const doctor = [t.doctor.academicTitle, t.doctor.firstName, t.doctor.lastName].filter(Boolean).join(' ') || 'Unknown doctor';
-        const dt = t.dateTimeFrom.dateTimeLocal || t.dateTimeFrom.dateTimeTz;
-        console.log(`[LuxMed] Booking slot #${args.slot_index}: ${dt}, ${doctor}, ${t.clinic || 'Unknown clinic'} (rebook=${rebookIfExists})`);
-        await luxmedBookSlot(accountId, term, cached.cityId, rebookIfExists);
-        console.log(`[LuxMed] Booking successful!`);
-
-        return {
-            success: true,
-            message: `Appointment booked: ${dt}, ${doctor}, ${t.clinic || 'Unknown clinic'}`,
-        };
+        const result = await smartBooking.process({id:'manual',userId:args.userId,accountId,serviceId:t.serviceId,serviceName:'Requested appointment',cityId:cached.cityId,cityName:'',clinicIds:[t.clinicId],doctorIds:[t.doctor.id],englishOnly:false,
+            dateFrom:t.dateTimeFrom.dateTimeTz||t.dateTimeFrom.dateTimeLocal||'',dateTo:t.dateTimeTo.dateTimeTz||t.dateTimeTo.dateTimeLocal||'',timeFrom:'00:00',timeTo:'23:59',autobook:true,rebookIfExists,lastCheck:null,createdAt:new Date().toISOString()},[term],true);
+        return {success:result.state==='booked',...result};
     },
 };
 
@@ -355,11 +396,29 @@ export const LuxmedCancelBooking: Tool = {
         if (!Number.isInteger(args.reservation_id) || args.reservation_id <= 0) {
             return { success: false, message: 'reservation_id must be a positive whole number.' };
         }
+        if (!(await luxmedCapabilities()).includes('cancellation-receipts-v2')) {
+            return { success: false, message: 'Cancellation waits for the sidecar review update.' };
+        }
         const bookings = await luxmedGetReserved(accountId);
-        if (!bookings.some(booking => booking.eventId === args.reservation_id)) {
+        const booking = bookings.find(booking => booking.eventId === args.reservation_id);
+        if (!booking) {
             return { success: false, message: `Reservation ${args.reservation_id} was not found among your upcoming appointments.` };
         }
-        await luxmedCancelVisit(accountId, args.reservation_id);
+        const expectedStartAt = zonedTime(booking.date);
+        if (!Number.isSafeInteger(expectedStartAt) || expectedStartAt <= 0) return { success: false, message: 'Reservation start time could not be verified.' };
+        let requestError: unknown;
+        try { await luxmedCancelVisit(accountId, args.reservation_id, expectedStartAt); }
+        catch (error) { requestError = error; }
+        const receipts = await luxmedCancellationReceipts(accountId);
+        const receipt = receipts.find(r => r.accountId === accountId && r.reservationId === args.reservation_id
+            && r.startAt === expectedStartAt);
+        if (!receipt && requestError) throw requestError;
+        if (receipt?.state === 'pending') return { success: false, message: `Cancellation of reservation ${args.reservation_id} needs operator verification. Automatic booking is on hold.` };
+        if (!receipt || receipt.state !== 'confirmed' || !Number.isSafeInteger(receipt.confirmedAt) || receipt.confirmedAt! <= 0
+            || !Number.isSafeInteger(receipt.reviewedAt) || receipt.reviewedAt! <= 0
+            || !receipt.reviewedBy?.trim() || !receipt.reviewReason?.trim() || receipt.reviewAction !== 'confirmed_cancelled')
+            return { success: false, message: `Cancellation of reservation ${args.reservation_id} has not been confirmed.` };
+        smartStore.confirmCancellation(accountId, args.reservation_id, receipt.startAt);
         return { success: true, message: `Appointment ${args.reservation_id} cancelled.` };
     },
 };
@@ -460,7 +519,7 @@ export const LuxmedSetPreferences: Tool = {
 
 export const LuxmedMonitorSlot: Tool = {
     name: 'LuxmedMonitorSlot',
-    description: 'Start monitoring for available appointments. Checks every 10 minutes with client-side filtering (English-speaking doctors, specific clinics/doctors). Auto-books when a matching slot appears.',
+    description: 'Prepare a smart LuxMed monitor. Ask "When can you book?" and collect availability, commitments and locations using LuxmedDraftAvailability. It cannot book until the user confirms the preview. Reuse confirmed rules but confirm each new monitor.',
     parameters: {
         type: 'object',
         properties: {
@@ -507,7 +566,8 @@ export const LuxmedMonitorSlot: Tool = {
         const cityName = textify(args.city_name) || prefs.defaultCityName || 'Unknown';
 
         console.log(`[LuxMed] Creating monitoring: ${serviceName}, city=${cityId}, time=${args.time_from}-${args.time_to}, clinics=${clinicIds?.join(',') ?? 'any'}, doctors=${doctorIds?.join(',') ?? 'any'}, english=${args.english_only === 'true'}, autobook=${args.autobook !== 'false'}`);
-        const monitoring = createLuxmedMonitoring({
+        const monitoring = smartStore.db.transaction(() => {
+        const created = createLuxmedMonitoring({
             id: generateShortId(),
             userId: args.userId,
             accountId,
@@ -526,6 +586,9 @@ export const LuxmedMonitorSlot: Tool = {
             rebookIfExists: args.rebook_if_exists === 'true',
             maxTransitMinutes,
         });
+        smartStore.enroll(created.id,args.userId);
+        return created;
+        })();
 
         const filters = [];
         if (clinicIds) filters.push(`clinics: ${clinicIds.length}`);
@@ -535,7 +598,8 @@ export const LuxmedMonitorSlot: Tool = {
 
         return {
             success: true,
-            message: `Monitoring started (${monitoring.id}): ${serviceName}, ${args.time_from}-${args.time_to}, auto-book: ${args.autobook !== 'false' ? 'yes' : 'no'}.${filterStr} Checking every 10 min.`,
+            message: `Monitoring prepared (${monitoring.id}): ${serviceName}, ${args.time_from}-${args.time_to}.${filterStr} When can you book? Confirm availability and locations using LuxmedDraftAvailability, then send LuxmedPreviewAvailability. Booking remains disabled until the user clicks Confirm.`,
+            monitoring_id:monitoring.id,
         };
     },
 };

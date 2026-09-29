@@ -1,4 +1,5 @@
 import db from './database';
+import { smartStore } from './luxmedSmartStore';
 import {DateTime} from 'luxon';
 import {estimateCostUsd, pricingFor} from './pricing';
 
@@ -347,8 +348,8 @@ const stmts = {
         INSERT INTO luxmed_monitorings (id, user_id, account_id, service_id, service_name, city_id, city_name, clinic_ids, doctor_ids, english_only, date_from, date_to, time_from, time_to, autobook, rebook_if_exists, max_transit_minutes, active, created_at)
         VALUES (@id, @user_id, @account_id, @service_id, @service_name, @city_id, @city_name, @clinic_ids, @doctor_ids, @english_only, @date_from, @date_to, @time_from, @time_to, @autobook, @rebook_if_exists, @max_transit_minutes, 1, @created_at)
     `),
-    getActiveLuxmedMonitorings: db.prepare<[], { id: string; user_id: number; account_id: number; service_id: number; service_name: string; city_id: number; city_name: string; clinic_ids: string | null; doctor_ids: string | null; english_only: number; date_from: string; date_to: string; time_from: string; time_to: string; autobook: number; rebook_if_exists: number; max_transit_minutes: number | null; last_check: string | null; created_at: string }>('SELECT * FROM luxmed_monitorings WHERE active = 1'),
-    getActiveLuxmedMonitoringsByUser: db.prepare<[number], { id: string; user_id: number; account_id: number; service_id: number; service_name: string; city_id: number; city_name: string; clinic_ids: string | null; doctor_ids: string | null; english_only: number; date_from: string; date_to: string; time_from: string; time_to: string; autobook: number; rebook_if_exists: number; max_transit_minutes: number | null; last_check: string | null; created_at: string }>('SELECT * FROM luxmed_monitorings WHERE active = 1 AND user_id = ?'),
+    getActiveLuxmedMonitorings: db.prepare<[], { id: string; user_id: number; account_id: number; service_id: number; service_name: string; city_id: number; city_name: string; clinic_ids: string | null; doctor_ids: string | null; english_only: number; date_from: string; date_to: string; time_from: string; time_to: string; autobook: number; smart_autobook: number | null; rebook_if_exists: number; max_transit_minutes: number | null; last_check: string | null; created_at: string }>('SELECT m.*,s.desired_autobook AS smart_autobook FROM luxmed_monitorings m LEFT JOIN luxmed_smart_monitors s ON s.monitoring_id=m.id WHERE m.active = 1'),
+    getActiveLuxmedMonitoringsByUser: db.prepare<[number], { id: string; user_id: number; account_id: number; service_id: number; service_name: string; city_id: number; city_name: string; clinic_ids: string | null; doctor_ids: string | null; english_only: number; date_from: string; date_to: string; time_from: string; time_to: string; autobook: number; smart_autobook: number | null; rebook_if_exists: number; max_transit_minutes: number | null; last_check: string | null; created_at: string }>('SELECT m.*,s.desired_autobook AS smart_autobook FROM luxmed_monitorings m LEFT JOIN luxmed_smart_monitors s ON s.monitoring_id=m.id WHERE m.active = 1 AND m.user_id = ?'),
     deactivateLuxmedMonitoring: db.prepare('UPDATE luxmed_monitorings SET active = 0 WHERE id = ? AND user_id = ?'),
     updateLuxmedMonitoringLastCheck: db.prepare('UPDATE luxmed_monitorings SET last_check = ? WHERE id = ?'),
 
@@ -361,11 +362,12 @@ const stmts = {
     clearLuxmedHomeCoordinates: db.prepare('UPDATE luxmed_preferences SET home_lat = NULL, home_lng = NULL WHERE user_id = ?'),
 
     // LuxMed Clinics
-    upsertClinic: db.prepare(`INSERT INTO luxmed_clinics (name, address, lat, lng, city_id, geocoded_at) VALUES (?, ?, ?, ?, ?, ?)
+    upsertClinic: db.prepare(`INSERT INTO luxmed_clinics_by_city (name, address, lat, lng, city_id, geocoded_at) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(name, city_id) DO UPDATE SET address = excluded.address, lat = excluded.lat, lng = excluded.lng, geocoded_at = excluded.geocoded_at`),
-    getClinic: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE id = ?'),
-    getClinicsByCity: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE city_id = ?'),
-    getClinicByName: db.prepare<[string], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE name = ?'),
+    getClinic: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics_by_city WHERE id = ?'),
+    getClinicsByCity: db.prepare<[number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics_by_city WHERE city_id = ?'),
+    getClinicByName: db.prepare<[string], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics_by_city WHERE name = ?'),
+    getClinicByNameAndCity: db.prepare<[string, number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics_by_city WHERE name = ? AND city_id = ?'),
 };
 
 // ============== USER FUNCTIONS ==============
@@ -1315,7 +1317,19 @@ export function getLuxmedAccountId(userId: number): number | null {
 }
 
 export function saveLuxmedAccount(userId: number, accountId: number, username: string): void {
-    stmts.upsertLuxmedAccount.run(userId, accountId, username, new Date().toISOString());
+    db.transaction(() => {
+        const previous = getLuxmedAccountId(userId);
+        if (previous !== null && previous !== accountId) {
+            db.prepare("INSERT OR IGNORE INTO luxmed_account_transitions(user_id,old_account_id,status,updated_at) VALUES (?,?,'pending',?)")
+                .run(userId, previous, Date.now());
+        }
+        stmts.upsertLuxmedAccount.run(userId, accountId, username, new Date().toISOString());
+        if (previous !== null && previous !== accountId) {
+            db.prepare('UPDATE luxmed_monitorings SET active=0 WHERE user_id=? AND account_id<>?').run(userId, accountId);
+            db.prepare("UPDATE luxmed_smart_monitors SET state='paused', status='LuxMed account changed; create and confirm a new monitor' WHERE user_id=? AND monitoring_id IN (SELECT id FROM luxmed_monitorings WHERE account_id<>?)").run(userId, accountId);
+            db.prepare("UPDATE luxmed_availability SET state='draft',revision=revision+1,confirmation_token=NULL,updated_at=? WHERE user_id=?").run(Date.now(), userId);
+        }
+    })();
 }
 
 export interface LuxmedPreferences {
@@ -1399,7 +1413,7 @@ function rowToMonitoringConfig(row: any): LuxmedMonitoringConfig {
         dateTo: row.date_to,
         timeFrom: row.time_from,
         timeTo: row.time_to,
-        autobook: row.autobook === 1,
+        autobook: (row.smart_autobook ?? row.autobook) === 1,
         rebookIfExists: row.rebook_if_exists === 1,
         lastCheck: row.last_check,
         createdAt: row.created_at,
@@ -1466,7 +1480,12 @@ export function saveUserAddress(userId: number, label: string, address: string, 
     const normalizedLabel = label.toLowerCase().trim();
     const createdAt = new Date().toISOString();
     const save = db.transaction(() => {
+        const previous = stmts.getAddressByLabel.get(userId, normalizedLabel);
         stmts.upsertAddress.run(userId, normalizedLabel, address, lat, lng, createdAt);
+        if (!previous || previous.address !== address || previous.lat !== lat || previous.lng !== lng) {
+            if (smartStore.db.prepare('DELETE FROM luxmed_smart_places WHERE user_id=? AND id=?')
+                .run(userId, `address:${normalizedLabel}`).changes) smartStore.pause(userId);
+        }
         if (normalizedLabel === 'home') {
             // Keep the legacy LuxMed preference coordinates in sync with the
             // canonical address used by directions and travel filtering.
@@ -1498,28 +1517,29 @@ export function deleteUserAddress(userId: number, label: string): void {
     const normalizedLabel = label.toLowerCase().trim();
     const remove = db.transaction(() => {
         stmts.deleteAddress.run(userId, normalizedLabel);
+        if(smartStore.db.prepare('DELETE FROM luxmed_smart_places WHERE user_id=? AND id=?').run(userId,`address:${normalizedLabel}`).changes)smartStore.pause(userId);
         if (normalizedLabel === 'home') stmts.clearLuxmedHomeCoordinates.run(userId);
     });
     remove();
 }
 
 // ============== LUXMED CLINICS CACHE ==============
-// Names normalized to lowercase so "LUXMED Al. Jana Pawła II" and "Luxmed Al.
-// Jana Pawła II" map to the same row (UNIQUE(name) was otherwise sensitive
-// to casing drift from the sidecar).
+// Names normalized to lowercase so case changes map to the same row within
+// each city. The old name-unique table remains only for rollback images.
 
 function normalizeClinicName(name: string): string {
     return name.toLowerCase().trim();
 }
 
 export function saveLuxmedClinic(name: string, address: string | null, lat: number | null, lng: number | null, cityId: number): void {
+    if (!Number.isSafeInteger(cityId) || cityId <= 0) throw new Error('A clinic cache entry needs a valid city ID.');
     stmts.upsertClinic.run(normalizeClinicName(name), address, lat, lng, cityId, new Date().toISOString());
 }
 
 export function getLuxmedClinicByName(name: string, cityId?: number): { id: number; name: string; lat: number; lng: number } | null {
     const row = cityId == null
-        ? stmts.getClinicByName.get(normalizeClinicName(name))
-        : db.prepare<[string, number], { id: number; name: string; address: string | null; lat: number | null; lng: number | null }>('SELECT * FROM luxmed_clinics WHERE name = ? AND city_id = ?').get(normalizeClinicName(name), cityId);
+        ? (() => { const matches = stmts.getClinicByName.all(normalizeClinicName(name)); return matches.length === 1 ? matches[0] : undefined; })()
+        : stmts.getClinicByNameAndCity.get(normalizeClinicName(name), cityId);
     return row && row.lat != null && row.lng != null ? { id: row.id, name: row.name, lat: row.lat, lng: row.lng } : null;
 }
 

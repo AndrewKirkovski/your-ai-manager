@@ -34,6 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+ARG BOT_IMAGE_REVISION=unavailable
+ENV BOT_IMAGE_REVISION=${BOT_IMAGE_REVISION}
+
 WORKDIR /app
 
 # Copy built node_modules and source from builder

@@ -8,6 +8,10 @@ import TelegramBot from 'node-telegram-bot-api';
 import OpenAI from 'openai';
 import cron from 'node-cron';
 import { initLuxmedMonitor, runLuxmedMonitoringCycle } from './luxmedMonitor';
+import { initSmartBookingTools, availabilityContext } from './tools.luxmedSmart';
+import { smartStore } from './luxmedSmartStore';
+import { availabilityTurn } from './luxmedConversation';
+import { slashMessageNeedsIngressHold } from './luxmedAvailabilityIngress';
 import { OpenAIProvider } from './aiProvider.openai';
 import { AnthropicProvider } from './aiProvider.anthropic';
 import type { AIProvider } from './aiProvider';
@@ -47,6 +51,7 @@ import {initStatTools} from './tools.stats';
 import {initStickerCacheTools} from './tools.stickercache';
 import {shutdownTgsRenderer} from './tgsRenderer';
 import db from './database';
+import { releaseVersionReply } from './releaseVersion';
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN!;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
@@ -228,11 +233,15 @@ async function fireBurstReply(userId: number): Promise<void> {
 // (/tasks, /routines, etc.) don't corrupt data but still benefit from
 // not interleaving display with an AI reply.
 type TextHandler = (msg: TelegramBot.Message, match: RegExpExecArray | null) => Promise<void>;
-function serialTextHandler(handler: TextHandler): (msg: TelegramBot.Message, match: RegExpExecArray | null) => void {
+function serialTextHandler(handler: TextHandler, holdOnReceipt: boolean | ((match: RegExpExecArray | null) => boolean) = false): (msg: TelegramBot.Message, match: RegExpExecArray | null) => void {
     return (msg, match) => {
         const userId = msg.from?.id;
         if (!userId) return;
         if (!isAllowedUser(userId)) return;
+        // A slash command with free-form user text can also change availability.
+        // Hold before queuing it, while another account decision may be running.
+        const needsHold = typeof holdOnReceipt === 'function' ? holdOnReceipt(match) : holdOnReceipt;
+        const holdToken = needsHold ? smartStore.hold(userId) : null;
         // Fire-and-forget; node-telegram-bot-api doesn't await handler returns.
         void enqueuePerUser(userId, async () => {
             // Bootstrap a profile for a brand-new user whose FIRST interaction is
@@ -249,7 +258,11 @@ function serialTextHandler(handler: TextHandler): (msg: TelegramBot.Message, mat
             } catch (e) {
                 console.warn('[serialTextHandler] profile bootstrap failed:', e instanceof Error ? e.message : e);
             }
-            await handler(msg, match);
+            try { await handler(msg, match); }
+            finally {
+                if (holdToken && smartStore.policy(userId)?.holdToken === holdToken)
+                    await safeSend(bot, msg.chat.id, 'Smart booking is paused while your schedule may have changed. Send the booking change as a new message, or say that your availability is unchanged.');
+            }
         });
     };
 }
@@ -301,6 +314,7 @@ const STICKER_LOOKUP_MODEL = process.env.STICKER_LOOKUP_MODEL || 'claude-haiku-4
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: true});
 initLuxmedMonitor(bot);
+initSmartBookingTools(bot);
 // Start the admin/webhook server after the bot exists so the LuxMed webhook
 // can deliver notifications via bot.sendMessage.
 startWebServer(bot);
@@ -450,7 +464,7 @@ Memory (stale entries may not reflect current state — treat older facts with a
 Today's stats: ${todayStatsStr}
 ${budgetAskStr}        `
 
-    return Memory;
+    return Memory + (opts?.userFacing ? stripSystemTags(availabilityContext(userId)) : '');
 }
 
 async function replyToUser(
@@ -458,6 +472,8 @@ async function replyToUser(
     userMessage: string,
     opts?: { signal?: AbortSignal; onTextStreamed?: () => void; addUserToHistory?: boolean }
 ): Promise<string> {
+    // Capture before any awaits. A later message must not lend this reply its hold token.
+    const availabilityHoldToken=smartStore.policy(userId)?.holdToken || null;
     try {
         const user = await getUser(userId);
         if (!user) {
@@ -472,7 +488,7 @@ async function replyToUser(
         // Split static prefix (cacheable) from per-turn dynamic memory so Anthropic
         // prompt-caching reuses the long scaffolding across turns. The provider
         // handles concatenation for the OpenAI-compat path internally.
-        const result = await AIService.streamAIResponse({
+        const result = await availabilityTurn.run({userId,holdToken:availabilityHoldToken},()=>AIService.streamAIResponse({
             userId,
             userMessage,
             systemPromptCachePrefix: getSystemPrompt(),
@@ -510,7 +526,7 @@ async function replyToUser(
                     console.log(`Failed to send images:`, e);
                 }
             }
-        });
+        }));
 
         // Cleanup old tasks after processing (keep last 50 per user)
         const removedCount = await cleanupOldTasks(userId, 50);
@@ -819,7 +835,7 @@ cron.schedule('0 4 * * *', async () => {
 }, { timezone: BOT_TZ });
 
 // LuxMed monitoring — check every 10 minutes
-cron.schedule('*/10 * * * *', async () => {
+cron.schedule('*/5 * * * * *', async () => {
     try {
         await runLuxmedMonitoringCycle();
     } catch (error) {
@@ -928,7 +944,7 @@ bot.onText(/\/goal(.*)/, serialTextHandler(async (msg, match) => {
 
         console.log(result);
     }
-}));
+}, match => !!match?.[1]?.trim()));
 
 bot.onText(/\/cleargoal/, serialTextHandler(async (msg) => {
     try {
@@ -1184,6 +1200,12 @@ bot.onText(/\/stats/, serialTextHandler(async (msg) => {
     }
 }));
 
+// The operator can verify which image Watchtower actually started without
+// opening a connection to Murzik. The optional challenge makes the reply fresh.
+bot.onText(/^\/version(?:@[A-Za-z0-9_]+)?(?:\s+([A-Za-z0-9_-]{8,64}))?$/, serialTextHandler(async (msg, match) => {
+    await safeSend(bot, msg.chat.id, releaseVersionReply(match?.[1]));
+}));
+
 bot.onText(/\/help/, serialTextHandler(async (msg) => {
     try {
         const result = await AIService.streamAIResponse({
@@ -1315,8 +1337,17 @@ bot.on('message', (msg) => {
         console.warn(`[auth] Rejected message from non-allowlisted userId=${userId}`);
         return;
     }
-    // Commands have their own dispatch path (serialTextHandler) and bypass burst.
-    if (msg.text?.startsWith('/')) return;
+    // Unknown slash commands have no onText handler. Hold them at ingress so
+    // schedule text such as "/busy Tuesday" cannot race a booking submission.
+    if (msg.text?.startsWith('/')) {
+        if (slashMessageNeedsIngressHold(msg.text) && smartStore.hold(userId)) {
+            void safeSend(bot, msg.chat.id,
+                'Smart booking is paused while your schedule may have changed. Send the booking change as an ordinary message, or say that your availability is unchanged.')
+                .catch(error => console.error('[LuxMed smart] Could not report command hold:', error instanceof Error ? error.message : String(error)));
+        }
+        return;
+    }
+    smartStore.hold(userId);
 
     // Acknowledge receipt with a typing action immediately so the user gets
     // visual feedback during the 800ms debounce window (otherwise pure-text
@@ -1402,6 +1433,15 @@ bot.on('message', (msg) => {
     //    still running, which is exactly what we want.
     softAbortIfPretext(userId);
     refreshBurstTimer(userId);
+});
+
+bot.on('edited_message', (msg) => {
+    const userId = msg.from?.id;
+    if (!userId || !isAllowedUser(userId)) return;
+    if (!smartStore.hold(userId)) return;
+    void safeSend(bot, msg.chat.id,
+        'I saw an edited message and paused smart booking. Please send the schedule change as a new message so I can review it.')
+        .catch(error => console.error('[LuxMed smart] Could not report edited-message hold:', error instanceof Error ? error.message : String(error)));
 });
 
 // Handle bot errors
