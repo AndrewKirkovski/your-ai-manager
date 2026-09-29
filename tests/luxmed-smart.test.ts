@@ -103,6 +103,52 @@ test('idempotent booking sends exact reservation facts to the sidecar', async ()
     } finally { globalThis.fetch = originalFetch; f.store.db.close(); }
 });
 
+test('a refused sidecar connection is classified as never dispatched', async () => {
+    const { luxmedBookSlot, LuxmedApiError } = await import('../luxmedAdapter.ts');
+    const f = coordinatorFixture();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+        throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect refused'), { code: 'ECONNREFUSED' }) });
+    };
+    try {
+        await assert.rejects(luxmedBookSlot(998, f.term, 1, false, '00000000-0000-0000-0000-000000000998'),
+            error => error instanceof LuxmedApiError && error.code === 'SIDECAR_PRE_DISPATCH');
+    } finally { globalThis.fetch = originalFetch; f.store.db.close(); }
+});
+
+test('an ambiguous sidecar network failure remains an unknown booking outcome', async () => {
+    const { luxmedBookSlot, LuxmedApiError } = await import('../luxmedAdapter.ts');
+    const f = coordinatorFixture();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }); };
+    try {
+        await assert.rejects(luxmedBookSlot(999, f.term, 1, false, '00000000-0000-0000-0000-000000000999'),
+            error => error instanceof LuxmedApiError && error.code === 'SIDECAR_UNAVAILABLE');
+    } finally { globalThis.fetch = originalFetch; f.store.db.close(); }
+});
+
+test('a definite pre-submit sidecar failure backs off further account requests', async () => {
+    const { luxmedBookSlot, luxmedGetReserved, LuxmedApiError } = await import('../luxmedAdapter.ts');
+    const f = coordinatorFixture();
+    const originalFetch = globalThis.fetch;
+    let requests = 0;
+    globalThis.fetch = async url => {
+        requests++;
+        if (String(url).endsWith('/visits/reserved'))
+            return new Response(JSON.stringify({ success: true, data: [] }));
+        return new Response(JSON.stringify({ success: true, data: { state: 'failed', errorCode: 'BOOKING_NOT_SUBMITTED' } }));
+    };
+    try {
+        assert.equal((await luxmedBookSlot(997, f.term, 1, false, '00000000-0000-0000-0000-000000000997')).errorCode,
+            'BOOKING_NOT_SUBMITTED');
+        await assert.rejects(luxmedBookSlot(997, f.term, 1, false, '00000000-0000-0000-0000-000000000996'),
+            error => error instanceof LuxmedApiError && error.code === 'ACCOUNT_BACKOFF' && error.retryAfterMs! > 50000);
+        assert.equal(requests, 1);
+        assert.deepEqual(await luxmedGetReserved(997), []);
+        assert.equal(requests, 2);
+    } finally { globalThis.fetch = originalFetch; f.store.db.close(); }
+});
+
 test('versioned booking submission runs before queued account reads', async () => {
     const f = coordinatorFixture();
     const { luxmedBookSlot, luxmedGetCities } = await import('../luxmedAdapter.ts');
@@ -771,6 +817,86 @@ test('unknown outcome blocks a second booking and reconciles after coordinator r
     const restarted = new SmartBookingCoordinator(f.store, f.api, () => null); await restarted.reconcile();
     assert.equal(f.store.pending(1).length, 0); assert.equal(f.store.blocks(1).length, 1); f.store.db.close();
 });
+test('mixed-image v4 route loss leaves an absent attempt held for operator review', async () => {
+    const { LuxmedApiError } = await import('../luxmedAdapter.ts');
+    const f = coordinatorFixture();
+    f.api.book = async () => { throw new LuxmedApiError('Versioned route absent', 'LUXMED_API_ERROR', 404); };
+    f.api.attempt = async () => { throw new LuxmedApiError('Attempt absent', 'LUXMED_API_ERROR', 404); };
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'unknown');
+    const attempt = f.store.pending(1)[0];
+    await new SmartBookingCoordinator(f.store, f.api, () => null).reconcile();
+    assert.equal(f.store.attempt(attempt.id)?.state, 'unknown');
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting');
+    assert.equal(f.store.pending(1).length, 1);
+    f.store.db.close();
+});
+test('a pre-dispatch failure releases the local attempt without claiming a booking', async () => {
+    const { LuxmedApiError } = await import('../luxmedAdapter.ts');
+    const f = coordinatorFixture();
+    f.api.book = async () => { throw new LuxmedApiError('Connection refused before dispatch', 'SIDECAR_PRE_DISPATCH'); };
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting');
+    assert.equal(f.store.pending(1).length, 0);
+    assert.equal(f.store.blocks(1).length, 0);
+    f.store.db.close();
+});
+test('a LuxMed account linked to two bot users cannot submit with one user schedule', async () => {
+    const f = coordinatorFixture();
+    f.store.db.prepare('INSERT INTO users(user_id) VALUES (2)').run();
+    f.store.db.prepare("INSERT INTO luxmed_accounts(user_id,account_id,username,created_at) VALUES (2,1,'shared','2026-10-01')").run();
+    assert.equal(f.store.soleAccountOwner(1, 1), false);
+    const result = await f.coordinator.process(f.config, [f.term]);
+    assert.equal(result.state, 'waiting');
+    assert.match(result.message, /more than one bot user/i);
+    assert.equal(f.books(), 0);
+    f.store.db.close();
+});
+test('sharing an account while a submission is queued invalidates its final guard', async () => {
+    const { LuxmedApiError } = await import('../luxmedAdapter.ts');
+    const f = coordinatorFixture();
+    let submitted = 0;
+    f.api.book = async (_account, _term, _city, _rebook, _id, guard) => {
+        f.store.db.prepare('INSERT INTO users(user_id) VALUES (2)').run();
+        f.store.db.prepare("INSERT INTO luxmed_accounts(user_id,account_id,username,created_at) VALUES (2,1,'shared','2026-10-01')").run();
+        if (guard && !guard()) throw new LuxmedApiError('Changed', 'BOOKING_GUARD_CHANGED');
+        submitted++; return { state: 'succeeded', reservationId: 88 };
+    };
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting');
+    assert.equal(submitted, 0);
+    assert.equal(f.store.pending().length, 0);
+    f.store.db.close();
+});
+test('a review-required lockterm pauses the monitor instead of retrying the slot', async () => {
+    const f = coordinatorFixture();
+    f.store.db.prepare(`INSERT INTO luxmed_monitorings(id,user_id,account_id,service_id,service_name,city_id,city_name,date_from,date_to,created_at)
+        VALUES ('m2',1,1,6,'Consultation',1,'Warszawa',?,?,?)`).run(f.config.dateFrom,f.config.dateTo,f.config.createdAt);
+    f.store.enroll('m2',1);
+    f.store.db.prepare("UPDATE luxmed_smart_monitors SET state='active' WHERE monitoring_id='m2'").run();
+    let calls = 0;
+    f.api.book = async () => { calls++; return { state: 'failed', errorCode: 'PAYMENT_OR_REFERRAL_REVIEW' }; };
+    const first = await f.coordinator.process(f.config, [f.term]);
+    assert.match(first.message, /paused/i);
+    assert.equal(f.store.enrollment(f.config.id)?.state, 'paused');
+    assert.equal(f.store.enrollment('m2')?.state, 'paused');
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting');
+    assert.equal(calls, 1);
+    assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM luxmed_notification_outbox WHERE id LIKE 'booking-review:%'").get() as { n: number }).n, 1);
+    f.store.db.close();
+});
+test('uncertain temporary reservation cleanup pauses smart booking', async () => {
+    const f = coordinatorFixture();
+    f.api.book = async () => ({ state: 'failed', errorCode: 'TEMPORARY_RESERVATION_CLEANUP_UNCERTAIN' });
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting');
+    assert.equal(f.store.enrollment(f.config.id)?.state, 'paused');
+    assert.match(f.store.enrollment(f.config.id)?.status || '', /temporary reservation may still need release/i);
+    f.store.db.close();
+});
+test('a definite pre-submit provider failure requests durable account backoff', async () => {
+    const f = coordinatorFixture();
+    f.api.book = async () => ({ state: 'failed', errorCode: 'BOOKING_NOT_SUBMITTED' });
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'retryable_failure');
+    assert.equal(f.store.pending(1).length, 0);
+    f.store.db.close();
+});
 test('confirmed cancellation prevents a lost-response reconciliation from restoring the booking', async () => {
     const f = coordinatorFixture(); f.api.book = async () => { throw new Error('lost response'); };
     assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'unknown');
@@ -1326,7 +1452,7 @@ test('confirmation requires the owning private chat and cannot be replayed', asy
     const { createLuxmedMonitoring, deactivateLuxmedMonitoring } = await import('../userStore.ts');
     const store = new SmartBookingStore(globalDb); const saved = store.policy(10)!;
     globalDb.prepare("INSERT OR REPLACE INTO luxmed_accounts(user_id,account_id,username,created_at) VALUES (10,10,'fixture','2026-10-01')").run();
-    const monitor = createLuxmedMonitoring({ id: 'confirm-test', userId: 10, accountId: 10, serviceId: 6, serviceName: 'Visit', cityId: 1, cityName: 'Warszawa', clinicIds: null, doctorIds: null, englishOnly: false, dateFrom: '2026-10-01T00:00:00', dateTo: '2026-11-01T00:00:00', timeFrom: '08:00', timeTo: '20:00', autobook: true, rebookIfExists: false });
+    const monitor = createLuxmedMonitoring({ id: 'confirm-test', userId: 10, accountId: 10, serviceId: 6, serviceName: 'Visit', cityId: 1, cityName: 'Old city label', clinicIds: null, doctorIds: null, englishOnly: false, dateFrom: '2026-10-01T00:00:00', dateTo: '2026-11-01T00:00:00', timeFrom: '08:00', timeTo: '20:00', autobook: true, rebookIfExists: false });
     store.enroll(monitor.id, 10); const c = store.confirmation(10);
     store.stageSidecarMonitorPreview(10, monitor.id, monitor.accountId, c, [42], monitorRulesFingerprint(monitor),
         'Visit', digest([6, 'Visit', 1, 'Warszawa', []]), null);
@@ -1368,6 +1494,7 @@ test('confirmation requires the owning private chat and cannot be replayed', asy
         assert.equal(enrolled, 0);
         deactivateLuxmedMonitoring('legacy-other-confirm-test', 10);
         callback(query); await new Promise(r => setTimeout(r, 10)); assert.equal(store.enrollment(monitor.id)?.state, 'active');
+        assert.equal((globalDb.prepare('SELECT city_name FROM luxmed_monitorings WHERE id=?').get(monitor.id) as { city_name: string }).city_name, 'Warszawa');
         assert.equal((globalDb.prepare('SELECT autobook FROM luxmed_monitorings WHERE id=?').get(monitor.id) as { autobook: number }).autobook, 0);
         assert.equal((await import('../userStore.ts')).getActiveLuxmedMonitoringsByUser(10).find(m => m.id === monitor.id)?.autobook, true);
         callback(query); await new Promise(r => setTimeout(r, 10)); assert.equal(answers, 6); assert.equal(store.policy(10)?.revision, saved.revision);
@@ -1792,6 +1919,16 @@ test('scheduler combines duplicate searches and does not poll before the next du
         await runLuxmedMonitoringCycle(); assert.equal(searches, 1); assert.equal(decisions, 2);
         globalDb.prepare('UPDATE luxmed_smart_monitors SET next_check=0 WHERE user_id=20').run();
         await runLuxmedMonitoringCycle(); assert.equal(searches, 1); assert.equal(decisions, 4);
+        smartBooking.process = async () => { decisions++; return {state:'retryable_failure',message:'Provider did not accept preparation'}; };
+        globalDb.prepare('UPDATE luxmed_smart_monitors SET next_check=0 WHERE user_id=20').run();
+        await runLuxmedMonitoringCycle();
+        assert.equal(decisions, 5);
+        for (const id of ['duplicate-a', 'duplicate-b']) {
+            const enrollment = store.enrollment(id)!;
+            assert.equal(enrollment.failures, 1);
+            assert.ok(enrollment.next_check - Date.now() > 50000);
+        }
+        await runLuxmedMonitoringCycle(); assert.equal(decisions, 5);
     } finally {
         globalThis.fetch = old.fetch; smartBooking.readiness = old.readiness; smartBooking.legacyMonitorIssue = old.legacy; smartBooking.refreshReservations = old.refresh;
         smartBooking.process = old.process; smartBooking.reconcile = old.reconcile;

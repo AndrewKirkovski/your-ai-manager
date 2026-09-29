@@ -148,6 +148,19 @@ export interface LuxmedMonitoring {
 }
 
 const accountBackoff = new Map<string,{until:number;failures:number}>();
+const bookingOutcomeBackoff = new Map<string,{until:number;failures:number}>();
+function failedBeforeSidecarDispatch(error: unknown): boolean {
+    const seen = new Set<unknown>();
+    const inspect = (value: unknown): boolean => {
+        if (!value || typeof value !== 'object' || seen.has(value)) return false;
+        seen.add(value);
+        const cause = value as { code?: unknown; cause?: unknown; errors?: unknown };
+        if (typeof cause.code === 'string') return ['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(cause.code);
+        if (Array.isArray(cause.errors) && cause.errors.length) return cause.errors.every(inspect);
+        return inspect(cause.cause);
+    };
+    return inspect(error);
+}
 async function sidecarRequest<T>(method: string, path: string, body?: unknown, guard?:()=>boolean): Promise<T> {
     const accountId=/\/accounts\/(\d+)\//.exec(path)?.[1];
     const bookingSubmission=method==='POST' && (path.endsWith('/book') || path.endsWith('/booking-attempts')
@@ -155,7 +168,12 @@ async function sidecarRequest<T>(method: string, path: string, body?: unknown, g
     const run=async()=>{
         if(guard&&!guard())throw new LuxmedApiError('Availability changed before submission','BOOKING_GUARD_CHANGED');
         const backoff=accountId ? accountBackoff.get(accountId) : undefined;
+        const bookingBackoff=accountId ? bookingOutcomeBackoff.get(accountId) : undefined;
         const upstream=!!accountId&&(bookingSubmission||!path.includes('/booking-attempts/'));
+        if((bookingSubmission||path.endsWith('/terms/search'))&&bookingBackoff&&bookingBackoff.until>Date.now()) {
+            const error=new LuxmedApiError('LuxMed booking is waiting after a pre-submit failure','ACCOUNT_BACKOFF',429);
+            error.retryAfterMs=bookingBackoff.until-Date.now();throw error;
+        }
         if(upstream&&backoff&&backoff.until>Date.now()) {
             const error=new LuxmedApiError('LuxMed account is waiting before another request','ACCOUNT_BACKOFF',429);
             error.retryAfterMs=backoff.until-Date.now();throw error;
@@ -163,6 +181,14 @@ async function sidecarRequest<T>(method: string, path: string, body?: unknown, g
         try {
             const result=await requestSidecar<T>(method,path,body);
             if(upstream)accountBackoff.delete(accountId!);
+            if (bookingSubmission && accountId) {
+                const outcome = result as { state?: unknown; errorCode?: unknown };
+                if (outcome?.state === 'failed' && outcome.errorCode === 'BOOKING_NOT_SUBMITTED') {
+                    const failures = (bookingBackoff?.failures || 0) + 1;
+                    bookingOutcomeBackoff.set(accountId, { failures,
+                        until: Date.now() + Math.min(600000, 30000 * 2 ** Math.min(failures, 5)) });
+                } else if (outcome?.state === 'succeeded' || outcome?.errorCode === 'BOOKING_REJECTED') bookingOutcomeBackoff.delete(accountId);
+            }
             return result;
         }catch(error) {
             if(upstream&&error instanceof LuxmedApiError) {
@@ -197,6 +223,10 @@ async function requestSidecar<T>(method: string, path: string, body?: unknown): 
         response = await fetch(url, options);
     } catch (err) {
         const elapsed = Date.now() - start;
+        if (failedBeforeSidecarDispatch(err)) {
+            console.error(`[LuxMed API] ${method} ${path} CONNECT FAILED before dispatch after ${elapsed}ms`);
+            throw new LuxmedApiError('LuxMed sidecar could not be reached before submission', 'SIDECAR_PRE_DISPATCH');
+        }
         if (err instanceof Error && err.name === 'TimeoutError') {
             console.error(`[LuxMed API] ${method} ${path} TIMEOUT after ${elapsed}ms`);
             throw new LuxmedApiError('LuxMed service timeout — try again later', 'SIDECAR_TIMEOUT');

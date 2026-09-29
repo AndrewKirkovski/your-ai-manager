@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'deploy'))
-from luxmed_release_guard import verify
+from luxmed_release_guard import make_pin, verify, verify_pin
 
 
 SHA = 'a' * 40
@@ -40,6 +40,16 @@ class FakeDocker:
         raise AssertionError(args)
 
 
+class PinDocker:
+    def __init__(self, image_id):
+        self.image_id = image_id
+
+    def __call__(self, *args):
+        if args == ('image', 'inspect', '--format', '{{.Id}}', LOCAL):
+            return subprocess.CompletedProcess(args, 0, self.image_id + '\n', '')
+        raise AssertionError(args)
+
+
 class ReleaseGuardTest(unittest.TestCase):
     def test_missing_tag_can_be_published(self):
         self.assertEqual(verify(LOCAL, TAG, SHA, LATEST, FakeDocker()), 'missing')
@@ -59,6 +69,30 @@ class ReleaseGuardTest(unittest.TestCase):
     def test_ambiguous_registry_failure_is_blocked(self):
         with self.assertRaisesRegex(RuntimeError, 'Cannot establish'):
             verify(LOCAL, TAG, SHA, LATEST, FakeDocker(pull_error='connection timed out'))
+
+    def test_staged_pin_matches_the_exact_image_sha_and_run(self):
+        image = PinDocker('sha256:' + '1' * 64)
+        pin = make_pin(LOCAL, SHA, '12345', image)
+        self.assertEqual(pin, {'version': 1, 'revision': SHA, 'run_id': '12345',
+                               'image_id': 'sha256:' + '1' * 64})
+        verify_pin(pin, LOCAL, SHA, '12345', image)
+
+    def test_staged_pin_rejects_changed_image_or_release_identity(self):
+        pin = make_pin(LOCAL, SHA, '12345', PinDocker('sha256:' + '1' * 64))
+        for image, revision, run_id in [
+            (PinDocker('sha256:' + '2' * 64), SHA, '12345'),
+            (PinDocker('sha256:' + '1' * 64), 'b' * 40, '12345'),
+            (PinDocker('sha256:' + '1' * 64), SHA, '67890'),
+        ]:
+            with self.subTest(revision=revision, run_id=run_id, image_id=image.image_id):
+                with self.assertRaisesRegex(RuntimeError, 'differs'):
+                    verify_pin(pin, LOCAL, revision, run_id, image)
+
+    def test_staged_pin_rejects_malformed_attestation(self):
+        with self.assertRaisesRegex(RuntimeError, 'malformed'):
+            verify_pin({'revision': SHA}, LOCAL, SHA, '12345', PinDocker('sha256:' + '1' * 64))
+        with self.assertRaisesRegex(RuntimeError, 'content digest'):
+            make_pin(LOCAL, SHA, '12345', PinDocker('not-a-digest'))
 
 
 if __name__ == '__main__':

@@ -21,6 +21,10 @@ on:
         description: "Fresh challenge echoed by /version; required for sidecar-after-bot"
         required: false
         type: string
+      staged_release_run_id:
+        description: "Successful Stage A workflow run ID that published the observed bot revision"
+        required: false
+        type: string
 
 # Serialize publication so separate runs cannot mix latest images.
 concurrency:
@@ -38,6 +42,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
       packages: write
 
     steps:
@@ -102,6 +107,7 @@ jobs:
         env:
           OBSERVED_BOT_REVISION: ${{ inputs.observed_bot_revision }}
           OBSERVED_CHALLENGE: ${{ inputs.observed_challenge }}
+          STAGED_RELEASE_RUN_ID: ${{ inputs.staged_release_run_id }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -117,15 +123,27 @@ jobs:
             echo 'The observed /version challenge must be 8 to 64 letters, digits, underscores or hyphens.' >&2
             exit 1
           fi
+          if ! [[ "$STAGED_RELEASE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'The Stage A release run ID must be a positive decimal number.' >&2
+            exit 1
+          fi
           remote_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
           bot_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$BOT_IMAGE:latest")"
           if [ "$remote_head" != "$GITHUB_SHA" ] || [ "$bot_revision" != "$OBSERVED_BOT_REVISION" ]; then
             echo 'Main or the watched bot image has changed since the observed /version response.' >&2
             exit 1
           fi
+          workflow_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/docker-publish.yml" --jq '.id')"
+          IFS=$'\t' read -r staged_sha staged_branch staged_conclusion staged_workflow_id <<< "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STAGED_RELEASE_RUN_ID" --jq '[.head_sha, .head_branch, .conclusion, (.workflow_id|tostring)] | @tsv')"
+          if [ "$staged_sha" != "$GITHUB_SHA" ] || [ "$staged_branch" != 'main' ] ||
+             [ "$staged_conclusion" != 'success' ] || [ "$staged_workflow_id" != "$workflow_id" ]; then
+            echo 'The Stage A release run must be a successful main run of this workflow for the observed SHA.' >&2
+            exit 1
+          fi
           {
             echo "Operator observed /version challenge: $OBSERVED_CHALLENGE"
             echo "Operator observed bot revision: $OBSERVED_BOT_REVISION"
+            echo "Stage A release run: $STAGED_RELEASE_RUN_ID"
             echo 'CI compared the revision with main and the watched registry image; CI did not inspect Murzik.'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -165,6 +183,21 @@ jobs:
           fi
           docker tag "$BOT_IMAGE:$GITHUB_SHA" luxmed-bot:test
           docker tag "$SIDECAR_IMAGE:$GITHUB_SHA" luxmed-sidecar:test
+
+      - name: Download Stage A sidecar digest
+        if: github.event_name == 'workflow_dispatch' && inputs.release_stage == 'sidecar-after-bot'
+        uses: actions/download-artifact@v4
+        with:
+          name: luxmed-sidecar-pin-${{ inputs.staged_release_run_id }}
+          run-id: ${{ inputs.staged_release_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/luxmed-sidecar-pin
+
+      - name: Verify Stage A sidecar digest
+        if: github.event_name == 'workflow_dispatch' && inputs.release_stage == 'sidecar-after-bot'
+        env:
+          STAGED_RELEASE_RUN_ID: ${{ inputs.staged_release_run_id }}
+        run: python3 deploy/luxmed_release_guard.py check-pin luxmed-sidecar:test "$GITHUB_SHA" "$STAGED_RELEASE_RUN_ID" "$RUNNER_TEMP/luxmed-sidecar-pin/sidecar-pin.json"
 
       - name: Verify bot candidate reports its build revision
         run: |
@@ -214,6 +247,19 @@ jobs:
           REHEARSAL_REQUIRE_SEAMLESS: 'true'
           REHEARSAL_BASELINE_READABLE: ${{ steps.baseline.outputs.auth_migrated }}
         run: python3 tests/luxmed-image-upgrade.py
+
+      - name: Record Stage A sidecar digest
+        if: github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.release_stage == 'standard')
+        run: python3 deploy/luxmed_release_guard.py write-pin luxmed-sidecar:test "$GITHUB_SHA" "$GITHUB_RUN_ID" "$RUNNER_TEMP/sidecar-pin.json"
+
+      - name: Upload Stage A sidecar digest
+        if: github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.release_stage == 'standard')
+        uses: actions/upload-artifact@v4
+        with:
+          name: luxmed-sidecar-pin-${{ github.run_id }}
+          path: ${{ runner.temp }}/sidecar-pin.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Publish tested images
         if: github.ref == 'refs/heads/main'

@@ -66,12 +66,15 @@ The first authenticated sidecar release has two Watchtower stages. CI publishes
 the bot watched tag while keeping the older sidecar watched tag in place. Once
 the running bot answers a fresh private `/version <challenge>` request with the
 staged release's full SHA and matching challenge, the operator dispatches the
-workflow's `sidecar-after-bot` stage with that SHA and challenge. The challenge
-must have 8 to 64 letters, digits, underscores or hyphens. CI checks the watched bot
-image revision and rehearses the replacement before publishing the sidecar
-watched tag. CI cannot independently observe Murzik; the Telegram response is
-the operator's evidence that Watchtower replaced the bot. Without it, the
-sidecar stays on the older image. No unauthenticated compatibility API is opened.
+workflow's `sidecar-after-bot` stage with that SHA, challenge, and the successful
+Stage A workflow run ID (`staged_release_run_id`). The challenge must have 8 to
+64 letters, digits, underscores or hyphens. CI checks the watched bot image
+revision and compares the sidecar's SHA-256 image ID with the value saved by
+that Stage A run before rehearsing or publishing the sidecar watched tag.
+Changed sidecar image content blocks the release. CI cannot independently
+observe Murzik; the Telegram response is the operator's evidence that Watchtower
+replaced the bot. Without it, the sidecar stays on the older image. No
+unauthenticated compatibility API is opened.
 Later releases rehearse both image orders against the authenticated watched
 baseline before publishing both tags. After a successful legacy booking under
 a compatible mixed version, the sidecar holds later legacy manual bookings

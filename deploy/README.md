@@ -28,11 +28,13 @@ new sidecar. Replacing the sidecar first would interrupt existing LuxMed actions
 After Watchtower replaces the bot, send a fresh `/version <challenge>` command
 to the bot in a private chat. Check that it echoes the challenge and reports the
 full SHA of the staged main release. Then run this workflow on `main` with
-`release_stage=sidecar-after-bot` and `observed_bot_revision` set to that SHA.
-Set `observed_challenge` to the echoed challenge. Choose a new challenge of 8 to
-64 letters, digits, underscores or hyphens for each attempt.
-The workflow checks the current main commit and watched bot image, rehearses
-sidecar replacement against the already released bot image, and advances only
+`release_stage=sidecar-after-bot`, `observed_bot_revision` set to that SHA,
+`observed_challenge` set to the echoed challenge, and `staged_release_run_id`
+set to the successful bot stage workflow run ID. Choose a new challenge of 8 to
+64 letters, digits, underscores or hyphens for each attempt. The workflow
+checks the current main commit, watched bot image, and sidecar SHA-256 image ID
+saved by that Stage A run. It rehearses sidecar replacement against the already
+released bot image and advances only
 the sidecar `latest` tag. An absent or mismatched response leaves the sidecar
 tag unchanged. The operator's Telegram observation is the trust boundary; CI
 cannot independently inspect Murzik's running container.

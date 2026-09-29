@@ -88,6 +88,7 @@ export function initSmartBookingTools(bot: TelegramBot): void {
                 if (query.message?.chat.type !== 'private' || query.message.chat.id !== userId) throw new Error('Confirm in your private chat.');
                 const monitor = getActiveLuxmedMonitoringsByUser(userId).find(m => m.id === monitorId);
                 if (!monitor) throw new Error('Monitoring is no longer active.');
+                if (!smartStore.soleAccountOwner(userId, monitor.accountId)) throw new Error('This LuxMed account is linked to more than one bot user. Resolve account ownership before smart booking.');
                 if (monitor.rebookIfExists) throw new Error('Automatic replacement is not available yet. Create a monitor without replacement and request a new preview.');
                 const issue = await smartBooking.readiness(true); if (issue) throw new Error(issue);
                 // Validate ownership, revision and token before any sidecar mutation.
@@ -107,6 +108,8 @@ export function initSmartBookingTools(bot: TelegramBot): void {
                     const currentMonitor = getActiveLuxmedMonitoringsByUser(userId).find(m => m.id === monitor.id && m.accountId === monitor.accountId);
                     if (!currentMonitor || monitorRulesFingerprint(currentMonitor) !== staged.monitorFingerprint)
                         throw new Error('Monitor booking rules changed. Request a new preview.');
+                    if (!smartStore.soleAccountOwner(userId, monitor.accountId))
+                        throw new Error('This LuxMed account is linked to more than one bot user. Resolve account ownership before smart booking.');
                     if (verifiedSelectedClinics(currentMonitor, providerIdentity.cityName).fingerprint !== staged.clinicIdentityFingerprint)
                         throw new Error('A selected clinic changed. Request a new preview.');
                     const otherLegacy = otherLegacyBotAutoMonitors(monitor.accountId, monitor.id);
@@ -134,6 +137,7 @@ export function initSmartBookingTools(bot: TelegramBot): void {
                 const current = smartStore.policy(userId);
                 if (!current || current.state !== 'activating' || current.holdToken || current.revision !== Number(revisionText)
                     || smartStore.accountTransition(userId)
+                    || !smartStore.soleAccountOwner(userId, monitor.accountId)
                     || (smartStore.db.prepare('SELECT account_id FROM luxmed_accounts WHERE user_id=?').get(userId) as { account_id: number } | undefined)?.account_id !== monitor.accountId
                     || !getActiveLuxmedMonitoringsByUser(userId).some(m => m.id === monitor.id && m.accountId === monitor.accountId
                         && monitorRulesFingerprint(m) === staged.monitorFingerprint))
@@ -142,13 +146,15 @@ export function initSmartBookingTools(bot: TelegramBot): void {
                     const currentMonitor = getActiveLuxmedMonitoringsByUser(userId).find(m => m.id === monitor.id && m.accountId === monitor.accountId);
                     if (!currentMonitor || monitorRulesFingerprint(currentMonitor) !== staged.monitorFingerprint)
                         throw new Error('Monitor booking rules changed during activation. Smart booking remains paused.');
+                    if (!smartStore.soleAccountOwner(userId, monitor.accountId))
+                        throw new Error('This LuxMed account is linked to more than one bot user. Resolve account ownership before smart booking.');
                     if (verifiedSelectedClinics(currentMonitor, finalIdentity.cityName).fingerprint !== staged.clinicIdentityFingerprint)
                         throw new Error('A selected clinic changed during activation. Request a new preview.');
                     const changed = smartStore.db.prepare("UPDATE luxmed_availability SET state='confirmed' WHERE user_id=? AND revision=? AND state='activating' AND hold_token IS NULL")
                         .run(userId, Number(revisionText)).changes;
                     if (!changed) return false;
-                    smartStore.db.prepare('UPDATE luxmed_monitorings SET service_name=? WHERE id=? AND user_id=? AND account_id=?')
-                        .run(staged.providerServiceName, monitorId, userId, monitor.accountId);
+                    smartStore.db.prepare('UPDATE luxmed_monitorings SET service_name=?,city_name=? WHERE id=? AND user_id=? AND account_id=?')
+                        .run(staged.providerServiceName, finalIdentity.cityName, monitorId, userId, monitor.accountId);
                     const monitorChanged = smartStore.db.prepare("UPDATE luxmed_smart_monitors SET state='active',status='Monitoring with confirmed availability',next_check=0,confirmed_fingerprint=?,confirmed_provider_fingerprint=?,confirmed_clinic_fingerprint=? WHERE monitoring_id=? AND user_id=? AND state='activating'")
                         .run(staged.monitorFingerprint, staged.providerIdentityFingerprint, staged.clinicIdentityFingerprint, monitorId, userId).changes;
                     if (monitorChanged !== 1) throw new Error('Monitoring changed during activation.');
@@ -224,6 +230,8 @@ export const LuxmedPreviewAvailability: Tool = {
         if (!telegram) throw new Error('Telegram confirmation is unavailable.');
         const monitor = getActiveLuxmedMonitoringsByUser(userId).find(m => m.id === monitoring_id);
         if (!monitor) throw new Error('Monitoring not found.');
+        if (!smartStore.soleAccountOwner(userId, monitor.accountId)) return { success: false,
+            message: 'This LuxMed account is linked to more than one bot user. Resolve account ownership before smart booking.' };
         if (monitor.rebookIfExists) return { success: false,
             message: 'Automatic replacement is not available yet. Create a monitor without replacement before confirming smart booking.' };
         const otherLegacy = otherLegacyBotAutoMonitors(monitor.accountId, monitor.id);

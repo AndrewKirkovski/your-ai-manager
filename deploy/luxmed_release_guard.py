@@ -1,9 +1,11 @@
 """Check watched and SHA-tagged LuxMed images before changing registry tags."""
 
+import json
 import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
 
 def docker(*args):
@@ -46,11 +48,35 @@ def verify(local, sha_tag, revision, watched_tag, call=docker):
     raise RuntimeError('Cannot establish whether the SHA tag exists; registry publication is blocked.')
 
 
+def make_pin(image, revision, run_id, call=docker):
+    if not re.fullmatch(r'[0-9a-f]{40}', revision) or not re.fullmatch(r'[1-9][0-9]*', run_id):
+        raise ValueError('The staged release needs a full SHA and numeric run ID.')
+    image_id = inspect(image, '{{.Id}}', call)
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id):
+        raise RuntimeError('The sidecar image has no valid content digest.')
+    return {'version': 1, 'revision': revision, 'run_id': run_id, 'image_id': image_id}
+
+
+def verify_pin(pin, image, revision, run_id, call=docker):
+    if not isinstance(pin, dict) or set(pin) != {'version', 'revision', 'run_id', 'image_id'}:
+        raise RuntimeError('The staged sidecar digest record is malformed.')
+    expected = make_pin(image, revision, run_id, call)
+    if pin != expected:
+        raise RuntimeError('The staged sidecar digest differs from the tested Stage A image.')
+
+
 if __name__ == '__main__':
-    if len(sys.argv) != 5:
-        raise SystemExit('Usage: luxmed_release_guard.py LOCAL SHA_TAG REVISION WATCHED_TAG')
     try:
-        print(verify(*sys.argv[1:]))
-    except (RuntimeError, ValueError) as error:
+        if len(sys.argv) == 6 and sys.argv[1] == 'write-pin':
+            _, _, image, revision, run_id, path = sys.argv
+            Path(path).write_text(json.dumps(make_pin(image, revision, run_id), sort_keys=True) + '\n', encoding='utf-8')
+        elif len(sys.argv) == 6 and sys.argv[1] == 'check-pin':
+            _, _, image, revision, run_id, path = sys.argv
+            verify_pin(json.loads(Path(path).read_text(encoding='utf-8')), image, revision, run_id)
+        elif len(sys.argv) == 5:
+            print(verify(*sys.argv[1:]))
+        else:
+            raise ValueError('Usage: luxmed_release_guard.py LOCAL SHA_TAG REVISION WATCHED_TAG | write-pin/check-pin IMAGE REVISION RUN_ID PATH')
+    except (OSError, json.JSONDecodeError, RuntimeError, ValueError) as error:
         print(error, file=sys.stderr)
         raise SystemExit(1) from None

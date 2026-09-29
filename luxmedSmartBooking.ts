@@ -140,7 +140,7 @@ export class SmartBookingCoordinator {
     constructor(readonly store: SmartBookingStore = smartStore, private api: Dependencies = smartDependencies, private configured = smartConfigurationIssue) { }
     private activeAccount(userId: number, accountId: number): boolean {
         const row = this.store.db.prepare('SELECT account_id FROM luxmed_accounts WHERE user_id=?').get(userId) as { account_id: number } | undefined;
-        return row?.account_id === accountId && !this.store.accountTransition(userId);
+        return row?.account_id === accountId && this.store.soleAccountOwner(userId, accountId) && !this.store.accountTransition(userId);
     }
     private activeMonitor(config: LuxmedMonitoringConfig): boolean {
         const row = this.store.db.prepare(`SELECT m.*,s.desired_autobook AS smart_autobook FROM luxmed_monitorings m
@@ -568,7 +568,7 @@ export class SmartBookingCoordinator {
         return { candidates: scan.candidates, revision: saved.revision, reservationRevision, complete: true, deferredFromDay };
     }
     async process(config: LuxmedMonitoringConfig, terms: LuxmedTerm[], manual = false): Promise<{ state: string; message: string }> {
-        if (!this.activeAccount(config.userId, config.accountId)) return { state: 'waiting', message: 'The LuxMed account changed. Search again under the current account.' };
+        if (!this.activeAccount(config.userId, config.accountId)) return { state: 'waiting', message: 'The LuxMed account changed or is linked to more than one bot user. Resolve account ownership before smart booking.' };
         if (!manual && !this.activeMonitor(config)) return { state: 'waiting', message: 'Smart monitoring is no longer active.' };
         if (config.rebookIfExists) return { state: 'waiting', message: 'Replacement booking is paused until the existing LuxMed visit can be identified and travel checked without that visit.' };
         if (this.accounts.has(config.accountId) || this.users.has(config.userId)) return { state: 'waiting', message: 'Another booking decision is in progress.' };
@@ -686,6 +686,21 @@ export class SmartBookingCoordinator {
                     }
                     if (outcome.state === 'failed') {
                         this.store.outcome(attempt.id, 'failed');
+                        if (['LOCKTERM_REQUIRES_REVIEW', 'PAYMENT_OR_REFERRAL_REVIEW', 'INCOMPLETE_LOCKTERM', 'ALREADY_RESERVED',
+                            'TEMPORARY_RESERVATION_CLEANUP_UNCERTAIN', 'SMART_REBOOK_REQUIRES_REVIEW',
+                            'IMPEDIMENT_REQUIRES_REVIEW', 'PREPARATION_MISSING', 'BOOKING_BASELINE_REQUIRED',
+                            'INCOMPLETE_RESERVATION_FEED'].includes(outcome.errorCode || '')) {
+                            const message = `LuxMed needs review before another booking (${outcome.errorCode}). Smart monitoring for this account is paused. Check the visit, preparation and reservation details, including payment or referral requirements, then request a new preview. A temporary reservation may still need release.`;
+                            this.store.db.transaction(() => {
+                                this.store.db.prepare(`UPDATE luxmed_smart_monitors SET state='paused',status=? WHERE user_id=? AND state='active'
+                                    AND monitoring_id IN (SELECT id FROM luxmed_monitorings WHERE account_id=? AND user_id=? AND active=1)`)
+                                    .run(message, config.userId, config.accountId, config.userId);
+                                this.store.notify(`booking-review:${attempt.id}`, config.userId, message);
+                            })();
+                            return { state: 'waiting', message };
+                        }
+                        if (outcome.errorCode === 'BOOKING_NOT_SUBMITTED')
+                            return { state: 'retryable_failure', message: 'LuxMed could not prepare the booking. Monitoring is backing off before another attempt.' };
                         if (outcome.errorCode === 'ACCOUNT_BUSY') return { state: 'waiting', message: 'Another booking outcome must be resolved for this LuxMed account.' };
                         if (outcome.errorCode === 'LEGACY_AUTO_MONITOR_ACTIVE') {
                             this.store.status(config.id, 'Waiting for existing LuxMed automatic monitors on this account to be enrolled or stopped.');
@@ -718,7 +733,7 @@ export class SmartBookingCoordinator {
                         // A response status after dispatch cannot prove the
                         // booking request was never submitted upstream.
                     }
-                    if (error instanceof LuxmedApiError && ['BOOKING_GUARD_CHANGED', 'ACCOUNT_BACKOFF'].includes(error.code)) {
+                    if (error instanceof LuxmedApiError && ['BOOKING_GUARD_CHANGED', 'ACCOUNT_BACKOFF', 'SIDECAR_PRE_DISPATCH'].includes(error.code)) {
                         this.store.outcome(attempt.id, 'failed'); return { state: 'waiting', message: error.message };
                     }
                     // A network error does not establish that booking failed.

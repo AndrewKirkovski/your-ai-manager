@@ -228,6 +228,14 @@ async function processMonitoring(config: LuxmedMonitoringConfig, search:typeof l
         if(smart) {
             const result=await smartBooking.process(config,terms);
             smartStore.status(config.id,result.message);
+            if(result.state==='retryable_failure') {
+                const failures=(smartStore.enrollment(config.id)?.failures||0)+1;
+                const delay=Math.min(600000,30000*2**Math.min(failures,5));
+                smartStore.db.prepare(`UPDATE luxmed_smart_monitors SET status=?,failures=?,next_check=? WHERE user_id=? AND state='active'
+                    AND monitoring_id IN (SELECT id FROM luxmed_monitorings WHERE account_id=? AND user_id=? AND active=1)`)
+                    .run(result.message,failures,Date.now()+delay,config.userId,config.accountId,config.userId);
+                return;
+            }
             smartStore.db.prepare('UPDATE luxmed_smart_monitors SET failures=0 WHERE monitoring_id=?').run(config.id);
             return;
         }
@@ -310,7 +318,7 @@ async function processMonitoring(config: LuxmedMonitoringConfig, search:typeof l
         }
         console.error(`[LuxMed Monitor] ${config.id}: Error checking "${config.serviceName}": ${errMsg}`);
         // If auth error, notify user and deactivate
-        const sidecarFailure = err instanceof LuxmedApiError && ['CLIENT_OUTDATED', 'SIDECAR_UNAVAILABLE', 'SIDECAR_TIMEOUT', 'SIDECAR_INVALID_RESPONSE'].includes(err.code);
+        const sidecarFailure = err instanceof LuxmedApiError && ['CLIENT_OUTDATED', 'SIDECAR_PRE_DISPATCH', 'SIDECAR_UNAVAILABLE', 'SIDECAR_TIMEOUT', 'SIDECAR_INVALID_RESPONSE'].includes(err.code);
         const confirmedIncompatibility = err instanceof LuxmedApiError && err.code === 'CLIENT_OUTDATED';
         const authFailure = errMsg.includes('Invalid login') || errMsg.includes('password');
         if (confirmedIncompatibility || authFailure) {
@@ -372,6 +380,7 @@ export async function runLuxmedMonitoringCycle(): Promise<void> {
             for(const config of configs) {
                 const started=Date.now();
                 const smart=smartStore.enrollment(config.id);
+                if(smart&&(smart.state!=='active'||smart.next_check>started))continue;
                 if(smart)smartStore.db.prepare('UPDATE luxmed_smart_monitors SET next_check=? WHERE monitoring_id=?').run(started+30000+Math.floor(Math.random()*3000),config.id);
                 if(config.lastCheck)console.log('[LuxMed monitor] Time since previous result',{monitorId:config.id,sinceResultMs:started-Date.parse(config.lastCheck)});
                 await processMonitoring(config,search);

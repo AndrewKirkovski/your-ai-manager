@@ -210,6 +210,11 @@ export class SmartBookingStore {
     status(monitorId: string, status: string): void {
         this.db.prepare('UPDATE luxmed_smart_monitors SET status=? WHERE monitoring_id=?').run(status, monitorId);
     }
+    soleAccountOwner(userId: number, accountId: number): boolean {
+        const owners = this.db.prepare('SELECT user_id FROM luxmed_accounts WHERE account_id=? LIMIT 2')
+            .all(accountId) as { user_id: number }[];
+        return owners.length === 1 && owners[0].user_id === userId;
+    }
     place(userId: number, id: string, address: string, lat: number, lng: number): Place {
         if (!id || !address || !Number.isFinite(lat) || Math.abs(lat) > 90 || !Number.isFinite(lng) || Math.abs(lng) > 180) throw new Error('Invalid location.');
         const revision = digest({ address, lat, lng });
