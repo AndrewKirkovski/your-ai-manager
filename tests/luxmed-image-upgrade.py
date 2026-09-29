@@ -60,15 +60,18 @@ def wait_health():
 
 
 def client(secret=None, expected_failure=False, smart=False, persisted=False,
-           image=BOT_IMAGE, legacy_auth_failure=False, legacy_read=False, legacy_smart=False):
+           image=BOT_IMAGE, legacy_auth_failure=False, legacy_read=False, legacy_smart=False,
+           legacy_v2=False, legacy_barrier_ack=''):
     env = ['-e', f'LUXMED_SIDECAR_URL=http://{SIDECAR}:8080',
            '-e', f'LUXMED_SECURITY_SECRET={ENCRYPTION_SECRET}',
            '-e', f'EXPECT_AUTH_FAILURE={str(expected_failure).lower()}',
            '-e', f'EXPECT_SMART_CAPABILITIES={str(smart).lower()}',
            '-e', f'EXPECT_LEGACY_SMART_CAPABILITIES={str(legacy_smart).lower()}',
+           '-e', f'EXPECT_LEGACY_V2_CAPABILITIES={str(legacy_v2).lower()}',
            '-e', f'EXPECT_ATTEMPT_PERSISTENCE={str(persisted).lower()}',
            '-e', f'EXPECT_LEGACY_BOT_AUTH_FAILURE={str(legacy_auth_failure).lower()}',
            '-e', f'EXPECT_LEGACY_BOT_READ={str(legacy_read).lower()}']
+    env += ['-e', f'EXPECT_LEGACY_BARRIER_ACK={legacy_barrier_ack}']
     if secret is not None:
         env += ['-e', f'LUXMED_SIDECAR_SECRET={secret}']
     result = docker('run', '--rm', '--network', NETWORK, *env,
@@ -93,7 +96,8 @@ def replace_bot(legacy_bot, original_env, original_mounts):
         docker('inspect', '--format', '{{json .Config.Env}}', BOT).stdout))
     for key in ('DB_PATH', 'REHEARSAL_MARKER'):
         assert updated_env[key] == original_env[key], f'Bot configuration changed: {key}'
-    for key in ('OPENROUTER_API_KEY', 'GOOGLE_MAPS_API_KEY'):
+    for key in ('OPENROUTER_API_KEY', 'GOOGLE_MAPS_API_KEY',
+                'GOOGLE_ROUTES_CACHE_PERMITTED', 'GOOGLE_GEOCODING_CACHE_PERMITTED'):
         assert key not in updated_env, f'Provider key was unexpectedly injected: {key}'
     updated_mounts = json.loads(docker('inspect', '--format', '{{json .Mounts}}', BOT).stdout)
     def mount_identity(mounts):
@@ -153,22 +157,39 @@ try:
                   '-e', f'MONITORING_WEBHOOK_URL=http://bot:3000/api/luxmed/monitoring-callback?secret={WEBHOOK_SECRET}']
     docker('run', '-d', '--name', SIDECAR, '--network', NETWORK, *legacy_env, TAG)
     wait_health()
+    migrations = docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-Atc',
+                        "SELECT COUNT(*) FILTER (WHERE filename LIKE '%13-cancellation-review.yml') || ':' || "
+                        "COUNT(*) FILTER (WHERE filename LIKE '%14-booking-recovery.yml') FROM databasechangelog").stdout.strip()
+    v2_baseline = migrations == '1:0'
+    if os.environ.get('REHEARSAL_V2_BASELINE') == 'true' and not v2_baseline:
+        raise AssertionError(f'Expected a v2 baseline, found migration counts {migrations}')
+    print(f'Watched sidecar baseline: {"v2" if v2_baseline else "other"} (migration counts {migrations}).', flush=True)
     # The new bot can still read the old sidecar while waiting for capabilities.
-    client(legacy_smart=os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true')
+    client(legacy_smart=os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true',
+           legacy_v2=v2_baseline)
     docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-v', 'ON_ERROR_STOP=1', '-c',
-           "INSERT INTO credentials (account_id, user_id, username, password) VALUES (424242,424242,'fixture-user','fixture-ciphertext');")
+           "INSERT INTO credentials (account_id, user_id, username, password) VALUES "
+           "(424242,424242,'fixture-user','fixture-ciphertext'),"
+           "(424249,424249,'clean-enrollment-fixture','fixture-ciphertext');")
     if os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true':
         # A v1 absent-feed confirmation must return to pending review during
         # the v2 migration on the same PostgreSQL 10 volume.
         docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-v', 'ON_ERROR_STOP=1', '-c',
                "INSERT INTO cancellation_receipt(account_id,reservation_id,start_at,state,requested_at,confirmed_at) "
                "VALUES (424246,77246,1791280800000,'confirmed',1,2);")
+    if v2_baseline:
+        # Old v2 persisted successes have no durable account lock. Check both
+        # its reservation-only ACK and the new bot's exact ACK after migration.
+        docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-v', 'ON_ERROR_STOP=1', '-c',
+               "INSERT INTO legacy_booking_barrier(id,account_id,state,reservation_id,start_at,created_at) "
+               "VALUES ('00000000-0000-0000-0000-000000424248',424248,'succeeded',77248,1791280800000,1);")
     old_db_id = docker('inspect', '--format', '{{.Id}}', DB).stdout.strip()
     original_env = dict(item.split('=', 1) for item in json.loads(
         docker('inspect', '--format', '{{json .Config.Env}}', SIDECAR).stdout))
     if ORDER == 'bot-first':
         replace_bot(legacy_bot, original_bot_env, original_bot_mounts)
-        client(legacy_smart=os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true')
+        client(legacy_smart=os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true',
+               legacy_v2=v2_baseline)
 
     # Exercise Watchtower itself, including CMD adoption and environment reuse.
     docker('tag', NEW_IMAGE, TAG)
@@ -182,6 +203,11 @@ try:
     for key in ('REST_SECRET', 'DB_PASSWORD', 'DB_USER', 'DB_NAME'):
         assert key not in updated_env, f'New configuration was unexpectedly injected: {key}'
     wait_health()
+    if v2_baseline:
+        client(image=legacy_bot if ORDER == 'sidecar-first' else BOT_IMAGE, legacy_read=True,
+               legacy_barrier_ack='v1' if ORDER == 'sidecar-first' else 'v2')
+        assert docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-Atc',
+                      'SELECT COUNT(*) FROM legacy_booking_barrier WHERE account_id=424248').stdout.strip() == '0'
     if ORDER == 'sidecar-first':
         # A release must keep the pinned old bot's LuxMed reads available while
         # Watchtower has replaced only the sidecar. Diagnostic mode records the
@@ -214,6 +240,8 @@ try:
            "INSERT INTO booking_account_lock(account_id,attempt_id) VALUES (424243,'00000000-0000-0000-0000-000000424243');"
            "INSERT INTO booking_attempt(id,account_id,fingerprint,state,created_at,phase,process_id) VALUES ('00000000-0000-0000-0000-000000424245',424245,'fixture','pending',1,'confirmation_started','prior-process');"
            "INSERT INTO booking_account_lock(account_id,attempt_id) VALUES (424245,'00000000-0000-0000-0000-000000424245');"
+           "INSERT INTO booking_attempt(id,account_id,fingerprint,state,reservation_id,created_at,phase,process_id) VALUES ('00000000-0000-0000-0000-000000424247',424247,'fixture','succeeded',77247,1,'confirmation_started','prior-process');"
+           "INSERT INTO booking_account_lock(account_id,attempt_id) VALUES (424247,'00000000-0000-0000-0000-000000424247');"
            "INSERT INTO legacy_booking_barrier(id,account_id,state,start_at,created_at,phase,process_id) VALUES ('00000000-0000-0000-0000-000000424244',424244,'pending',1,1,'prepared','prior-process');")
     docker('restart', SIDECAR)
     wait_health()
@@ -223,10 +251,12 @@ try:
                       "(2,(SELECT COUNT(*)::text FROM booking_account_lock WHERE account_id=424243)),"
                       "(3,(SELECT COUNT(*)::text FROM legacy_booking_barrier WHERE account_id=424244)),"
                       "(4,(SELECT state FROM booking_attempt WHERE account_id=424245)),"
-                      "(5,(SELECT COUNT(*)::text FROM booking_account_lock WHERE account_id=424245))"
-                      ") AS checks(position,result) ORDER BY position;").stdout.splitlines()
-    assert recovery == ['failed:PREPARED_INTERRUPTED', '0', '0', 'pending', '1'], recovery
-    print('PG10 restart released only prepared smart and legacy work; confirmation-started work stayed locked.', flush=True)
+                       "(5,(SELECT COUNT(*)::text FROM booking_account_lock WHERE account_id=424245)),"
+                       "(6,(SELECT COUNT(*)::text FROM booking_account_lock WHERE account_id=424247)),"
+                       "(7,(SELECT COUNT(*)::text FROM information_schema.columns WHERE table_name='booking_attempt' AND column_name IN ('start_at','end_at','clinic_id','service_id','schedule_id','doctor_id','telemedicine','baseline_reservation_ids')))"
+                       ") AS checks(position,result) ORDER BY position;").stdout.splitlines()
+    assert recovery == ['failed:PREPARED_INTERRUPTED', '0', '0', 'unknown', '1', '1', '8'], recovery
+    print('PG10 restart held unknown confirmation and unacknowledged success locks with recovery columns.', flush=True)
     docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-v', 'ON_ERROR_STOP=1', '-c',
            "INSERT INTO booking_attempt(id,account_id,fingerprint,state,created_at) VALUES ('00000000-0000-0000-0000-000000424242',424242,'fixture','unknown',1); INSERT INTO booking_account_lock(account_id,attempt_id) VALUES (424242,'00000000-0000-0000-0000-000000424242');")
     client('incorrect-key', expected_failure=True)
@@ -245,6 +275,8 @@ try:
            *legacy_env, '-e', 'DB_PASSWORD=lsb123', '-e', f'REST_SECRET={explicit_secret}', NEW_IMAGE)
     wait_health()
     client(explicit_secret, smart=True, persisted=True)
+    assert docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-Atc',
+                  'SELECT COUNT(*) FROM booking_account_lock WHERE account_id=424247').stdout.strip() == '0'
     client(expected_failure=True)
     print('Explicit REST secret overrides legacy authentication.', flush=True)
 finally:

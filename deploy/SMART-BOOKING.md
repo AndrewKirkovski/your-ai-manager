@@ -34,11 +34,21 @@ Add `OPENROUTER_API_KEY` and `GOOGLE_MAPS_API_KEY` to the deployment's existing
 environment file. Enable Google Routes and Geocoding for that Maps project.
 The OpenRouter integration uses `typesafe/jev-1.13` and the Decisions API.
 Keep keys out of chat history, source control and logs.
+Keep the bot timezone at `Europe/Warsaw`. The sidecar interprets LuxMed local
+appointment times in Warsaw, and smart booking pauses if the bot uses another
+timezone.
 
 Set `GOOGLE_ROUTES_CACHE_PERMITTED=true` only after confirming that the applicable
 Google agreement permits the stored travel estimates. Lazy refresh is still
-caching. Google's standard Routes caching exception explicitly covers coordinates,
-so permission for duration profiles must not be assumed.
+caching. The [published Routes terms](https://cloud.google.com/maps-platform/terms/maps-service-terms)
+explicitly cover temporary coordinate caching, so permission for duration
+profiles must not be assumed.
+Set `GOOGLE_GEOCODING_CACHE_PERMITTED=true` only after confirming that the
+applicable agreement permits storing the resolved addresses and coordinates for
+the required period. The [published EEA Geocoding terms](https://cloud.google.com/terms/maps-platform/eea/maps-service-terms)
+allow temporary caching of coordinates for 30 days and do not grant general
+indefinite address storage.
+Both permission checks must pass before smart booking starts.
 
 Recreate only the bot service using the deployment's existing Compose file:
 
@@ -65,6 +75,10 @@ baseline before publishing both tags. After a successful legacy booking under
 a compatible mixed version, the sidecar holds later legacy manual bookings
 until the new bot verifies and acknowledges the reservation. This prevents a
 duplicate retry but can interrupt legacy booking if the bot update fails.
+An old v2 bot cannot supply the exact reservation facts required by a v4
+sidecar. A sidecar-first update therefore pauses its automatic smart booking
+until Watchtower replaces the bot. This is a safe service pause, not continuous
+booking availability.
 Smart booking waits if configuration or sidecar capabilities are missing.
 Enrolment stores the intended auto-book setting in smart-monitor state and clears
 the old monitor's auto-book flag. An older bot image therefore cannot resume
@@ -105,19 +119,29 @@ or nonzero prices and referral requirements until the user can review them.
 The sidecar records a failed smart attempt without contacting LuxMed while any
 sidecar-owned automatic monitor is active for the account. Those monitors keep
 running until the user confirms account-wide enrolment or stops them. A legacy
-booking through the
-sidecar first records a durable account barrier. Smart booking waits while its
+booking through the sidecar first records a durable account barrier. Smart booking waits while its
 outcome is uncertain. After success, the bot clears the barrier only when a
 complete reservation response for that visit's date shows the exact reservation
 ID, or the bot has confirmed its cancellation. The bot checks barriers for linked
 accounts in the background, including accounts without an active smart monitor.
+A chat booking for an account absent from the bot account table remains held
+until that account is registered or an operator reviews it.
 A complete reservation feed that omits a previously seen visit does not prove
 cancellation. Every dispatched DELETE leaves a pending receipt and holds new
 bookings for that account. The sidecar never repeats that DELETE. An operator
 must check the result in LuxMed, then review the exact reservation ID and start
 through `POST /api/v1/accounts/{accountId}/visits/cancellation-receipts/{reservationId}/review`
-with `expectedStartAt`, `action`, `operator` and `reason`. The action is
-`confirmed_cancelled` or `verified_still_reserved`. The review is recorded in
+with `expectedStartAt`, `action`, `operator`, `reason` and
+`providerRequestSettled=true`. A confirmed cancellation also requires
+`cancellationStatusVerified=true`: the operator verifies that exact reservation
+ID was cancelled in LuxMed and the DELETE has settled. The sidecar checks a
+complete broad reservation range; a moved visit or incomplete response keeps
+the account held. The action is `confirmed_cancelled`,
+`verified_still_reserved` or `verified_moved`. For a moved visit the operator
+provides `expectedMovedStartAt`; the sidecar verifies the exact ID at the new
+start in complete coverage of both dates and returns the new visit facts. The
+bot refreshes that date, moves any saved booking block, and acknowledges the
+move before the sidecar releases the account. The review is recorded in
 an append-only audit table. The endpoint uses the existing sidecar REST secret;
 the `operator` field is supplied by that caller and is not independently
 authenticated. It is not exposed as a chatbot tool. A confirmed cancellation
@@ -126,7 +150,11 @@ For a still-reserved visit, the bot removes any old cancellation marker and
 requires a fresh reservation feed to show that exact visit before booking
 resumes. Prior confirmations based on absent feeds become pending during the
 v2 database migration and need review. Smart booking requires the sidecar's
-`cancellation-receipts-v2` capability, including during mixed image updates.
+`cancellation-receipts-v3` capability, including during mixed image updates.
+LuxMed's DELETE accepts a reservation ID without a conditional start time.
+An external move between the sidecar's start-time check and the DELETE can
+still cancel the moved visit. The pending receipt prevents an automatic retry;
+the operator must inspect the result in LuxMed.
 
 Smart searches target 30 seconds plus jitter. Requests are serialised per account,
 with bookings ahead of queued searches. Effective polling intervals and decision
@@ -138,20 +166,43 @@ increase the retry interval.
 
 Booking attempts and notifications are persisted. An uncertain response holds the
 account while its attempt status and reservations are checked. A missing or
-ambiguous receipt never permits an automatic duplicate attempt. If the upstream
-outcome remains unknown, the user must verify it; the bot reports possible matching
-reservations without guessing. The sidecar records a prepared phase before
-each new smart or legacy booking and records confirmation started before the
-provider confirmation call. After a restart, it releases prepared work from
-an earlier process because that process could not confirm without first
-changing the phase. A concurrent earlier process loses its conditional phase
-update and must not call the provider. Attempts that reached confirmation and
-older rows without a phase remain held. There is no evidence-bound operator
-resolution tool for those rows, so an unresolved attempt requires manual
-investigation before booking can resume. Notifications retry
-independently of booking. Confirmed cancellations remain recorded so a late
-success receipt or a stale reservation feed cannot restore the cancelled visit.
-Later travel or schedule conflicts generate a warning without cancelling a visit.
+ambiguous receipt never permits an automatic duplicate attempt. The bot reports
+possible matching reservations without guessing.
+
+The sidecar records a prepared phase before each new smart or legacy booking
+and records confirmation started before the provider confirmation call. After
+a restart, it releases prepared work from an earlier process because that
+process could not confirm without first changing the phase. A prior process's
+confirmation-started attempt becomes unknown and stays locked. A successful
+smart attempt keeps the account lock until the bot has saved the reservation
+block, stopped the monitor, queued the notification and acknowledged the exact
+attempt. The bot retries an unacknowledged success after restart. A shared
+database permit covers legacy bookings, smart bookings, enrolment and
+cancellation dispatch across sidecar processes.
+
+For a new unknown smart attempt, an operator can inspect
+`GET /api/v1/accounts/{accountId}/booking-attempts/{attemptId}/review-context`.
+The sidecar stores the requested visit facts, the complete pre-submit
+reservation ID set, and exact facts for the candidate's three-day comparison
+window. Missing end time or location inside that window blocks booking;
+unrelated visits outside it do not. Positive review uses
+`POST /api/v1/accounts/{accountId}/booking-attempts/{attemptId}/review` with
+the exact fingerprint, start, end, clinic and baseline from that context, the
+new reservation ID, `serviceAndDoctorVerified=true`,
+`providerRequestSettled=true`, `operator` and `reason`. The operator must verify
+the service and doctor in LuxMed and establish that the original provider
+request is no longer in flight. The sidecar also requires a complete exact-day
+reservation response with the new ID, time and clinic or telemedicine type.
+Review is audited and leaves the account locked until the bot records and
+acknowledges success. The provider feed cannot prove which request created a
+matching reservation, and a delayed provider response remains an operator
+judgment. No absent feed or timeout clears an unknown attempt. Older attempts
+without stored recovery facts remain held for manual investigation.
+
+Notifications retry independently of booking. Confirmed cancellations remain
+recorded so a late success receipt or a stale reservation feed cannot restore
+the cancelled visit. Later travel or schedule conflicts generate a warning
+without cancelling a visit.
 
 ## Verification
 
@@ -177,6 +228,11 @@ candidate requires a fresh image replacement rehearsal with a working Docker dae
 For an authenticated v1 baseline, the rehearsal seeds a previously confirmed
 cancellation and verifies that PostgreSQL 10 moves it to pending review with an
 audit entry in both image orders.
+It also checks the v3 recovery columns and keeps a successful attempt
+locked across restart until the bot acknowledges it.
+The authenticated v2 baseline rehearsal covers both image orders and the old
+bot's reservation-only legacy barrier acknowledgement. It detects a watched v2
+baseline from applied migrations and asserts that the migrated barrier clears.
 
 After configuring keys, run the optional read-only provider check:
 

@@ -10,6 +10,7 @@ export interface Enrollment { monitoring_id: string; user_id: number; state: str
 export interface BookingAttempt {
     id: string; user_id: number; account_id: number; monitoring_id: string | null; fingerprint: string;
     state: string; policy_revision: number; payload: string; reservation_id: number | null; created_at: number; updated_at: number;
+    acknowledged_at: number | null;
 }
 export interface ReservationCoverage { from: number; to: number; }
 export interface ReservationSnapshot {
@@ -383,6 +384,50 @@ export class SmartBookingStore {
             this.db.prepare('DELETE FROM luxmed_reservation_snapshots WHERE account_id=?').run(accountId);
         })();
     }
+    recordMovedReservation(accountId: number, reservationId: number, oldStartAt: number,
+        movedStartAt: number, movedEndAt: number, telemedicine: boolean): void {
+        if (![reservationId, oldStartAt, movedStartAt, movedEndAt].every(value => Number.isSafeInteger(value) && value > 0)
+            || movedStartAt === oldStartAt || movedEndAt <= movedStartAt)
+            throw new Error('Moved reservation facts are invalid.');
+        this.db.transaction(() => {
+            const snapshot = this.snapshot(accountId);
+            if (!snapshot || !snapshot.value.some(event => {
+                const visit = event as { eventId: number; date: string };
+                return visit.eventId === reservationId && zonedTime(visit.date) === movedStartAt;
+            })) throw new Error('The moved visit is absent from the verified reservation snapshot.');
+            const marker = this.db.prepare('SELECT start_at FROM luxmed_cancelled_reservations WHERE account_id=? AND reservation_id=?')
+                .get(accountId, reservationId) as { start_at: number | null } | undefined;
+            if (marker && marker.start_at !== oldStartAt) throw new Error('A cancellation marker conflicts with the moved visit.');
+            if (marker) this.db.prepare('DELETE FROM luxmed_cancelled_reservations WHERE account_id=? AND reservation_id=? AND start_at=?')
+                .run(accountId, reservationId, oldStartAt);
+            const rows = this.db.prepare(`SELECT b.attempt_id,b.user_id,b.value FROM luxmed_booking_blocks b
+                JOIN luxmed_booking_attempts a ON a.id=b.attempt_id
+                WHERE a.account_id=? AND b.reservation_id=?`).all(accountId, reservationId) as
+                { attempt_id: string; user_id: number; value: string }[];
+            for (const row of rows) {
+                const prior = JSON.parse(row.value) as BusyInterval;
+                if (![oldStartAt, oldStartAt - 10 * 60000, movedStartAt, movedStartAt - 10 * 60000].includes(prior.start))
+                    throw new Error('A saved booking block conflicts with the moved visit.');
+                const next: BusyInterval = { ...prior, start: movedStartAt - (telemedicine ? 0 : 10 * 60000),
+                    end: movedEndAt + 10 * 60000,
+                    // A moved visit does not establish the old clinic as the
+                    // patient's location, even when the new visit is remote.
+                    locationId: telemedicine ? undefined : `unresolved-reservation:${reservationId}` };
+                this.db.prepare('UPDATE luxmed_booking_blocks SET value=? WHERE attempt_id=? AND user_id=? AND reservation_id=?')
+                    .run(JSON.stringify(next), row.attempt_id, row.user_id, reservationId);
+            }
+            const current = snapshot.value.filter(event => {
+                const visit = event as { eventId: number; date: string };
+                return visit.eventId !== reservationId || zonedTime(visit.date) !== oldStartAt;
+            });
+            if (current.length !== snapshot.value.length) this.db.prepare('UPDATE luxmed_reservation_snapshots SET revision=?,value=? WHERE account_id=?')
+                .run(digest({ value: current, coverage: { from: snapshot.coveredFrom, to: snapshot.coveredTo } }), JSON.stringify(current), accountId);
+            const users = this.db.prepare('SELECT DISTINCT user_id FROM luxmed_accounts WHERE account_id=?')
+                .all(accountId) as { user_id: number }[];
+            for (const user of users) this.notify(`moved:${accountId}:${reservationId}:${movedStartAt}`, user.user_id,
+                `LuxMed reservation ${reservationId} was moved. Please review its new time and journey. Automatic booking waited for the updated reservation.`);
+        })();
+    }
     wasCancelled(accountId: number, reservationId: number, startAt: number): boolean {
         return !!this.db.prepare('SELECT 1 FROM luxmed_cancelled_reservations WHERE account_id=? AND reservation_id=? AND start_at=?')
             .get(accountId, reservationId, startAt);
@@ -390,6 +435,10 @@ export class SmartBookingStore {
     pending(userId?: number): BookingAttempt[] {
         return this.db.prepare("SELECT * FROM luxmed_booking_attempts WHERE state IN ('pending','unknown')" + (userId === undefined ? '' : ' AND user_id=?'))
             .all(...(userId === undefined ? [] : [userId])) as BookingAttempt[];
+    }
+    accountBookingRevision(accountId: number): number {
+        return (this.db.prepare("SELECT COUNT(*) AS value FROM luxmed_booking_attempts WHERE account_id=? AND state IN ('succeeded','cancelled')")
+            .get(accountId) as { value: number }).value;
     }
     begin(userId: number, accountId: number, monitoringId: string | null, revision: number, fingerprint: string, payload: unknown): BookingAttempt {
         const id = randomUUID();
@@ -399,6 +448,18 @@ export class SmartBookingStore {
         return this.attempt(id)!;
     }
     attempt(id: string): BookingAttempt | null { return this.db.prepare('SELECT * FROM luxmed_booking_attempts WHERE id=?').get(id) as BookingAttempt || null; }
+    unacknowledged(): BookingAttempt[] {
+        return this.db.prepare("SELECT * FROM luxmed_booking_attempts WHERE state IN ('succeeded','cancelled') AND reservation_id IS NOT NULL AND acknowledged_at IS NULL")
+            .all() as BookingAttempt[];
+    }
+    acknowledge(id: string, reservationId: number): boolean {
+        const changed = this.db.prepare(`UPDATE luxmed_booking_attempts SET acknowledged_at=?,updated_at=?
+            WHERE id=? AND reservation_id=? AND state IN ('succeeded','cancelled') AND acknowledged_at IS NULL`)
+            .run(Date.now(), Date.now(), id, reservationId);
+        return changed.changes === 1 || !!this.db.prepare(`SELECT 1 FROM luxmed_booking_attempts
+            WHERE id=? AND reservation_id=? AND state IN ('succeeded','cancelled') AND acknowledged_at IS NOT NULL`)
+            .get(id, reservationId);
+    }
     outcome(id: string, state: 'unknown' | 'failed'): void {
         this.db.prepare("UPDATE luxmed_booking_attempts SET state=?,updated_at=? WHERE id=? AND state IN ('pending','unknown')").run(state, Date.now(), id);
     }

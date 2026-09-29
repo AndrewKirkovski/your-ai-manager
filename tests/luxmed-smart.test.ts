@@ -10,12 +10,12 @@ import { computeGoogleRoute, providerStreetMatches, providerCityMatches, resolve
 import { rankWithJev } from '../luxmedJev.ts';
 import { AccountQueue } from '../luxmedAccountQueue.ts';
 import type { LuxmedMonitoringConfig } from '../userStore.ts';
-import type { LuxmedTerm } from '../luxmedAdapter.ts';
+import type { LuxmedEvent, LuxmedTerm } from '../luxmedAdapter.ts';
 
 // Dynamic imports ensure tests can never open the operator's bot.sqlite.
 process.env.DB_PATH = ':memory:';
 const { SmartBookingStore } = await import('../luxmedSmartStore.ts');
-const { SmartBookingCoordinator, smartDependencies, slotFromTerm, matchesMonitor } = await import('../luxmedSmartBooking.ts');
+const { SmartBookingCoordinator, smartDependencies, slotFromTerm, matchesMonitor, smartBookingTimezoneIssue, smartConfigurationIssue, reservationBaselineFacts } = await import('../luxmedSmartBooking.ts');
 const { saveUserAddress, saveLuxmedAccount } = await import('../userStore.ts');
 const { LuxmedBookSlot } = await import('../tools.luxmed.ts');
 const globalDb = (await import('../database.ts')).default;
@@ -42,6 +42,65 @@ test('policy validation rejects unresolved shape, missing limits and invented ti
     assert.throws(() => validatePolicy({ ...policy, maxTaxiMinutes: undefined }));
     assert.throws(() => validatePolicy({ ...policy, timezone: 'UTC' }));
     assert.throws(() => validatePolicy({ ...policy, windows: [{ date: '2026-02-30', from: '08:00', to: '11:00' }] }));
+});
+test('smart booking holds when the bot timezone differs from the sidecar term timezone', () => {
+    assert.equal(smartBookingTimezoneIssue('Europe/Warsaw'), null);
+    assert.match(smartBookingTimezoneIssue('UTC')!, /Europe\/Warsaw/);
+});
+test('stored Google routes and geocoding each require confirmed cache permission', () => {
+    const keys = ['OPENROUTER_API_KEY', 'GOOGLE_MAPS_API_KEY', 'GOOGLE_ROUTES_CACHE_PERMITTED', 'GOOGLE_GEOCODING_CACHE_PERMITTED'] as const;
+    const previous = keys.map(key => process.env[key]);
+    try {
+        process.env.OPENROUTER_API_KEY = 'fixture';
+        process.env.GOOGLE_MAPS_API_KEY = 'fixture';
+        process.env.GOOGLE_ROUTES_CACHE_PERMITTED = 'true';
+        delete process.env.GOOGLE_GEOCODING_CACHE_PERMITTED;
+        assert.match(smartConfigurationIssue()!, /geocoding storage permission/);
+        process.env.GOOGLE_GEOCODING_CACHE_PERMITTED = 'true';
+        assert.equal(smartConfigurationIssue(), null);
+    } finally {
+        keys.forEach((key, index) => {
+            if (previous[index] === undefined) delete process.env[key];
+            else process.env[key] = previous[index];
+        });
+    }
+});
+test('booking baseline preserves visit time and clinic facts for the sidecar recheck', () => {
+    assert.deepEqual(reservationBaselineFacts([{ eventId: 42, date: '2026-10-06T11:00:00',
+        dateTo: '2026-10-06T11:30:00', eventType: 'Visit', clinic: { id: 7, address: 'Testowa 2', city: 'Warszawa' },
+        status: 'Reserved', title: 'Visit' }]), [{ reservationId: 42, startAt: at('11:00'), endAt: at('11:30'),
+        clinicId: 7, telemedicine: false, clinicAddress: 'Testowa 2', clinicCity: 'Warszawa' }]);
+    assert.throws(() => reservationBaselineFacts([{ eventId: 42, date: '2026-10-06T11:00:00', status: 'Reserved', title: '' },
+        { eventId: 42, date: '2026-10-06T12:00:00', status: 'Reserved', title: '' }]));
+});
+test('booking baseline limits detailed facts to the candidate window but keeps missing nearby ends', () => {
+    const events = [
+        { eventId: 40, date: '2026-10-06T09:00:00', dateTo: '2026-10-06T09:30:00', eventType: 'Telemedicine' },
+        { eventId: 41, date: '2026-10-07T09:00:00', eventType: 'Telemedicine' },
+        { eventId: 42, date: '2026-11-20T09:00:00', eventType: 'Telemedicine' },
+    ] as LuxmedEvent[];
+    const facts = reservationBaselineFacts(events, zonedTime('2026-10-06T11:00:00'));
+    assert.deepEqual(facts.map(fact => fact.reservationId), [40, 41]);
+    assert.equal(facts[1].endAt, 0);
+    assert.deepEqual(events.map(event => event.eventId), [40, 41, 42]);
+});
+test('idempotent booking sends exact reservation facts to the sidecar', async () => {
+    const f = coordinatorFixture();
+    const facts = reservationBaselineFacts([{ eventId: 42, date: '2026-10-06T11:00:00',
+        dateTo: '2026-10-06T11:30:00', eventType: 'Visit', clinic: { id: 7, address: 'Testowa 2', city: 'Warszawa' },
+        status: 'Reserved', title: 'Visit' }]);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+        assert.match(String(url), /\/booking-attempts$/);
+        const body = JSON.parse(String(init?.body));
+        assert.deepEqual(body.baselineReservationIds, [42]);
+        assert.deepEqual(body.baselineReservations, facts);
+        return new Response(JSON.stringify({ success: true, data: { state: 'failed', errorCode: 'BOOKING_REJECTED' } }));
+    };
+    try {
+        const { luxmedBookSlot } = await import('../luxmedAdapter.ts');
+        await luxmedBookSlot(991, f.term, 1, false, '00000000-0000-0000-0000-000000000991', () => true, [42], facts);
+    } finally { globalThis.fetch = originalFetch; f.store.db.close(); }
 });
 test('a one-off commitment cannot disappear behind recurrence bounds or exceptions', () => {
     const friday = { id: 'trip', name: 'Away', date: '2026-10-09', from: '08:00', to: '20:00', locationId: 'home' };
@@ -277,7 +336,7 @@ function coordinatorFixture() {
         .run(config.dateFrom, config.dateTo, config.createdAt);
     store.enroll('m1', 1); store.db.prepare("UPDATE luxmed_smart_monitors SET state='active' WHERE monitoring_id='m1'").run();
     let books = 0;
-    const api = { ...smartDependencies, capabilities: async () => ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v2', 'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1', 'legacy-booking-barrier-v1', 'smart-booking-enrollment-fence-v2', 'smart-booking-identity-fence-v1', 'cancellation-receipts-v2'], reserved: async () => [], doctors: async () => [], cities: async () => [{ id: 1, name: 'Warszawa' }], monitorings: async () => [], cancellations: async () => [], book: async () => { books++; return { state: 'succeeded', reservationId: 77 }; }, attempt: async () => ({ state: 'succeeded' as const, reservationId: 77 }), legacyBarrier: async () => ({ state: 'clear' as const }), acknowledgeLegacy: async () => { }, resolve: async () => null };
+    const api = { ...smartDependencies, capabilities: async () => ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v3', 'smart-booking-attempts-v4', 'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1', 'legacy-booking-barrier-v2', 'smart-booking-enrollment-fence-v2', 'smart-booking-identity-fence-v1', 'cancellation-receipts-v3'], reserved: async () => [], doctors: async () => [], cities: async () => [{ id: 1, name: 'Warszawa' }], monitorings: async () => [], cancellations: async () => [], acknowledgeMove: async () => { }, book: async () => { books++; return { state: 'succeeded', reservationId: 77 }; }, attempt: async () => ({ state: 'succeeded' as const, reservationId: 77 }), acknowledgeAttempt: async () => { }, legacyBarrier: async () => ({ state: 'clear' as const }), acknowledgeLegacy: async () => { }, resolve: async () => null };
     const coordinator = new SmartBookingCoordinator(store, api, () => null);
     const cache = { lookup: async (q: TravelQuery) => estimate(q, 1500, false, Date.now()), prepared: () => null, previous: () => null, key: (q: TravelQuery) => JSON.stringify(q), warm: () => { }, metrics: {} };
     coordinator.cache = () => cache as any;
@@ -343,6 +402,35 @@ test('concurrent decisions produce one booking and durable notification even whe
     assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM luxmed_notification_outbox WHERE delivered_at IS NULL').get().n, 1);
     assert.equal(f.store.blocks(1).length, 1); f.store.db.close();
 });
+test('sidecar success is acknowledged only after the booking and notification are durable', async () => {
+    const f = coordinatorFixture();
+    let acknowledgements = 0;
+    f.api.acknowledgeAttempt = async (_accountId, id, reservationId) => {
+        const saved = f.store.attempt(id);
+        assert.equal(saved?.state, 'succeeded');
+        assert.equal(saved?.reservation_id, reservationId);
+        assert.equal(f.store.blocks(1).length, 1);
+        assert.equal((f.store.db.prepare("SELECT COUNT(*) AS n FROM luxmed_notification_outbox WHERE id=?").get(`booked:${id}`) as { n: number }).n, 1);
+        acknowledgements++;
+    };
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'booked');
+    assert.equal(acknowledgements, 1);
+    assert.equal(f.store.unacknowledged().length, 0);
+    f.store.db.close();
+});
+test('a failed sidecar acknowledgement is retried after bot restart without another booking', async () => {
+    const f = coordinatorFixture();
+    let acknowledgements = 0;
+    f.api.acknowledgeAttempt = async () => { acknowledgements++; throw new Error('ack response lost'); };
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'booked');
+    assert.equal(f.store.unacknowledged().length, 1);
+    f.api.acknowledgeAttempt = async () => { acknowledgements++; };
+    await new SmartBookingCoordinator(f.store, f.api, () => null).reconcile();
+    assert.equal(acknowledgements, 2);
+    assert.equal(f.store.unacknowledged().length, 0);
+    assert.equal(f.books(), 1);
+    f.store.db.close();
+});
 test('an active legacy auto monitor leaves a terminal smart attempt and clear waiting status', async () => {
     const f = coordinatorFixture();
     f.api.book = async () => ({ state: 'failed', errorCode: 'LEGACY_AUTO_MONITOR_ACTIVE' });
@@ -400,7 +488,7 @@ test('a succeeded legacy barrier clears only after the exact reservation appears
     const dateTo = f.term.term.dateTimeTo.dateTimeLocal!;
     let barrierState: 'succeeded' | 'clear' = 'succeeded';
     let acknowledgements = 0;
-    f.api.legacyBarrier = async () => barrierState === 'clear' ? { state: 'clear' } : { state: 'succeeded', reservationId: 77, start };
+    f.api.legacyBarrier = async () => barrierState === 'clear' ? { state: 'clear' } : { id: 'legacy-1', state: 'succeeded', reservationId: 77, start };
     f.api.acknowledgeLegacy = async () => { acknowledgements++; barrierState = 'clear'; };
     const day = DateTime.fromMillis(start, { zone: 'Europe/Warsaw' }).startOf('day');
     const coverage = { from: day.toMillis(), to: day.plus({ days: 1 }).toMillis() };
@@ -423,7 +511,7 @@ test('a confirmed cancellation can clear its matching legacy barrier without rev
     const start = slotFromTerm(f.term, 1).start;
     f.store.confirmCancellation(1, 77, start);
     let acknowledged = false;
-    f.api.legacyBarrier = async () => acknowledged ? { state: 'clear' } : { state: 'succeeded', reservationId: 77, start };
+    f.api.legacyBarrier = async () => acknowledged ? { state: 'clear' } : { id: 'legacy-2', state: 'succeeded', reservationId: 77, start };
     f.api.acknowledgeLegacy = async () => { acknowledged = true; };
     await f.coordinator.process(f.config, []);
     assert.equal(acknowledged, true);
@@ -543,6 +631,63 @@ test('a reviewed still-reserved visit restores an old cancellation tombstone and
     assert.equal(result.state, 'waiting');
     f.store.db.close();
 });
+test('a reviewed move replaces the saved visit time before releasing the sidecar hold', async () => {
+    const f = coordinatorFixture();
+    const oldStart = slotFromTerm(f.term, 1).start;
+    const movedStart = oldStart + 86400000, movedEnd = movedStart + 30 * 60000;
+    const local = (time: number) => DateTime.fromMillis(time, { zone: 'Europe/Warsaw' }).toFormat("yyyy-MM-dd'T'HH:mm:ss");
+    const oldEvent = { eventId: 77, date: local(oldStart), dateTo: local(oldStart + 30 * 60000), eventType: 'Telemedicine' };
+    const movedEvent = { eventId: 77, date: local(movedStart), dateTo: local(movedEnd), eventType: 'Telemedicine' };
+    const oldDay = DateTime.fromMillis(oldStart, { zone: 'Europe/Warsaw' }).startOf('day');
+    f.store.saveSnapshot(1, [oldEvent], { from: oldDay.toMillis(), to: oldDay.plus({ days: 1 }).toMillis() });
+    const attempt = f.store.begin(1, 1, null, 1, 'original', { slot: { start: oldStart } });
+    f.store.succeed(attempt.id, 77, { id: 'reservation:77', start: oldStart,
+        end: oldStart + 40 * 60000, locationId: clinic.id }, 'Booked');
+    f.api.cancellations = async () => [{ accountId: 1, reservationId: 77, startAt: oldStart,
+        state: 'verified_moved' as const, reviewedAt: Date.now(), reviewedBy: 'operator',
+        reviewReason: 'Provider shows a moved visit', reviewAction: 'verified_moved',
+        movedStartAt: movedStart, movedEndAt: movedEnd, movedClinicId: null,
+        movedTelemedicine: true, movedClinicAddress: null, movedClinicCity: null }];
+    f.api.reserved = async () => [movedEvent as LuxmedEvent];
+    let acknowledged = 0;
+    f.api.acknowledgeMove = async (_account, id, expectedOld, expectedMoved) => {
+        assert.deepEqual([id, expectedOld, expectedMoved], [77, oldStart, movedStart]);
+        assert.equal((f.store.snapshot(1)?.value as LuxmedEvent[]).some(event => zonedTime(event.date) === oldStart), false);
+        assert.equal(f.store.blocks(1)[0].start, movedStart);
+        assert.equal(f.store.blocks(1)[0].locationId, undefined);
+        acknowledged++;
+    };
+    await f.coordinator.process(f.config, []);
+    assert.equal(acknowledged, 1);
+    assert.equal(f.store.blocks(1)[0].end, movedEnd + 10 * 60000);
+    const busy = await f.coordinator.intervals(1, 1, 1);
+    assert.equal(busy.find(interval => interval.id === 'reservation:77')?.locationId, undefined);
+    assert.equal(await evaluateSlot({ id: 'later-clinic', start: movedEnd + 45 * 60000,
+        end: movedEnd + 75 * 60000, locationId: clinic.id, telemedicine: false,
+        preparationRequired: false }, policy, f.store.places(1), busy,
+    async query => estimate(query, 25 * 60, false, Date.now())), null);
+    assert.equal(f.books(), 0);
+    f.store.db.close();
+});
+test('a reviewed move with incomplete provider facts keeps the account held', async () => {
+    const f = coordinatorFixture();
+    const oldStart = slotFromTerm(f.term, 1).start, movedStart = oldStart + 86400000;
+    f.api.cancellations = async () => [{ accountId: 1, reservationId: 77, startAt: oldStart,
+        state: 'verified_moved' as const, reviewedAt: Date.now(), reviewedBy: 'operator',
+        reviewReason: 'Provider shows a moved visit', reviewAction: 'verified_moved',
+        movedStartAt: movedStart, movedEndAt: movedStart + 30 * 60000, movedClinicId: null,
+        movedTelemedicine: true, movedClinicAddress: null, movedClinicCity: null }];
+    f.api.reserved = async () => [{ eventId: 77,
+        date: DateTime.fromMillis(movedStart, { zone: 'Europe/Warsaw' }).toFormat("yyyy-MM-dd'T'HH:mm:ss"),
+        eventType: 'Telemedicine' } as LuxmedEvent];
+    let acknowledged = 0;
+    f.api.acknowledgeMove = async () => { acknowledged++; };
+    const result = await f.coordinator.process(f.config, [f.term]);
+    assert.equal(result.state, 'waiting');
+    assert.equal(acknowledged, 0);
+    assert.equal(f.books(), 0);
+    f.store.db.close();
+});
 test('smart booking waits for reviewed cancellation receipts on a mixed sidecar image', async () => {
     const f = coordinatorFixture();
     f.api.capabilities = async () => ['smart-booking-v1', 'cancellation-receipts-v1'];
@@ -572,7 +717,7 @@ test('chat cancellation binds the sidecar request and local tombstone to the exa
     globalThis.fetch = async (url, init) => {
         const path = String(url);
         if (path.endsWith('/capabilities'))
-            return new Response(JSON.stringify({ success: true, data: ['cancellation-receipts-v2'] }));
+            return new Response(JSON.stringify({ success: true, data: ['cancellation-receipts-v3'] }));
         if (init?.method === 'DELETE') {
             assert.ok(path.endsWith(`/visits/77?expectedStartAt=${start}`));
             deleteCalled = true;
@@ -602,7 +747,7 @@ test('chat cancellation leaves occupied time intact without a confirmed sidecar 
     globalThis.fetch = async (url, init) => {
         const path = String(url);
         if (path.endsWith('/capabilities'))
-            return new Response(JSON.stringify({ success: true, data: ['cancellation-receipts-v2'] }));
+            return new Response(JSON.stringify({ success: true, data: ['cancellation-receipts-v3'] }));
         if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: true, data: 'Cancelled' }));
         if (path.endsWith('/visits/reserved')) return new Response(JSON.stringify({ success: true,
             data: [{ eventId: 77, date: '2026-10-06T12:00:00' }] }));
@@ -697,6 +842,28 @@ test('unsupported sidecar cannot enable smart booking', async () => {
     assert.equal(result.state, 'waiting');
     assert.match(result.message, /sidecar smart booking update/);
     assert.equal(f.books(), 0); f.store.db.close();
+});
+test('a v2 sidecar without durable success acknowledgement cannot enable smart booking', async () => {
+    const f = coordinatorFixture();
+    f.api.capabilities = async () => ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v2',
+        'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1',
+        'legacy-booking-barrier-v1', 'smart-booking-enrollment-fence-v2',
+        'smart-booking-identity-fence-v1', 'cancellation-receipts-v2'];
+    const result = await f.coordinator.process(f.config, [f.term]);
+    assert.equal(result.state, 'waiting');
+    assert.equal(f.books(), 0);
+    f.store.db.close();
+});
+test('a v3 sidecar that ignores exact reservation facts cannot enable smart booking', async () => {
+    const f = coordinatorFixture();
+    f.api.capabilities = async () => ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v3',
+        'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1',
+        'legacy-booking-barrier-v2', 'smart-booking-enrollment-fence-v2',
+        'smart-booking-identity-fence-v1', 'cancellation-receipts-v2'];
+    const result = await f.coordinator.process(f.config, [f.term]);
+    assert.equal(result.state, 'waiting');
+    assert.equal(f.books(), 0);
+    f.store.db.close();
 });
 test('smart replacement waits until the old visit is identified before any booking work', async () => {
     const f = coordinatorFixture();
@@ -1037,6 +1204,22 @@ test('a queued submission rejects a newly held policy before contacting LuxMed',
     };
     assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting');
     assert.equal(submitted, 0); assert.equal(f.store.pending().length, 0); f.store.db.close();
+});
+test('a queued submission rejects a booking recorded after its decision began', async () => {
+    const { LuxmedApiError } = await import('../luxmedAdapter.ts');
+    const f = coordinatorFixture();
+    let submitted = 0;
+    f.api.book = async (_account, _term, _city, _rebook, _id, guard) => {
+        f.store.db.prepare(`INSERT INTO luxmed_booking_attempts
+            (id,user_id,account_id,fingerprint,state,policy_revision,payload,reservation_id,created_at,updated_at)
+            VALUES ('competing-success',1,1,'fixture','succeeded',1,'{}',99,1,1)`).run();
+        if (guard && !guard()) throw new LuxmedApiError('Changed', 'BOOKING_GUARD_CHANGED');
+        submitted++; return { state: 'succeeded', reservationId: 88 };
+    };
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting');
+    assert.equal(submitted, 0);
+    assert.equal(f.store.pending().length, 0);
+    f.store.db.close();
 });
 test('a late travel conflict queues a warning without another booking or cancellation', async () => {
     const f = coordinatorFixture(); assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'booked');

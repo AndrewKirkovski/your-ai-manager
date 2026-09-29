@@ -4,19 +4,49 @@ import { smartStore, SmartBookingStore, digest, requiresPreparation, snapshotCov
 import { TravelCache, queueTravelRequest } from './luxmedTravel';
 import { rankWithJev } from './luxmedJev';
 import { providerStreetMatches, providerCityMatches, resolveStreetAddress } from './googleRoutes';
-import { LuxmedApiError, luxmedCapabilities, luxmedGetReserved, luxmedGetDoctors, luxmedGetCities, luxmedGetMonitorings, luxmedBookSlot, luxmedBookingAttempt, luxmedLegacyBookingBarrier, luxmedAcknowledgeLegacyBooking, luxmedCancellationReceipts, type BookingOutcome, type LuxmedTerm, type LuxmedEvent } from './luxmedAdapter';
+import { LuxmedApiError, luxmedCapabilities, luxmedGetReserved, luxmedGetDoctors, luxmedGetCities, luxmedGetMonitorings, luxmedBookSlot, luxmedBookingAttempt, luxmedAcknowledgeBookingAttempt, luxmedLegacyBookingBarrier, luxmedAcknowledgeLegacyBooking, luxmedCancellationReceipts, luxmedAcknowledgeMovedVisit, type BookingOutcome, type BookingReservationFact, type LuxmedTerm, type LuxmedEvent } from './luxmedAdapter';
 import { getActiveLuxmedMonitoringsByUser, type LuxmedMonitoringConfig } from './userStore';
 
 export const smartDependencies = {
     capabilities: luxmedCapabilities, reserved: luxmedGetReserved, doctors: luxmedGetDoctors, cities: luxmedGetCities, monitorings: luxmedGetMonitorings,
-    book: luxmedBookSlot, attempt: luxmedBookingAttempt, legacyBarrier: luxmedLegacyBookingBarrier,
-    acknowledgeLegacy: luxmedAcknowledgeLegacyBooking, cancellations: luxmedCancellationReceipts, resolve: resolveStreetAddress,
+    book: luxmedBookSlot, attempt: luxmedBookingAttempt, acknowledgeAttempt: luxmedAcknowledgeBookingAttempt,
+    legacyBarrier: luxmedLegacyBookingBarrier,
+    acknowledgeLegacy: luxmedAcknowledgeLegacyBooking, cancellations: luxmedCancellationReceipts,
+    acknowledgeMove: luxmedAcknowledgeMovedVisit, resolve: resolveStreetAddress,
 };
+export function smartBookingTimezoneIssue(zone: string): string | null {
+    return zone === 'Europe/Warsaw' ? null : 'Smart booking requires the bot timezone to be Europe/Warsaw because LuxMed terms use Warsaw local time.';
+}
+export function reservationBaselineFacts(events: LuxmedEvent[], candidateStart?: number): BookingReservationFact[] {
+    const seen = new Set<number>();
+    const day = candidateStart === undefined ? null : DateTime.fromMillis(candidateStart, { zone: BOOKING_ZONE }).startOf('day');
+    if (day && !day.isValid) throw new Error('The booking date is invalid.');
+    const from = day?.minus({ days: 1 }).toMillis();
+    const to = day?.plus({ days: 2 }).toMillis();
+    return events.map(event => {
+        const startAt = zonedTime(event.date);
+        const endAt = event.dateTo ? zonedTime(event.dateTo) : 0;
+        if (!Number.isSafeInteger(event.eventId) || event.eventId <= 0 || seen.has(event.eventId)
+            || !Number.isSafeInteger(startAt) || startAt <= 0)
+            throw new Error('A LuxMed reservation has invalid or duplicate booking facts.');
+        seen.add(event.eventId);
+        return {
+            reservationId: event.eventId, startAt,
+            endAt: Number.isSafeInteger(endAt) && endAt > startAt ? endAt : 0,
+            clinicId: Number.isSafeInteger(event.clinic?.id) && event.clinic!.id! > 0 ? event.clinic!.id! : null,
+            telemedicine: event.eventType === 'Telemedicine',
+            clinicAddress: event.clinic?.address?.trim() || null,
+            clinicCity: event.clinic?.city?.trim() || null,
+        };
+    }).filter(fact => from === undefined || to === undefined || (fact.startAt >= from && fact.startAt < to))
+        .sort((a, b) => a.reservationId - b.reservationId);
+}
 type Dependencies = typeof smartDependencies;
 export function smartConfigurationIssue(): string | null {
     if (!process.env.OPENROUTER_API_KEY) return 'OPENROUTER_API_KEY is not configured.';
     if (!process.env.GOOGLE_MAPS_API_KEY) return 'GOOGLE_MAPS_API_KEY is not configured.';
     if (process.env.GOOGLE_ROUTES_CACHE_PERMITTED !== 'true') return 'Confirm Google route caching permission before enabling stored travel profiles.';
+    if (process.env.GOOGLE_GEOCODING_CACHE_PERMITTED !== 'true') return 'Confirm Google geocoding storage permission before enabling saved locations.';
     return null;
 }
 export function slotFromTerm(term: LuxmedTerm, cityId: number): Slot {
@@ -85,8 +115,9 @@ export class SmartBookingCoordinator {
     private cityNames = new Map<string, { expires: number; name: string }>();
     private legacyMonitorCache = new Map<number, { expires: number; active: boolean }>();
     private legacyResolutions = new Map<number, Promise<string | null>>();
-    private legacyCapability: { expires: number; value: boolean } | null = null;
+    private legacyCapability: { expires: number; version: 0 | 1 | 2 } | null = null;
     private cancellationCapability: { expires: number; value: boolean } | null = null;
+    private attemptAckCapability: { expires: number; value: boolean } | null = null;
     private legacySweepCursor = 0;
     private lastLegacySweep = new Map<number, number>();
     private warmed = new Set<string>();
@@ -113,10 +144,12 @@ export class SmartBookingCoordinator {
         return cache;
     }
     async readiness(force = false): Promise<string | null> {
+        const timezoneIssue = smartBookingTimezoneIssue(BOOKING_ZONE); if (timezoneIssue) return timezoneIssue;
         const config = this.configured(); if (config) return config;
         if (force || !this.capability || this.capability.expires < Date.now()) {
             const caps = await this.api.capabilities();
-            this.capability = { expires: Date.now() + 60000, value: caps.includes('smart-booking-v1') && caps.includes('reservation-end-times-v1') && caps.includes('smart-booking-attempts-v2') && caps.includes('monitor-quiesce-v1') && caps.includes('reservation-range-complete-v1') && caps.includes('legacy-monitor-fence-v1') && caps.includes('legacy-booking-barrier-v1') && caps.includes('smart-booking-enrollment-fence-v2') && caps.includes('smart-booking-identity-fence-v1') && caps.includes('cancellation-receipts-v2') };
+            this.capability = { expires: Date.now() + 60000, value: caps.includes('smart-booking-v1') && caps.includes('reservation-end-times-v1') && caps.includes('smart-booking-attempts-v3') && caps.includes('smart-booking-attempts-v4') && caps.includes('monitor-quiesce-v1') && caps.includes('reservation-range-complete-v1') && caps.includes('legacy-monitor-fence-v1') && caps.includes('legacy-booking-barrier-v2') && caps.includes('smart-booking-enrollment-fence-v2') && caps.includes('smart-booking-identity-fence-v1') && caps.includes('cancellation-receipts-v3') };
+            this.legacyCapability = { expires: Date.now() + 60000, version: caps.includes('legacy-booking-barrier-v2') ? 2 : caps.includes('legacy-booking-barrier-v1') ? 1 : 0 };
         }
         return this.capability.value ? null : 'Waiting for the sidecar smart booking update.';
     }
@@ -136,7 +169,7 @@ export class SmartBookingCoordinator {
         for (const receipt of receipts) {
             if (receipt.accountId !== accountId || !Number.isSafeInteger(receipt.reservationId) || receipt.reservationId <= 0
                 || !Number.isSafeInteger(receipt.startAt) || receipt.startAt <= 0
-                || !['pending', 'confirmed', 'verified_still_reserved'].includes(receipt.state)) throw new Error('Sidecar cancellation receipt is invalid.');
+                || !['pending', 'confirmed', 'verified_still_reserved', 'verified_moved'].includes(receipt.state)) throw new Error('Sidecar cancellation receipt is invalid.');
             if (receipt.state === 'pending') pending = true;
             else if (!Number.isSafeInteger(receipt.reviewedAt) || receipt.reviewedAt! <= 0 || !receipt.reviewedBy?.trim() || !receipt.reviewReason?.trim())
                 throw new Error('Reviewed cancellation has no audit details.');
@@ -151,6 +184,33 @@ export class SmartBookingCoordinator {
                 const exactVisit = (snapshot?.value as LuxmedEvent[] | undefined)?.some(event =>
                     event.eventId === receipt.reservationId && zonedTime(event.date) === receipt.startAt);
                 if (!snapshotUsable(snapshot, coverage.from, coverage.to, Date.now(), 60000) || !exactVisit) pending = true;
+            } else if (receipt.state === 'verified_moved' && receipt.reviewAction === 'verified_moved') {
+                const movedStart = receipt.movedStartAt, movedEnd = receipt.movedEndAt;
+                if (!Number.isSafeInteger(movedStart) || !Number.isSafeInteger(movedEnd) || movedStart! <= 0
+                    || movedEnd! <= movedStart! || movedStart === receipt.startAt || typeof receipt.movedTelemedicine !== 'boolean')
+                    throw new Error('Moved visit review lacks exact booking facts.');
+                const coverage = reservationCoverage(movedStart!, movedEnd!);
+                await this.refreshReservations(accountId, coverage, !receipt.acknowledgedAt);
+                const snapshot = this.store.snapshot(accountId);
+                const normalized = (value: string | null | undefined) => value?.trim().replace(/\s+/g, ' ').toLowerCase() || null;
+                const exact = (snapshot?.value as LuxmedEvent[] | undefined)?.filter(event =>
+                    event.eventId === receipt.reservationId && zonedTime(event.date) === movedStart) || [];
+                const visit = exact.length === 1 ? exact[0] : null;
+                const sameClinic = !!visit && (visit.clinic?.id ?? null) === (receipt.movedClinicId ?? null)
+                    && normalized(visit.clinic?.address) === normalized(receipt.movedClinicAddress)
+                    && normalized(visit.clinic?.city) === normalized(receipt.movedClinicCity);
+                if (!snapshotUsable(snapshot, coverage.from, coverage.to, Date.now(), 60000) || !visit
+                    || zonedTime(visit.dateTo || '') !== movedEnd || (visit.eventType === 'Telemedicine') !== receipt.movedTelemedicine
+                    || !sameClinic) { pending = true; continue; }
+                this.store.recordMovedReservation(accountId, receipt.reservationId, receipt.startAt,
+                    movedStart!, movedEnd!, receipt.movedTelemedicine!);
+                if (!receipt.acknowledgedAt) {
+                    try { await this.api.acknowledgeMove(accountId, receipt.reservationId, receipt.startAt, movedStart!); }
+                    catch (error) {
+                        pending = true;
+                        console.warn('[LuxMed smart] Moved visit acknowledgement deferred', { accountId, reservationId: receipt.reservationId, error });
+                    }
+                }
             } else throw new Error('Cancellation review does not match the receipt state.');
         }
         return pending ? 'An earlier LuxMed cancellation outcome needs verification. Smart booking is on hold.' : null;
@@ -163,15 +223,22 @@ export class SmartBookingCoordinator {
         return job;
     }
     private async checkLegacyBarrier(accountId: number): Promise<string | null> {
+        if (!this.legacyCapability || this.legacyCapability.expires < Date.now()) {
+            const capabilities = await this.api.capabilities();
+            this.legacyCapability = { expires: Date.now() + 60000,
+                version: capabilities.includes('legacy-booking-barrier-v2') ? 2 : capabilities.includes('legacy-booking-barrier-v1') ? 1 : 0 };
+        }
+        if (!this.legacyCapability.version) return 'Waiting for the sidecar legacy booking barrier update.';
         for (let checked = 0; checked < 20; checked++) {
             const barrier = await this.api.legacyBarrier(accountId);
             if (barrier.state === 'clear') return null;
             if (barrier.state !== 'succeeded' || !Number.isSafeInteger(barrier.reservationId) || barrier.reservationId! <= 0
-                || !Number.isSafeInteger(barrier.start) || barrier.start! <= 0) {
+                || !Number.isSafeInteger(barrier.start) || barrier.start! <= 0
+                || (this.legacyCapability.version >= 2 && !barrier.id)) {
                 return 'An earlier LuxMed booking outcome needs verification. Smart booking is on hold.';
             }
             if (this.store.wasCancelled(accountId, barrier.reservationId!, barrier.start!)) {
-                await this.api.acknowledgeLegacy(accountId, barrier.reservationId!);
+                await this.api.acknowledgeLegacy(accountId, barrier.reservationId!, barrier.id, barrier.start!);
                 continue;
             }
             const day = DateTime.fromMillis(barrier.start!, { zone: BOOKING_ZONE }).startOf('day');
@@ -182,16 +249,17 @@ export class SmartBookingCoordinator {
             if (!observed.some(event => event.eventId === barrier.reservationId && zonedTime(event.date) === barrier.start)) {
                 return `Waiting for LuxMed to confirm reservation ${barrier.reservationId} in a complete reservation response.`;
             }
-            await this.api.acknowledgeLegacy(accountId, barrier.reservationId!);
+            await this.api.acknowledgeLegacy(accountId, barrier.reservationId!, barrier.id, barrier.start!);
         }
         return 'Several earlier LuxMed bookings need verification before smart booking can continue.';
     }
     private async reconcileLegacyBarriers(): Promise<void> {
         if (!this.legacyCapability || this.legacyCapability.expires < Date.now()) {
             const capabilities = await this.api.capabilities();
-            this.legacyCapability = { expires: Date.now() + 60000, value: capabilities.includes('legacy-booking-barrier-v1') };
+            this.legacyCapability = { expires: Date.now() + 60000,
+                version: capabilities.includes('legacy-booking-barrier-v2') ? 2 : capabilities.includes('legacy-booking-barrier-v1') ? 1 : 0 };
         }
-        if (!this.legacyCapability.value) return;
+        if (!this.legacyCapability.version) return;
         const accounts = this.store.db.prepare('SELECT DISTINCT account_id FROM luxmed_accounts ORDER BY account_id')
             .all() as { account_id: number }[];
         if (!accounts.length) return;
@@ -444,6 +512,7 @@ export class SmartBookingCoordinator {
         if (this.accounts.has(config.accountId) || this.users.has(config.userId)) return { state: 'waiting', message: 'Another booking decision is in progress.' };
         this.accounts.add(config.accountId); this.users.add(config.userId);
         const started = Date.now();
+        const bookingRevision = this.store.accountBookingRevision(config.accountId);
         try {
             if (this.store.pending(config.userId).length) return { state: 'waiting', message: 'Checking the outcome of a previous booking.' };
             const readiness = await this.readiness(); if (readiness) return { state: 'waiting', message: readiness };
@@ -491,7 +560,8 @@ export class SmartBookingCoordinator {
                 // All awaits are complete. Recheck synchronously immediately before persistence/submission.
                 const latest = this.store.policy(config.userId);
                 if (!latest || latest.revision !== current.revision || latest.holdToken || latest.state !== 'confirmed'
-                    || !this.activeAccount(config.userId, config.accountId) || (!manual && !this.activeMonitor(config))) throw new Error('Availability or monitoring changed before submission.');
+                    || this.store.accountBookingRevision(config.accountId) !== bookingRevision
+                    || !this.activeAccount(config.userId, config.accountId) || (!manual && !this.activeMonitor(config))) throw new Error('Availability, reservations or monitoring changed before submission.');
                 const submissionPlaces = this.store.places(config.userId);
                 const submissionLocations = [latest.policy.originLocationId, ...latest.policy.commitments.map(c => c.locationId),
                     ...this.store.scheduleAppointments(config.userId).map(c => c.locationId)];
@@ -508,6 +578,9 @@ export class SmartBookingCoordinator {
                     this.store.notify(`candidate:${config.id}:${candidate.slot.id}`, config.userId, `LuxMed found a suitable appointment at ${new Date(candidate.slot.start).toISOString()}. Use the bot to book it.`);
                     return { state: 'notified', message: 'Suitable appointment notification queued.' };
                 }
+                const allReservations = snapshot.value as LuxmedEvent[];
+                const baselineFacts = reservationBaselineFacts(allReservations, candidate.slot.start);
+                const baselineIds = allReservations.map(event => event.eventId).sort((a, b) => a - b);
                 const attempt = this.store.begin(config.userId, config.accountId, manual ? null : config.id, current.revision, digest(term), { term, cityId: config.cityId,
                     rebookIfExists: config.rebookIfExists, slot: candidate.slot, journey: rechecked,
                     baseline: snapshot.value, reservationRevision: snapshot.revision });
@@ -527,6 +600,7 @@ export class SmartBookingCoordinator {
                             return !usableEstimate(leg, leg.query, Date.now()) || !!newest && newest.fetchedAt > leg.fetchedAt;
                         });
                         return !!policy && policy.state === 'confirmed' && !policy.holdToken && policy.revision === current.revision && snapshotNow?.revision === snapshot.revision
+                            && this.store.accountBookingRevision(config.accountId) === bookingRevision
                             && snapshotUsable(snapshotNow, candidate.slot.start, candidate.slot.end, Date.now(), 60000)
                             && rechecked.leaveAt >= Date.now() + 5 * 60000
                             && this.activeAccount(config.userId, config.accountId) && (manual || this.activeMonitor(config)) && !routeChanged
@@ -537,9 +611,10 @@ export class SmartBookingCoordinator {
                             && (term.term.isTelemedicine || providerCityMatches(this.cityNames.get(`${config.accountId}:${config.cityId}`)?.name || '',
                                 this.store.places(config.userId).get(candidate.slot.locationId!)?.address || ''))
                             && (!candidate.slot.preparationRequired || this.store.isPreparationConfirmed(config.userId, current.revision, term));
-                    }) as BookingOutcome;
+                    }, baselineIds, baselineFacts) as BookingOutcome;
                     if (outcome.state === 'succeeded' && Number.isSafeInteger(outcome.reservationId) && outcome.reservationId! > 0) {
                         this.complete(attempt, outcome.reservationId!);
+                        await this.acknowledgeCompletedAttempt(attempt.id, config.accountId, outcome.reservationId!);
                         return { state: 'booked', message: `Appointment booked. Reservation ${outcome.reservationId}.` };
                     }
                     if (outcome.state === 'failed') {
@@ -604,13 +679,26 @@ export class SmartBookingCoordinator {
             `LuxMed booked ${time}. Reservation ${reservationId}. Leave by ${leave}. ${p.journey.taxiLegs ? 'Taxi is needed for part of the journey.' : 'Public transport fits.'}${conflict ? ' Your schedule, monitor, account or LuxMed reservations changed while booking was submitted. Please review this appointment.' : ''}`);
         void this.refreshReservations(attempt.account_id, reservationCoverage(p.slot.start, p.slot.end), true).catch(() => console.warn('[LuxMed smart] Post-booking reservation refresh deferred'));
     }
+    private async acknowledgeCompletedAttempt(id: string, accountId: number, reservationId: number): Promise<void> {
+        const saved = this.store.attempt(id);
+        if (!saved || !['succeeded', 'cancelled'].includes(saved.state) || saved.reservation_id !== reservationId) return;
+        try {
+            await this.api.acknowledgeAttempt(accountId, id, reservationId);
+            if (!this.store.acknowledge(id, reservationId))
+                throw new Error('Local booking acknowledgement no longer matches the saved reservation.');
+        } catch (error) {
+            console.warn('[LuxMed smart] Booking acknowledgement deferred', { attemptId: id, error });
+        }
+    }
     async reconcile(): Promise<void> {
         if (this.sweepRunning) return; this.sweepRunning = true;
         try {
             try {
-                if (!this.cancellationCapability || this.cancellationCapability.expires < Date.now()) {
+                if (!this.cancellationCapability || this.cancellationCapability.expires < Date.now()
+                    || !this.attemptAckCapability || this.attemptAckCapability.expires < Date.now()) {
                     const capabilities = await this.api.capabilities();
-                    this.cancellationCapability = { expires: Date.now() + 60000, value: capabilities.includes('cancellation-receipts-v2') };
+                    this.cancellationCapability = { expires: Date.now() + 60000, value: capabilities.includes('cancellation-receipts-v3') };
+                    this.attemptAckCapability = { expires: Date.now() + 60000, value: capabilities.includes('smart-booking-attempts-v3') };
                 }
                 if (this.cancellationCapability.value) {
                     const accounts = this.store.db.prepare('SELECT DISTINCT account_id FROM luxmed_accounts ORDER BY account_id')
@@ -618,6 +706,12 @@ export class SmartBookingCoordinator {
                     for (const account of accounts) await this.syncCancellationReceipts(account.account_id);
                 }
             } catch { console.warn('[LuxMed smart] Cancellation receipt review deferred'); }
+            if (this.attemptAckCapability?.value) {
+                for (const attempt of this.store.unacknowledged()) {
+                    if (attempt.reservation_id)
+                        await this.acknowledgeCompletedAttempt(attempt.id, attempt.account_id, attempt.reservation_id);
+                }
+            }
             for (const attempt of this.store.pending()) {
                 try {
                     const outcome = await this.api.attempt(attempt.account_id, attempt.id).catch(error => {
@@ -626,7 +720,10 @@ export class SmartBookingCoordinator {
                     });
                     // A missing sidecar record does not prove the upstream request was never sent.
                     const settled = outcome;
-                    if (settled.state === 'succeeded' && Number.isSafeInteger(settled.reservationId) && settled.reservationId! > 0) this.complete(attempt, settled.reservationId!);
+                    if (settled.state === 'succeeded' && Number.isSafeInteger(settled.reservationId) && settled.reservationId! > 0) {
+                        this.complete(attempt, settled.reservationId!);
+                        await this.acknowledgeCompletedAttempt(attempt.id, attempt.account_id, settled.reservationId!);
+                    }
                     else if (settled.state === 'failed') this.store.outcome(attempt.id, 'failed');
                     else {
                         const payload = JSON.parse(attempt.payload) as { slot: Slot; baseline: LuxmedEvent[] };

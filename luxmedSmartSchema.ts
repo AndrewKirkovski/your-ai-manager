@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS luxmed_booking_attempts (
     id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
     monitoring_id TEXT, fingerprint TEXT NOT NULL, state TEXT NOT NULL,
     policy_revision INTEGER NOT NULL, payload TEXT NOT NULL, reservation_id INTEGER,
-    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, acknowledged_at INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_attempt_unresolved_account
     ON luxmed_booking_attempts(account_id) WHERE state IN ('pending','unknown');

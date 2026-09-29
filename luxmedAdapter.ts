@@ -100,16 +100,33 @@ export interface LuxmedEvent {
     title: string;
 }
 
+export interface BookingReservationFact {
+    reservationId: number;
+    startAt: number;
+    endAt: number;
+    clinicId: number | null;
+    telemedicine: boolean;
+    clinicAddress: string | null;
+    clinicCity: string | null;
+}
+
 export interface LuxmedCancellationReceipt {
     accountId: number;
     reservationId: number;
     startAt: number;
-    state: 'pending' | 'confirmed' | 'verified_still_reserved';
+    state: 'pending' | 'confirmed' | 'verified_still_reserved' | 'verified_moved';
     confirmedAt?: number | null;
     reviewedAt?: number | null;
     reviewedBy?: string | null;
     reviewReason?: string | null;
     reviewAction?: string | null;
+    movedStartAt?: number | null;
+    movedEndAt?: number | null;
+    movedClinicId?: number | null;
+    movedTelemedicine?: boolean | null;
+    movedClinicAddress?: string | null;
+    movedClinicCity?: string | null;
+    acknowledgedAt?: number | null;
 }
 
 export interface LuxmedMonitoring {
@@ -324,7 +341,8 @@ function termTimestamp(term: LuxmedTerm): number {
     return parseSearchDate(term.term.dateTimeFrom.dateTimeLocal || term.term.dateTimeFrom.dateTimeTz || '') || Number.MAX_SAFE_INTEGER;
 }
 
-export async function luxmedBookSlot(accountId: number, term: LuxmedTerm, cityId: number, rebookIfExists: boolean = false, attemptId?: string, guard?:()=>boolean): Promise<unknown> {
+export async function luxmedBookSlot(accountId: number, term: LuxmedTerm, cityId: number, rebookIfExists: boolean = false,
+    attemptId?: string, guard?:()=>boolean, baselineReservationIds?: number[], baselineReservations?: BookingReservationFact[]): Promise<unknown> {
     const t = term.term;
     const dateTimeFrom = t.dateTimeFrom.dateTimeLocal || t.dateTimeFrom.dateTimeTz || '';
     const dateTimeTo = t.dateTimeTo.dateTimeLocal || t.dateTimeTo.dateTimeTz || '';
@@ -350,6 +368,8 @@ export async function luxmedBookSlot(accountId: number, term: LuxmedTerm, cityId
         preparationItems: term.additionalData.preparationItems,
         rebookIfExists,
         ...(attemptId ? { attemptId } : {}),
+        ...(attemptId && baselineReservationIds ? { baselineReservationIds } : {}),
+        ...(attemptId && baselineReservations ? { baselineReservations } : {}),
     },guard);
 }
 
@@ -358,12 +378,16 @@ export function luxmedCapabilities(): Promise<string[]> { return sidecarRequest(
 export function luxmedBookingAttempt(accountId: number, attemptId: string): Promise<BookingOutcome> {
     return sidecarRequest('GET', `/api/v1/accounts/${accountId}/booking-attempts/${encodeURIComponent(attemptId)}`);
 }
-export interface LegacyBookingBarrier { state: 'clear' | 'pending' | 'succeeded'; reservationId?: number; start?: number; }
+export async function luxmedAcknowledgeBookingAttempt(accountId: number, attemptId: string, reservationId: number): Promise<void> {
+    await sidecarRequest('POST', `/api/v1/accounts/${accountId}/booking-attempts/${encodeURIComponent(attemptId)}/acknowledge`, { reservationId });
+}
+export interface LegacyBookingBarrier { id?: string; state: 'clear' | 'pending' | 'succeeded'; reservationId?: number; start?: number; }
 export function luxmedLegacyBookingBarrier(accountId: number): Promise<LegacyBookingBarrier> {
     return sidecarRequest('GET', `/api/v1/accounts/${accountId}/legacy-booking-barrier`);
 }
-export async function luxmedAcknowledgeLegacyBooking(accountId: number, reservationId: number): Promise<void> {
-    await sidecarRequest('POST', `/api/v1/accounts/${accountId}/legacy-booking-barrier/acknowledge`, { reservationId });
+export async function luxmedAcknowledgeLegacyBooking(accountId: number, reservationId: number, id?: string, expectedStartAt?: number): Promise<void> {
+    await sidecarRequest('POST', `/api/v1/accounts/${accountId}/legacy-booking-barrier/acknowledge`,
+        id ? { id, reservationId, expectedStartAt } : { reservationId });
 }
 export function luxmedSmartEnrollment(accountId: number): Promise<{ enrolled: boolean }> {
     return sidecarRequest('GET', `/api/v1/accounts/${accountId}/smart-booking-enrollment`);
@@ -399,6 +423,12 @@ export async function luxmedCancelVisit(accountId: number, reservationId: number
 
 export async function luxmedCancellationReceipts(accountId: number): Promise<LuxmedCancellationReceipt[]> {
     return sidecarRequest<LuxmedCancellationReceipt[]>('GET', `/api/v1/accounts/${accountId}/visits/cancellation-receipts`);
+}
+
+export async function luxmedAcknowledgeMovedVisit(accountId: number, reservationId: number,
+    expectedStartAt: number, expectedMovedStartAt: number): Promise<void> {
+    await sidecarRequest('POST', `/api/v1/accounts/${accountId}/visits/cancellation-receipts/${reservationId}/acknowledge-move`,
+        { expectedStartAt, expectedMovedStartAt });
 }
 
 // === Monitoring ===

@@ -396,7 +396,7 @@ export const LuxmedCancelBooking: Tool = {
         if (!Number.isInteger(args.reservation_id) || args.reservation_id <= 0) {
             return { success: false, message: 'reservation_id must be a positive whole number.' };
         }
-        if (!(await luxmedCapabilities()).includes('cancellation-receipts-v2')) {
+        if (!(await luxmedCapabilities()).includes('cancellation-receipts-v3')) {
             return { success: false, message: 'Cancellation waits for the sidecar review update.' };
         }
         const bookings = await luxmedGetReserved(accountId);

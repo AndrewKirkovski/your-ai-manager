@@ -7,6 +7,12 @@ import { SMART_SCHEMA_SQL } from './luxmedSmartSchema';
  * before CREATE INDEX statements that reference the new columns. Called by
  * database.ts on bot startup. */
 export function applyColumnMigrations(db: Database.Database): void {
+    // A booking stays locked in the sidecar until the bot records its outcome.
+    {
+        const cols = db.prepare('PRAGMA table_info(luxmed_booking_attempts)').all() as { name: string }[];
+        if (cols.length && !cols.some(column => column.name === 'acknowledged_at'))
+            db.exec('ALTER TABLE luxmed_booking_attempts ADD COLUMN acknowledged_at INTEGER');
+    }
     const cancellationColumns = db.prepare('PRAGMA table_info(luxmed_cancelled_reservations)').all() as { name: string }[];
     if (cancellationColumns.length && !cancellationColumns.some(column => column.name === 'start_at'))
         db.exec('ALTER TABLE luxmed_cancelled_reservations ADD COLUMN start_at INTEGER');
