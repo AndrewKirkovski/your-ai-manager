@@ -17,8 +17,8 @@ if (process.env.SEED_LEGACY === 'true') {
         { account_id: 424242, username: 'fixture-user' });
     assert.deepEqual(db.prepare('SELECT address, lat, lng FROM user_addresses WHERE user_id=424242').get(),
         { address: 'fixture-home', lat: 52, lng: 21 });
-    // The new cache keeps both cities, while the old name-unique table remains
-    // valid for a rollback image's ON CONFLICT(name) statement.
+    // The new cache keeps both cities, while the legacy table keeps the
+    // rollback image's (name, city_id) shape and its one seeded row.
     db.prepare('INSERT OR IGNORE INTO luxmed_clinics_by_city (name, city_id) VALUES (?, ?)').run('fixture clinic', 2);
     assert.equal((db.prepare("SELECT count(*) AS n FROM luxmed_clinics_by_city WHERE name='fixture clinic'").get() as {n: number}).n, 2);
     assert.equal((db.prepare("SELECT count(*) AS n FROM luxmed_clinics WHERE name='fixture clinic'").get() as {n: number}).n, 1);

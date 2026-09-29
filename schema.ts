@@ -16,62 +16,89 @@ export function applyColumnMigrations(db: Database.Database): void {
     const cancellationColumns = db.prepare('PRAGMA table_info(luxmed_cancelled_reservations)').all() as { name: string }[];
     if (cancellationColumns.length && !cancellationColumns.some(column => column.name === 'start_at'))
         db.exec('ALTER TABLE luxmed_cancelled_reservations ADD COLUMN start_at INTEGER');
-    // Keep the old name-unique table for rollback images: their userStore
-    // prepares ON CONFLICT(name) at startup. New code uses the city-scoped
-    // table. Copy every city-specific row before reducing an interim
-    // nonunique legacy table to one conservative row per name.
+    // Keep luxmed_clinics in the shape the rollback image (c45c769) expects:
+    // name is not unique, and idx_luxmed_clinics_name_city is the unique
+    // (name, city_id) index its userStore needs for ON CONFLICT(name, city_id).
+    // New code uses the city-scoped luxmed_clinics_by_city table.
     {
         const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'luxmed_clinics'").get() as { sql: string } | undefined;
-        if (table?.sql) {
-            const migrate = db.transaction(() => {
-                type ClinicRow = { id: number; name: string; address: string | null; lat: number | null;
-                    lng: number | null; city_id: number | null; geocoded_at: string | null };
-                const rows = db.prepare(`SELECT id,name,address,lat,lng,city_id,geocoded_at FROM luxmed_clinics
-                    ORDER BY (lat IS NOT NULL AND lng IS NOT NULL) DESC, COALESCE(geocoded_at,'') DESC, id DESC`)
-                    .all() as ClinicRow[];
-                const saveCity = db.prepare(`INSERT OR IGNORE INTO luxmed_clinics_by_city
-                    (name,address,lat,lng,city_id,geocoded_at) VALUES (?,?,?,?,?,?)`);
-                for (const row of rows) {
-                    const name = row.name.toLowerCase().trim();
-                    if (name && Number.isSafeInteger(row.city_id) && row.city_id! > 0)
-                        // A name-only old image may have replaced coordinates
-                        // for another city without replacing its city_id.
-                        // Carry the identity forward, but require fresh
-                        // verification before these rows can guide travel.
-                        saveCity.run(name, null, null, null, row.city_id, null);
-                }
-                if (!/name\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(table.sql)) {
-                    db.exec('ALTER TABLE luxmed_clinics RENAME TO luxmed_clinics_before_rollback');
-                    db.exec(`CREATE TABLE luxmed_clinics (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
-                        address TEXT, lat REAL, lng REAL, city_id INTEGER, geocoded_at TEXT
-                    )`);
-                    const saveLegacy = db.prepare(`INSERT OR IGNORE INTO luxmed_clinics
-                        (id,name,address,lat,lng,city_id,geocoded_at) VALUES (?,?,?,?,?,?,?)`);
-                    for (const row of rows) {
-                        const name = row.name.toLowerCase().trim();
-                        if (name) saveLegacy.run(row.id, name, row.address, row.lat, row.lng, row.city_id, row.geocoded_at);
-                    }
-                    db.exec('DROP TABLE luxmed_clinics_before_rollback');
-                }
-                // The old image updates coordinates by name without changing
-                // city_id. Once the new cache owns a name, never trust that
-                // legacy row as a cross-city route cache during rollback.
-                const cityNames = new Set((db.prepare('SELECT DISTINCT name FROM luxmed_clinics_by_city').all() as { name: string }[])
-                    .map(row => row.name));
-                const clearLegacy = db.prepare(`UPDATE luxmed_clinics SET address=NULL,lat=NULL,lng=NULL,geocoded_at=NULL WHERE id=?`);
-                for (const row of db.prepare('SELECT id,name FROM luxmed_clinics').all() as { id: number; name: string }[]) {
-                    if (cityNames.has(row.name.toLowerCase().trim())) clearLegacy.run(row.id);
-                }
-                // A nonunique index under the old name would hide the old
-                // image's CREATE UNIQUE INDEX IF NOT EXISTS statement.
-                const oldIndex = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_luxmed_clinics_name'")
-                    .get() as { sql: string | null } | undefined;
-                if (oldIndex?.sql && !/^\s*CREATE\s+UNIQUE\s+INDEX\b/i.test(oldIndex.sql))
-                    db.exec('DROP INDEX idx_luxmed_clinics_name');
+        const migrate = db.transaction(() => {
+            // Earlier builds of this image used the legacy index name for the
+            // city table. That made the old image's CREATE UNIQUE INDEX IF NOT
+            // EXISTS a no-op, so its upsert failed to prepare.
+            const cityIndex = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index'
+                AND name='idx_luxmed_clinics_name_city' AND tbl_name='luxmed_clinics_by_city'`).get();
+            if (cityIndex) db.exec('DROP INDEX idx_luxmed_clinics_name_city');
+            if (!table?.sql) return;
+            type ClinicRow = { id: number; name: string; address: string | null; lat: number | null;
+                lng: number | null; city_id: number | null; geocoded_at: string | null };
+            const rows = db.prepare(`SELECT id,name,address,lat,lng,city_id,geocoded_at FROM luxmed_clinics
+                ORDER BY (lat IS NOT NULL AND lng IS NOT NULL) DESC, COALESCE(geocoded_at,'') DESC, id DESC`)
+                .all() as ClinicRow[];
+            const saveCity = db.prepare(`INSERT OR IGNORE INTO luxmed_clinics_by_city
+                (name,address,lat,lng,city_id,geocoded_at) VALUES (?,?,?,?,?,?)`);
+            for (const row of rows) {
+                const name = row.name.toLowerCase().trim();
+                if (name && Number.isSafeInteger(row.city_id) && row.city_id! > 0)
+                    // An older name-only image may have replaced coordinates
+                    // for another city without replacing its city_id. Carry
+                    // the identity forward, but require fresh verification
+                    // before these rows can guide travel.
+                    saveCity.run(name, null, null, null, row.city_id, null);
+            }
+            // A unique index on name alone makes the old (name, city_id)
+            // upsert throw for one clinic name in two cities.
+            db.exec('DROP INDEX IF EXISTS idx_luxmed_clinics_name');
+            // Keep one row per (name, city_id), preferring geocoded and newer
+            // rows, so the old image's unique index can be created.
+            const seen = new Set<string>();
+            const kept = rows.filter(row => {
+                const name = row.name.toLowerCase().trim();
+                if (!name) return false;
+                if (row.city_id == null) return true; // NULLs never conflict in a unique index.
+                const key = `${row.city_id}\u0000${name}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
             });
-            migrate();
-        }
+            if (/name\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(table.sql)) {
+                // SQLite cannot drop a column UNIQUE constraint in place. The
+                // city-table trigger names luxmed_clinics in its body, and a
+                // rename would rewrite it to the temporary table. Drop it
+                // here; INDEXES_SQL recreates it.
+                db.exec('DROP TRIGGER IF EXISTS luxmed_city_clinic_legacy_guard_insert');
+                db.exec('ALTER TABLE luxmed_clinics RENAME TO luxmed_clinics_before_rollback');
+                db.exec(`CREATE TABLE luxmed_clinics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                    address TEXT, lat REAL, lng REAL, city_id INTEGER, geocoded_at TEXT
+                )`);
+                const saveLegacy = db.prepare(`INSERT INTO luxmed_clinics
+                    (id,name,address,lat,lng,city_id,geocoded_at) VALUES (?,?,?,?,?,?,?)`);
+                for (const row of kept)
+                    saveLegacy.run(row.id, row.name.toLowerCase().trim(), row.address, row.lat, row.lng, row.city_id, row.geocoded_at);
+                db.exec('DROP TABLE luxmed_clinics_before_rollback');
+            } else {
+                // Delete losing duplicates before renaming, so normalization
+                // cannot collide with an existing (name, city_id) index entry.
+                const keptIds = new Set(kept.map(row => row.id));
+                const drop = db.prepare('DELETE FROM luxmed_clinics WHERE id=?');
+                for (const row of rows) if (!keptIds.has(row.id)) drop.run(row.id);
+                const rename = db.prepare('UPDATE luxmed_clinics SET name=? WHERE id=?');
+                for (const row of kept) {
+                    const name = row.name.toLowerCase().trim();
+                    if (name !== row.name) rename.run(name, row.id);
+                }
+            }
+            // Once the new cache owns a name, never let a rollback image
+            // trust a legacy row for that name as a route cache.
+            const cityNames = new Set((db.prepare('SELECT DISTINCT name FROM luxmed_clinics_by_city').all() as { name: string }[])
+                .map(row => row.name));
+            const clearLegacy = db.prepare(`UPDATE luxmed_clinics SET address=NULL,lat=NULL,lng=NULL,geocoded_at=NULL WHERE id=?`);
+            for (const row of db.prepare('SELECT id,name FROM luxmed_clinics').all() as { id: number; name: string }[]) {
+                if (cityNames.has(row.name.toLowerCase().trim())) clearLegacy.run(row.id);
+            }
+        });
+        migrate();
     }
     // sticker_cache: short_tag + used_count (added 2026-04-24)
     {
@@ -258,7 +285,7 @@ export const SCHEMA_SQL = `
 
     CREATE TABLE IF NOT EXISTS luxmed_clinics (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        name        TEXT NOT NULL UNIQUE,
+        name        TEXT NOT NULL,
         address     TEXT,
         lat         REAL,
         lng         REAL,
@@ -359,8 +386,8 @@ export const INDEXES_SQL = `
     CREATE INDEX IF NOT EXISTS idx_stats_user_name_ts ON stat_entries(user_id, name, timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_luxmed_monitorings_active ON luxmed_monitorings(active, user_id);
     CREATE INDEX IF NOT EXISTS idx_user_addresses_user ON user_addresses(user_id);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_clinics_name ON luxmed_clinics(name);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_clinics_name_city ON luxmed_clinics_by_city(name, city_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_clinics_name_city ON luxmed_clinics(name, city_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_luxmed_clinics_by_city_name_city ON luxmed_clinics_by_city(name, city_id);
     CREATE TRIGGER IF NOT EXISTS luxmed_legacy_clinic_city_guard_insert
     AFTER INSERT ON luxmed_clinics
     WHEN EXISTS (SELECT 1 FROM luxmed_clinics_by_city WHERE name=lower(trim(NEW.name)))
