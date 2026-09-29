@@ -192,6 +192,7 @@ jobs:
           LEGACY_SIDECAR_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager-luxmed-sidecar:latest
           LEGACY_BOT_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager:latest
           REHEARSAL_ORDER: bot-first
+          REHEARSAL_BASELINE_READABLE: ${{ steps.baseline.outputs.auth_migrated }}
         run: python3 tests/luxmed-image-upgrade.py
 
       - name: Rehearse sidecar-first Watchtower upgrade after authentication migration
@@ -201,6 +202,7 @@ jobs:
           LEGACY_BOT_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager:latest
           REHEARSAL_ORDER: sidecar-first
           REHEARSAL_REQUIRE_SEAMLESS: 'true'
+          REHEARSAL_BASELINE_READABLE: ${{ steps.baseline.outputs.auth_migrated }}
         run: python3 tests/luxmed-image-upgrade.py
 
       - name: Rehearse sidecar replacement with the observed bot revision
@@ -210,6 +212,7 @@ jobs:
           LEGACY_BOT_IMAGE: ghcr.io/andrewkirkovski/your-ai-manager:latest
           REHEARSAL_ORDER: sidecar-first
           REHEARSAL_REQUIRE_SEAMLESS: 'true'
+          REHEARSAL_BASELINE_READABLE: ${{ steps.baseline.outputs.auth_migrated }}
         run: python3 tests/luxmed-image-upgrade.py
 
       - name: Publish tested images

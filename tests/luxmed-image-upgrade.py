@@ -29,6 +29,8 @@ BOT_IMAGE = os.environ.get('BOT_TEST_IMAGE', 'luxmed-bot:test')
 ORDER = os.environ.get('REHEARSAL_ORDER', 'bot-first')
 if ORDER not in ('bot-first', 'sidecar-first'):
     raise ValueError('REHEARSAL_ORDER must be bot-first or sidecar-first')
+BASELINE_READABLE = os.environ.get('REHEARSAL_BASELINE_READABLE') == 'true'
+LEGACY_SMART_BASELINE = os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true'
 
 
 def docker(*args, check=True):
@@ -165,13 +167,14 @@ try:
         raise AssertionError(f'Expected a v2 baseline, found migration counts {migrations}')
     print(f'Watched sidecar baseline: {"v2" if v2_baseline else "other"} (migration counts {migrations}).', flush=True)
     # The new bot can still read the old sidecar while waiting for capabilities.
-    client(legacy_smart=os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true',
+    client(legacy_read=BASELINE_READABLE and not v2_baseline and not LEGACY_SMART_BASELINE,
+           legacy_smart=LEGACY_SMART_BASELINE,
            legacy_v2=v2_baseline)
     docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-v', 'ON_ERROR_STOP=1', '-c',
            "INSERT INTO credentials (account_id, user_id, username, password) VALUES "
            "(424242,424242,'fixture-user','fixture-ciphertext'),"
            "(424249,424249,'clean-enrollment-fixture','fixture-ciphertext');")
-    if os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true':
+    if LEGACY_SMART_BASELINE:
         # A v1 absent-feed confirmation must return to pending review during
         # the v2 migration on the same PostgreSQL 10 volume.
         docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-v', 'ON_ERROR_STOP=1', '-c',
@@ -188,7 +191,8 @@ try:
         docker('inspect', '--format', '{{json .Config.Env}}', SIDECAR).stdout))
     if ORDER == 'bot-first':
         replace_bot(legacy_bot, original_bot_env, original_bot_mounts)
-        client(legacy_smart=os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true',
+        client(legacy_read=BASELINE_READABLE and not v2_baseline and not LEGACY_SMART_BASELINE,
+               legacy_smart=LEGACY_SMART_BASELINE,
                legacy_v2=v2_baseline)
 
     # Exercise Watchtower itself, including CMD adoption and environment reuse.
@@ -224,7 +228,7 @@ try:
         client(smart=True)
         replace_bot(legacy_bot, original_bot_env, original_bot_mounts)
     client(smart=True)
-    if os.environ.get('REHEARSAL_AUTHENTICATED_BASELINE') == 'true':
+    if LEGACY_SMART_BASELINE:
         migrated_receipt = docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-Atc',
                                   "SELECT r.state || ':' || COALESCE(r.confirmed_at::text,'null') || ':' || "
                                   "a.old_state || ':' || a.new_state FROM cancellation_receipt r "
