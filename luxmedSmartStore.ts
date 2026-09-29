@@ -460,7 +460,7 @@ export class SmartBookingStore {
             const users = this.db.prepare('SELECT DISTINCT user_id FROM luxmed_accounts WHERE account_id=?')
                 .all(accountId) as { user_id: number }[];
             for (const user of users) this.notify(`moved:${accountId}:${reservationId}:${movedStartAt}`, user.user_id,
-                `LuxMed reservation ${reservationId} was moved. Please review its new time and journey. Automatic booking waited for the updated reservation.`);
+                `бронь LuxMed ${reservationId} перенесли. проверь новое время и дорогу. автозапись ждала обновлённую бронь.`);
         })();
     }
     wasCancelled(accountId: number, reservationId: number, startAt: number): boolean {
@@ -513,7 +513,7 @@ export class SmartBookingStore {
                     this.status(attempt.monitoring_id, 'Booked and then cancelled');
                 }
                 this.notify(`resolved-cancelled:${id}`, attempt.user_id,
-                    `LuxMed reservation ${reservationId} was booked and then cancelled. Automatic booking did not submit another attempt.`);
+                    `бронь LuxMed ${reservationId} была создана и потом отменена. новую попытку автозапись не отправляла.`);
                 return;
             }
             this.db.prepare("UPDATE luxmed_booking_attempts SET state='succeeded',reservation_id=?,updated_at=? WHERE id=?").run(reservationId, Date.now(), id);

@@ -517,7 +517,7 @@ export const LuxmedSetPreferences: Tool = {
 
 export const LuxmedMonitorSlot: Tool = {
     name: 'LuxmedMonitorSlot',
-    description: 'Prepare a smart LuxMed monitor. Ask "When can you book?" and collect availability, commitments and locations using LuxmedDraftAvailability. It cannot book until the user confirms the preview. Reuse confirmed rules but confirm each new monitor.',
+    description: 'Prepare a smart LuxMed monitor. Ask "When can you book?" and collect availability, commitments and locations using LuxmedDraftAvailability. It cannot book until the user confirms the preview. Reuse confirmed rules but confirm each new monitor. time_from/time_to is only the broad outer daily window for the search. Per-day differences (e.g. Monday until 18:00, Tuesday from 12:00) and busy periods MUST go into LuxmedDraftAvailability windows and commitments. Never collapse different per-day constraints into one window, and never invent an end time; ask the user.',
     parameters: {
         type: 'object',
         properties: {
@@ -530,8 +530,8 @@ export const LuxmedMonitorSlot: Tool = {
             english_only: { type: 'string', description: 'Only English-speaking doctors? "true" or "false". Default "false".' },
             date_from: { type: 'string', description: 'Start of date range (ISO, e.g. "2026-04-10T00:00:00")' },
             date_to: { type: 'string', description: 'End of date range (ISO)' },
-            time_from: { type: 'string', description: 'Earliest time, e.g. "10:00"' },
-            time_to: { type: 'string', description: 'Latest time, e.g. "14:00"' },
+            time_from: { type: 'string', description: 'Broad outer window start, e.g. "08:00": the earliest time on ANY day. Not for per-day limits; put those in LuxmedDraftAvailability windows/commitments.' },
+            time_to: { type: 'string', description: 'Broad outer window end, e.g. "20:00": the latest time on ANY day. Not for per-day limits; put those in LuxmedDraftAvailability windows/commitments. If the user gave no end time, ask; never invent one.' },
             max_transit_minutes: { type: 'number', description: 'Maximum transit time from saved home in minutes. Omit to use the saved preference.' },
             autobook: { type: 'string', description: 'Auto-book first matching slot? "true" or "false". Default "true".' },
             rebook_if_exists: { type: 'string', description: 'Replace existing booking with better slot? "true" or "false". Default "false".' },
@@ -612,7 +612,7 @@ export const LuxmedMonitorSlot: Tool = {
 
         return {
             success: true,
-            message: `Monitoring prepared (${monitoring.id}): LuxMed service ${serviceName} (ID ${args.service_id}) in ${cityName} (ID ${cityId}), ${args.time_from}-${args.time_to}.${filterStr} When can you book? Confirm availability and locations using LuxmedDraftAvailability, then send LuxmedPreviewAvailability. Booking remains disabled until the user clicks Confirm.`,
+            message: `Monitoring prepared (${monitoring.id}): LuxMed service ${serviceName} (ID ${args.service_id}) in ${cityName} (ID ${cityId}), ${args.time_from}-${args.time_to}.${filterStr} When can you book? Confirm availability and locations using LuxmedDraftAvailability, then send LuxmedPreviewAvailability. The time window above is only the broad outer search window: put per-day differences and busy periods into LuxmedDraftAvailability windows/commitments, never collapse different per-day constraints into one window, and ask instead of inventing an end time. Booking remains disabled until the user clicks Confirm.`,
             monitoring_id:monitoring.id,
         };
     },

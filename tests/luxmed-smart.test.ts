@@ -602,8 +602,8 @@ test('explicit clinic preview requires and displays verified identity even with 
         const clinicPlace = store.place(userId, 'clinic:1:2', 'Testowa 2, Warszawa', 52.1, 21.1);
         store.verifyClinic(userId, clinicPlace.id, 'Clinic - Testowa 2', clinicPlace.revision);
         assert.equal((await preview() as any).success, true);
-        assert.match(sent.join('\n'), /LuxMed service Visit \(ID 6\)/);
-        assert.match(sent.join('\n'), /Selected exact clinic 2, Clinic - Testowa 2: Testowa 2, Warszawa/);
+        assert.match(sent.join('\n'), /услуга LuxMed Visit \(ID 6\)/);
+        assert.match(sent.join('\n'), /выбранная клиника 2, Clinic - Testowa 2: Testowa 2, Warszawa/);
         const confirmation = globalDb.prepare('SELECT confirmation_token AS token,revision FROM luxmed_availability WHERE user_id=?')
             .get(userId) as { token: string; revision: number };
         const staged = store.sidecarMonitorPreview(userId, monitor.id, monitor.accountId, confirmation);
@@ -613,7 +613,7 @@ test('explicit clinic preview requires and displays verified identity even with 
             data: `luxconfirm:${monitor.id}:${confirmation.revision}:${confirmation.token}` });
         await answered;
         assert.equal(enrollmentPosts, 0);
-        assert.match(alerts.join('\n'), /selected clinic changed/i);
+        assert.match(alerts.join('\n'), /выбранная клиника поменялась/);
         assert.notEqual(store.enrollment(monitor.id)?.state, 'active');
     } finally { smartBooking.readiness = oldReady; globalThis.fetch = oldFetch; }
 });
@@ -640,10 +640,10 @@ test('explicit monitor booleans cannot silently change doctor or automatic booki
 });
 test('confirmation preview states exact clinic, doctor and language filters', async () => {
     const { monitorFilterSummary } = await import('../tools.luxmedSmart.ts');
-    const summary = monitorFilterSummary({ clinicIds: [2, 7], doctorIds: [3], englishOnly: true });
-    assert.match(summary, /Clinic IDs: 2, 7/);
-    assert.match(summary, /Doctor IDs: 3/);
-    assert.match(summary, /English-speaking doctors only: yes/);
+    const summary = monitorFilterSummary({ clinicIds: [2, 7], doctorIds: [3], englishOnly: true }, new Map(), 'ru');
+    assert.match(summary, /ID клиник: 2, 7/);
+    assert.match(summary, /ID врачей: 3/);
+    assert.match(summary, /только англоговорящие врачи: да/);
 });
 test('Google transit duration before the first stop counts against a tight commitment', async () => {
     const appointment = slot('11:40', '12:10');
@@ -1350,7 +1350,7 @@ test('a booking completed after its monitor was stopped reports the conflict', a
     };
     assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'booked');
     const outbox = f.store.db.prepare("SELECT message FROM luxmed_notification_outbox WHERE id LIKE 'booked:%'").get() as { message: string };
-    assert.match(outbox.message, /monitor.*changed while booking was submitted/i);
+    assert.match(outbox.message, /пока отправлял запись, поменялись.*мониторинг/);
     assert.equal(f.store.blocks(1).length, 1);
     f.store.db.close();
 });
@@ -1359,7 +1359,7 @@ test('a confirmed provider warning is delivered with the booked reservation', as
     f.api.book = async () => ({ state: 'succeeded', reservationId: 77, errorCode: 'BOOKING_WARNINGS_REVIEW' });
     assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'booked');
     const outbox = f.store.db.prepare("SELECT message FROM luxmed_notification_outbox WHERE id LIKE 'booked:%'").get() as { message: string };
-    assert.match(outbox.message, /LuxMed returned a booking warning/);
+    assert.match(outbox.message, /LuxMed вернул предупреждение по записи/);
     assert.equal(f.store.blocks(1).length, 1);
     f.store.db.close();
 });
@@ -1526,8 +1526,8 @@ test('confirmation requires the owning private chat and cannot be replayed', asy
         assert.equal(enrolled, 1);
         assert.match(store.enrollment(monitor.id)?.status || '', /Monitoring with confirmed availability/);
         const notices = globalDb.prepare("SELECT message FROM luxmed_notification_outbox WHERE user_id=10 AND id LIKE 'activation-%'").all() as { message: string }[];
-        assert.equal(notices.filter(notice => notice.message.includes('Smart monitoring is active')).length, 1);
-        assert.equal(notices.some(notice => notice.message.includes('stayed paused')), false);
+        assert.equal(notices.filter(notice => notice.message.includes('умный мониторинг LuxMed включён')).length, 1);
+        assert.equal(notices.some(notice => notice.message.includes('остался на паузе')), false);
     } finally { smartBooking.readiness = oldReady; globalThis.fetch = oldFetch; }
 });
 test('failed sidecar enrollment leaves the confirmed monitor held before activation', async () => {
@@ -1675,7 +1675,7 @@ test('a late travel conflict queues a warning without another booking or cancell
     f.coordinator.cache(1).previous = q => ({ ...estimate(q, 1500, true, Date.now() + 1), status: 'no_route' });
     await f.coordinator.reconcile();
     const messages = f.store.db.prepare('SELECT message FROM luxmed_notification_outbox').all() as { message: string }[];
-    assert.ok(messages.some(m => m.message.includes('has not been cancelled'))); assert.equal(f.books(), 1); f.store.db.close();
+    assert.ok(messages.some(m => m.message.includes('запись я не отменял'))); assert.equal(f.books(), 1); f.store.db.close();
 });
 
 test('a changed route duration warns after booking even when departure and arrival match', async () => {
@@ -1690,7 +1690,7 @@ test('a changed route duration warns after booking even when departure and arriv
     };
     await f.coordinator.reconcile();
     const messages = f.store.db.prepare('SELECT message FROM luxmed_notification_outbox').all() as { message: string }[];
-    assert.ok(messages.some(message => message.message.includes('Please review the journey')));
+    assert.ok(messages.some(message => message.message.includes('проверь маршрут')));
     assert.equal(f.books(), 1);
     f.store.db.close();
 });
@@ -1759,7 +1759,7 @@ test('a reservation appearing during submission is reported with the successful 
     finish();
     assert.equal((await booking).state, 'booked');
     const messages = f.store.db.prepare('SELECT message FROM luxmed_notification_outbox').all() as { message: string }[];
-    assert.ok(messages.some(row => row.message.includes('reservations changed while booking was submitted')));
+    assert.ok(messages.some(row => row.message.includes('пока отправлял запись, поменялись твоё расписание, мониторинг, аккаунт или брони LuxMed')));
     f.store.db.close();
 });
 
@@ -1772,7 +1772,7 @@ test('a newly drafted conflicting commitment still warns about an existing booki
     f.coordinator.cache(1).previous = q => estimate(q, 1500, true, Date.now());
     await f.coordinator.reconcile();
     const messages = f.store.db.prepare('SELECT message FROM luxmed_notification_outbox').all() as { message: string }[];
-    assert.ok(messages.some(row => row.message.includes('another LuxMed reservation may conflict')));
+    assert.ok(messages.some(row => row.message.includes('другая бронь LuxMed могут конфликтовать')));
     f.store.db.close();
 });
 

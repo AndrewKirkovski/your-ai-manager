@@ -667,7 +667,7 @@ export class SmartBookingCoordinator {
                 if (candidate.slot.preparationRequired && !this.store.isPreparationConfirmed(config.userId, current.revision, term))
                     throw new Error('Appointment preparation changed before submission.');
                 if (!config.autobook && !manual) {
-                    this.store.notify(`candidate:${config.id}:${candidate.slot.id}`, config.userId, `LuxMed found a suitable appointment at ${new Date(candidate.slot.start).toISOString()}. Use the bot to book it.`);
+                    this.store.notify(`candidate:${config.id}:${candidate.slot.id}`, config.userId, `LuxMed нашёл подходящий слот: ${DateTime.fromMillis(candidate.slot.start, { zone: BOOKING_ZONE }).setLocale('ru').toFormat('ccc dd LLL yyyy HH:mm')} (${BOOKING_ZONE}). этот мониторинг только уведомляет, сам я не записал. скажи, если записать.`);
                     return { state: 'notified', message: 'Suitable appointment notification queued.' };
                 }
                 const allReservations = snapshot.value as LuxmedEvent[];
@@ -725,7 +725,8 @@ export class SmartBookingCoordinator {
                                 this.store.db.prepare(`UPDATE luxmed_smart_monitors SET state='paused',status=? WHERE user_id=? AND state='active'
                                     AND monitoring_id IN (SELECT id FROM luxmed_monitorings WHERE account_id=? AND user_id=? AND active=1)`)
                                     .run(message, config.userId, config.accountId, config.userId);
-                                this.store.notify(`booking-review:${attempt.id}`, config.userId, message);
+                                this.store.notify(`booking-review:${attempt.id}`, config.userId,
+                                    `LuxMed требует ручной проверки перед следующей записью (${outcome.errorCode}). умный мониторинг на этом аккаунте на паузе. проверь визит, подготовку и брони, включая оплату или направление, потом попроси новое превью. возможно, ещё висит временная бронь, которую надо снять.`);
                             })();
                             return { state: 'waiting', message };
                         }
@@ -773,7 +774,7 @@ export class SmartBookingCoordinator {
                     // A network error does not establish that booking failed.
                 }
                 this.store.outcome(attempt.id, 'unknown');
-                this.store.notify(`unknown:${attempt.id}`, config.userId, 'LuxMed booking outcome is uncertain. I am checking the reservation before attempting another booking.');
+                this.store.notify(`unknown:${attempt.id}`, config.userId, 'не понял, прошла ли запись в LuxMed. проверяю брони, прежде чем пробовать ещё раз.');
                 return { state: 'unknown', message: 'Checking the booking outcome before retrying.' };
             }
             return { state: 'waiting', message: 'No verified slot fits the confirmed schedule and travel limits.' };
@@ -789,10 +790,10 @@ export class SmartBookingCoordinator {
         const conflict = policy?.revision !== attempt.policy_revision || !!policy?.holdToken
             || !currentSnapshot || currentSnapshot.revision !== p.reservationRevision
             || monitorStopped || !this.activeAccount(attempt.user_id, attempt.account_id);
-        const time = DateTime.fromMillis(p.slot.start, { zone: BOOKING_ZONE }).toFormat('ccc dd LLL HH:mm');
+        const time = DateTime.fromMillis(p.slot.start, { zone: BOOKING_ZONE }).setLocale('ru').toFormat('ccc dd LLL HH:mm');
         const leave = DateTime.fromMillis(p.journey.leaveAt, { zone: BOOKING_ZONE }).toFormat('HH:mm');
         this.store.succeed(attempt.id, reservationId, { id: `reservation:${reservationId}`, start: p.slot.start - (p.slot.telemedicine ? 0 : 10 * 60000), end: p.slot.end + 10 * 60000, transitionMinutes: 0, locationId: p.journey.legs[0]?.query.to.id },
-            `LuxMed booked ${time}. Reservation ${reservationId}. Leave by ${leave}. ${p.journey.taxiLegs ? 'Taxi is needed for part of the journey.' : 'Public transport fits.'}${providerWarning ? ' LuxMed returned a booking warning. Review the appointment and its instructions in the LuxMed portal.' : ''}${conflict ? ' Your schedule, monitor, account or LuxMed reservations changed while booking was submitted. Please review this appointment.' : ''}`);
+            `записал тебя в LuxMed: ${time}. бронь ${reservationId}. выходить не позже ${leave}. ${p.journey.taxiLegs ? 'на часть пути нужно такси.' : 'успеваешь на общественном транспорте.'}${providerWarning ? ' LuxMed вернул предупреждение по записи, глянь визит и его инструкции в портале LuxMed.' : ''}${conflict ? ' пока отправлял запись, поменялись твоё расписание, мониторинг, аккаунт или брони LuxMed. проверь эту запись.' : ''}`);
         void this.refreshReservations(attempt.account_id, reservationCoverage(p.slot.start, p.slot.end), true).catch(() => console.warn('[LuxMed smart] Post-booking reservation refresh deferred'));
     }
     private async acknowledgeCompletedAttempt(id: string, accountId: number, reservationId: number): Promise<void> {
@@ -847,7 +848,7 @@ export class SmartBookingCoordinator {
                         this.store.outcome(attempt.id, 'unknown');
                         const known = new Set(payload.baseline.map(e => e.eventId));
                         const possible = (this.store.snapshot(attempt.account_id)?.value as LuxmedEvent[] || []).filter(e => !known.has(e.eventId) && zonedTime(e.date) === payload.slot.start);
-                        this.store.notify(`verify:${attempt.id}`, attempt.user_id, `A booking outcome still needs verification. Automatic booking is on hold; no duplicate attempt will be submitted.${possible.length ? ` The portal now lists reservation(s) ${possible.map(e => e.eventId).join(', ')} at that time. Please verify the service and clinic.` : ''}`);
+                        this.store.notify(`verify:${attempt.id}`, attempt.user_id, `результат записи в LuxMed всё ещё не подтверждён. автозапись на паузе, повторную попытку отправлять не буду.${possible.length ? ` в портале сейчас на это время есть брони: ${possible.map(e => e.eventId).join(', ')}. проверь услугу и клинику.` : ''}`);
                     }
                 } catch { console.warn('[LuxMed smart] Booking reconciliation deferred', { attemptId: attempt.id }); }
             }
@@ -890,7 +891,7 @@ export class SmartBookingCoordinator {
                     return i >= 0 ? refreshed[i] || payload.journey.legs[i] : null;
                 });
                 if (!fits) this.store.notify(`travel-conflict:${attempt.id}:${policy.revision}:${currentSnapshot?.revision || 'missing'}`, attempt.user_id,
-                    `Updated travel, availability or another LuxMed reservation may conflict with reservation ${attempt.reservation_id}. Please review the journey. Your appointment has not been cancelled.`);
+                    `обновлённая дорога, расписание или другая бронь LuxMed могут конфликтовать с бронью ${attempt.reservation_id}. проверь маршрут. запись я не отменял.`);
                 if (currentSnapshot) this.reviewedReservationRevisions.set(attempt.id, currentSnapshot.revision);
             } catch { console.warn('[LuxMed smart] Booked journey review deferred', { attemptId: attempt.id }); }
         }
