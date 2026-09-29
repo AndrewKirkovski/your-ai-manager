@@ -338,6 +338,8 @@ export const LuxmedAvailabilityReviewed: Tool = {
     parameters: { type: 'object', properties: { hold_token: { type: 'string' } }, required: ['hold_token'] },
     execute: async ({ userId, hold_token }: { userId: number; hold_token: string }) => {
         const turn = availabilityTurn.getStore();
-        return { success: !!turn && turn.userId === userId && turn.holdToken === hold_token && smartStore.release(userId, hold_token) };
+        if (!turn || turn.userId !== userId || turn.holdToken !== hold_token || !smartStore.release(userId, hold_token)) return { success: false };
+        turn.holdToken = null; // this turn released its own hold; a newer message sets a new token and still rejects it
+        return { success: true };
     },
 };
