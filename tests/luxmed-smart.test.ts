@@ -14,8 +14,8 @@ import type { LuxmedEvent, LuxmedTerm } from '../luxmedAdapter.ts';
 
 // Dynamic imports ensure tests can never open the operator's bot.sqlite.
 process.env.DB_PATH = ':memory:';
-const { SmartBookingStore } = await import('../luxmedSmartStore.ts');
-const { SmartBookingCoordinator, smartDependencies, slotFromTerm, matchesMonitor, smartBookingTimezoneIssue, smartConfigurationIssue, reservationBaselineFacts } = await import('../luxmedSmartBooking.ts');
+const { SmartBookingStore, digest } = await import('../luxmedSmartStore.ts');
+const { SmartBookingCoordinator, smartDependencies, slotFromTerm, matchesMonitor, monitorRulesFingerprint, smartBookingTimezoneIssue, smartConfigurationIssue, reservationBaselineFacts } = await import('../luxmedSmartBooking.ts');
 const { saveUserAddress, saveLuxmedAccount, createLuxmedMonitoring } = await import('../userStore.ts');
 const { LuxmedBookSlot, parseMonitorIds, parseMonitorBoolean } = await import('../tools.luxmed.ts');
 const globalDb = (await import('../database.ts')).default;
@@ -91,7 +91,7 @@ test('idempotent booking sends exact reservation facts to the sidecar', async ()
         status: 'Reserved', title: 'Visit' }]);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (url, init) => {
-        assert.match(String(url), /\/booking-attempts$/);
+        assert.match(String(url), /\/booking-attempts\/v4$/);
         const body = JSON.parse(String(init?.body));
         assert.deepEqual(body.baselineReservationIds, [42]);
         assert.deepEqual(body.baselineReservations, facts);
@@ -100,6 +100,42 @@ test('idempotent booking sends exact reservation facts to the sidecar', async ()
     try {
         const { luxmedBookSlot } = await import('../luxmedAdapter.ts');
         await luxmedBookSlot(991, f.term, 1, false, '00000000-0000-0000-0000-000000000991', () => true, [42], facts);
+    } finally { globalThis.fetch = originalFetch; f.store.db.close(); }
+});
+
+test('versioned booking submission runs before queued account reads', async () => {
+    const f = coordinatorFixture();
+    const { luxmedBookSlot, luxmedGetCities } = await import('../luxmedAdapter.ts');
+    const { luxmedAccountQueue } = await import('../luxmedAccountQueue.ts');
+    const originalFetch = globalThis.fetch, order: string[] = [];
+    let release!: () => void;
+    globalThis.fetch = async url => {
+        order.push(String(url));
+        return new Response(JSON.stringify({ success: true, data: String(url).endsWith('/cities') ? [] : { state: 'failed', errorCode: 'BOOKING_REJECTED' } }));
+    };
+    try {
+        const held = luxmedAccountQueue.run(992, 0, () => new Promise<void>(resolve => { release = resolve; }));
+        await Promise.resolve();
+        const cities = luxmedGetCities(992);
+        const booking = luxmedBookSlot(992, f.term, 1, false, '00000000-0000-0000-0000-000000000992');
+        release();
+        await Promise.all([held, cities, booking]);
+        assert.match(order[0], /\/booking-attempts\/v4$/);
+        assert.match(order[1], /\/cities$/);
+    } finally { globalThis.fetch = originalFetch; f.store.db.close(); }
+});
+
+test('versioned booking submission observes account Retry-After', async () => {
+    const f = coordinatorFixture();
+    const { luxmedBookSlot, LuxmedApiError } = await import('../luxmedAdapter.ts');
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => { calls++; return new Response('throttled', { status: 429, headers: { 'Retry-After': '60' } }); };
+    try {
+        await assert.rejects(luxmedBookSlot(994, f.term, 1, false, '00000000-0000-0000-0000-000000000994'));
+        await assert.rejects(luxmedBookSlot(994, f.term, 1, false, '00000000-0000-0000-0000-000000000995'),
+            error => error instanceof LuxmedApiError && error.code === 'ACCOUNT_BACKOFF' && error.retryAfterMs! > 50000);
+        assert.equal(calls, 1);
     } finally { globalThis.fetch = originalFetch; f.store.db.close(); }
 });
 test('a one-off commitment cannot disappear behind recurrence bounds or exceptions', () => {
@@ -332,11 +368,12 @@ function coordinatorFixture() {
     const term: LuxmedTerm = { additionalData: { isPreparationRequired: false, preparationItems: [] }, term: { clinicId: 2, clinicGroupId: 2, clinic: 'Clinic - Testowa 2', dateTimeFrom: { dateTimeLocal: from }, dateTimeTo: { dateTimeLocal: to }, doctor: { id: 3, name: 'Doctor' }, isTelemedicine: false, isAdditional: false, isImpediment: false, roomId: 4, scheduleId: 5, serviceId: 6 } };
     const config: LuxmedMonitoringConfig = { id: 'm1', userId: 1, accountId: 1, serviceId: 6, serviceName: 'Consultation', cityId: 1, cityName: 'Warszawa', clinicIds: null, doctorIds: null, englishOnly: false, dateFrom: `${future}T00:00:00`, dateTo: `${future}T23:59:59`, timeFrom: '08:00', timeTo: '20:00', autobook: true, rebookIfExists: false, lastCheck: null, createdAt: new Date().toISOString() };
     store.db.prepare("INSERT INTO luxmed_accounts(user_id,account_id,username,created_at) VALUES (1,1,'fixture','2026-10-01')").run();
-    store.db.prepare("INSERT INTO luxmed_monitorings(id,user_id,account_id,service_id,service_name,city_id,city_name,date_from,date_to,created_at) VALUES ('m1',1,1,6,'Consultation',1,'Warszawa',?,?,?)")
-        .run(config.dateFrom, config.dateTo, config.createdAt);
-    store.enroll('m1', 1); store.db.prepare("UPDATE luxmed_smart_monitors SET state='active' WHERE monitoring_id='m1'").run();
+    store.db.prepare("INSERT INTO luxmed_monitorings(id,user_id,account_id,service_id,service_name,city_id,city_name,date_from,date_to,time_from,time_to,created_at) VALUES ('m1',1,1,6,'Consultation',1,'Warszawa',?,?,?,?,?)")
+        .run(config.dateFrom, config.dateTo, config.timeFrom, config.timeTo, config.createdAt);
+    store.enroll('m1', 1); store.db.prepare("UPDATE luxmed_smart_monitors SET state='active',confirmed_fingerprint=?,confirmed_provider_fingerprint=? WHERE monitoring_id='m1'")
+        .run(monitorRulesFingerprint(config), digest([6, 'Consultation', 1, 'Warszawa', []]));
     let books = 0;
-    const api = { ...smartDependencies, capabilities: async () => ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v3', 'smart-booking-attempts-v4', 'smart-booking-lockterm-review-v1', 'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1', 'legacy-booking-barrier-v2', 'smart-booking-enrollment-fence-v2', 'smart-booking-identity-fence-v1', 'cancellation-receipts-v3'], reserved: async () => [], doctors: async () => [], cities: async () => [{ id: 1, name: 'Warszawa' }], monitorings: async () => [], cancellations: async () => [], acknowledgeMove: async () => { }, book: async () => { books++; return { state: 'succeeded', reservationId: 77 }; }, attempt: async () => ({ state: 'succeeded' as const, reservationId: 77 }), acknowledgeAttempt: async () => { }, legacyBarrier: async () => ({ state: 'clear' as const }), acknowledgeLegacy: async () => { }, resolve: async () => null };
+    const api = { ...smartDependencies, capabilities: async () => ['smart-booking-v1', 'reservation-end-times-v1', 'smart-booking-attempts-v3', 'smart-booking-attempts-v4', 'smart-booking-lockterm-review-v1', 'monitor-quiesce-v1', 'reservation-range-complete-v1', 'legacy-monitor-fence-v1', 'legacy-booking-barrier-v2', 'smart-booking-enrollment-fence-v2', 'smart-booking-identity-fence-v1', 'cancellation-receipts-v3'], reserved: async () => [], doctors: async () => [], cities: async () => [{ id: 1, name: 'Warszawa' }], services: async () => [{ id: 6, name: 'Consultation' }], monitorings: async () => [], cancellations: async () => [], acknowledgeMove: async () => { }, book: async () => { books++; return { state: 'succeeded', reservationId: 77 }; }, attempt: async () => ({ state: 'succeeded' as const, reservationId: 77 }), acknowledgeAttempt: async () => { }, legacyBarrier: async () => ({ state: 'clear' as const }), acknowledgeLegacy: async () => { }, resolve: async () => null };
     const coordinator = new SmartBookingCoordinator(store, api, () => null);
     const cache = { lookup: async (q: TravelQuery) => estimate(q, 1500, false, Date.now()), prepared: () => null, previous: () => null, key: (q: TravelQuery) => JSON.stringify(q), warm: () => { }, metrics: {} };
     coordinator.cache = () => cache as any;
@@ -417,6 +454,136 @@ test('malformed monitor time bounds never broaden a smart monitor', () => {
         assert.throws(() => createLuxmedMonitoring({ ...config, id: 'invalid-time', timeFrom: from, timeTo: to }), /valid HH:mm/);
         f.store.db.close();
     }
+});
+test('active smart enrollment pauses when saved monitor rules change or lack a reviewed fingerprint', async () => {
+    const changed = coordinatorFixture();
+    changed.store.db.prepare("UPDATE luxmed_monitorings SET time_from='09:00' WHERE id='m1'").run();
+    assert.equal((await changed.coordinator.process(changed.config, [changed.term])).state, 'waiting');
+    assert.equal(changed.books(), 0);
+    changed.store.db.close();
+
+    const legacy = coordinatorFixture();
+    legacy.store.db.prepare("UPDATE luxmed_smart_monitors SET confirmed_fingerprint=NULL WHERE monitoring_id='m1'").run();
+    applyColumnMigrations(legacy.store.db);
+    assert.equal(legacy.store.enrollment('m1')?.state, 'paused');
+    assert.match(legacy.store.enrollment('m1')?.status || '', /confirm availability again/);
+    assert.equal((await legacy.coordinator.process(legacy.config, [legacy.term])).state, 'waiting');
+    assert.equal(legacy.books(), 0);
+    legacy.store.db.close();
+
+    const oldProviderProof = coordinatorFixture();
+    oldProviderProof.store.db.prepare("UPDATE luxmed_smart_monitors SET confirmed_provider_fingerprint=NULL WHERE monitoring_id='m1'").run();
+    applyColumnMigrations(oldProviderProof.store.db);
+    assert.equal(oldProviderProof.store.enrollment('m1')?.state, 'paused');
+    assert.match(oldProviderProof.store.enrollment('m1')?.status || '', /provider identity/);
+    assert.equal((await oldProviderProof.coordinator.process(oldProviderProof.config, [oldProviderProof.term])).state, 'waiting');
+    assert.equal(oldProviderProof.books(), 0);
+    oldProviderProof.store.db.close();
+});
+test('provider service identity drift pauses an enrolled monitor before booking', async () => {
+    const f = coordinatorFixture();
+    f.api.services = async () => [{ id: 6, name: 'Different visit' }];
+    const result = await f.coordinator.process(f.config, [f.term]);
+    assert.equal(result.state, 'waiting');
+    assert.match(result.message, /changed a selected service/);
+    assert.equal(f.store.enrollment('m1')?.state, 'paused');
+    assert.equal(f.books(), 0);
+    f.store.db.close();
+});
+test('provider identity is checked after route inspection, before submission', async () => {
+    const f = coordinatorFixture();
+    let providerName = 'Consultation';
+    f.api.services = async () => [{ id: 6, name: providerName }];
+    const inspect = f.coordinator.inspect.bind(f.coordinator);
+    f.coordinator.inspect = async (...args) => {
+        const result = await inspect(...args);
+        providerName = 'Different visit';
+        return result;
+    };
+    const result = await f.coordinator.process(f.config, [f.term]);
+    assert.equal(result.state, 'waiting');
+    assert.equal(f.store.enrollment('m1')?.state, 'paused');
+    assert.equal(f.books(), 0);
+    f.store.db.close();
+});
+test('provider identities need one authoritative service, city and selected doctor', async () => {
+    const { uniqueServiceName, uniqueCityName, selectedDoctorNames } = await import('../luxmedProviderIdentity.ts');
+    assert.equal(uniqueServiceName([{ id: 1, name: 'Group', children: [{ id: 6, name: 'Visit' }] }], 6), 'Visit');
+    assert.equal(uniqueServiceName([{ id: 6, name: 'Visit' }, { id: 6, name: 'Other' }], 6), null);
+    assert.equal(uniqueServiceName([], 6), null);
+    assert.equal(uniqueCityName([{ id: 1, name: 'Warszawa' }], 1), 'Warszawa');
+    assert.equal(uniqueCityName([{ id: 1, name: 'Warszawa' }, { id: 1, name: 'Other' }], 1), null);
+    assert.equal(selectedDoctorNames([{ id: 3, name: 'Dr Test' }], [3])?.get(3), 'Dr Test');
+    assert.equal(selectedDoctorNames([{ id: 3, name: 'Dr Test' }], [4]), null);
+});
+test('explicit clinic preview requires and displays verified identity even with no current slots', async () => {
+    const { initSmartBookingTools, LuxmedPreviewAvailability } = await import('../tools.luxmedSmart.ts');
+    const { smartBooking } = await import('../luxmedSmartBooking.ts');
+    const { availabilityTurn } = await import('../luxmedConversation.ts');
+    const userId = 140, store = new SmartBookingStore(globalDb);
+    globalDb.prepare('INSERT INTO users(user_id) VALUES (?)').run(userId);
+    globalDb.prepare("INSERT INTO luxmed_accounts(user_id,account_id,username,created_at) VALUES (140,140,'fixture','2026-10-01')").run();
+    const savedHome = store.place(userId, 'home', 'Testowa 1, Warszawa', 52, 21);
+    store.verifyLocation(userId, 'home', savedHome.revision);
+    store.draft(userId, policy);
+    const future = DateTime.now().setZone('Europe/Warsaw').plus({ days: 3 }).toISODate()!;
+    const monitor = createLuxmedMonitoring({ id: 'selected-clinic-preview', userId, accountId: userId,
+        serviceId: 6, serviceName: 'Wrong display label', cityId: 1, cityName: 'Warszawa', clinicIds: [2], doctorIds: null,
+        englishOnly: false, dateFrom: `${future}T00:00:00`, dateTo: `${future}T23:59:59`, timeFrom: '08:00',
+        timeTo: '20:00', autobook: true, rebookIfExists: false });
+    store.enroll(monitor.id, userId);
+    const sent: string[] = [];
+    let callback: (query: any) => void = () => { }, finish: () => void = () => { };
+    const answered = new Promise<void>(resolve => { finish = resolve; });
+    const alerts: string[] = [];
+    initSmartBookingTools({ on: (_event: string, handler: (query: any) => void) => { callback = handler; },
+        answerCallbackQuery: async (_id: string, options: { text: string }) => { alerts.push(options.text); finish(); },
+        sendMessage: async (_id: number, message: string) => { sent.push(message); return {} as any; } } as any);
+    const oldReady = smartBooking.readiness, oldFetch = globalThis.fetch;
+    smartBooking.readiness = async () => null;
+    let enrollmentPosts = 0;
+    globalThis.fetch = async (url, init) => {
+        if (String(url).endsWith('/smart-booking-enrollment') && init?.method === 'POST') enrollmentPosts++;
+        return new Response(JSON.stringify({ success: true, data:
+        String(url).endsWith('/services') ? [{ id: 6, name: 'Visit' }] :
+        String(url).endsWith('/cities') ? [{ id: 1, name: 'Warszawa' }] : [] }));
+    };
+    const preview = () => availabilityTurn.run({ userId, holdToken: null }, () =>
+        LuxmedPreviewAvailability.execute({ userId, monitoring_id: monitor.id }));
+    try {
+        await assert.rejects(preview(), /selected exact clinic ID has no provider-verified name and street address/);
+        assert.equal(sent.length, 0);
+        const clinicPlace = store.place(userId, 'clinic:1:2', 'Testowa 2, Warszawa', 52.1, 21.1);
+        store.verifyClinic(userId, clinicPlace.id, 'Clinic - Testowa 2', clinicPlace.revision);
+        assert.equal((await preview() as any).success, true);
+        assert.match(sent.join('\n'), /LuxMed service Visit \(ID 6\)/);
+        assert.match(sent.join('\n'), /Selected exact clinic 2, Clinic - Testowa 2: Testowa 2, Warszawa/);
+        const confirmation = globalDb.prepare('SELECT confirmation_token AS token,revision FROM luxmed_availability WHERE user_id=?')
+            .get(userId) as { token: string; revision: number };
+        const staged = store.sidecarMonitorPreview(userId, monitor.id, monitor.accountId, confirmation);
+        assert.equal(staged?.clinicIdentityFingerprint, digest(store.selectedClinicIdentities(userId, 1, [2])));
+        store.verifyClinic(userId, clinicPlace.id, 'Renamed - Testowa 2', clinicPlace.revision);
+        callback({ id: 'selected-clinic-query', from: { id: userId }, message: { chat: { id: userId, type: 'private' } },
+            data: `luxconfirm:${monitor.id}:${confirmation.revision}:${confirmation.token}` });
+        await answered;
+        assert.equal(enrollmentPosts, 0);
+        assert.match(alerts.join('\n'), /selected clinic changed/i);
+        assert.notEqual(store.enrollment(monitor.id)?.state, 'active');
+    } finally { smartBooking.readiness = oldReady; globalThis.fetch = oldFetch; }
+});
+test('changed selected clinic label blocks an active smart monitor', async () => {
+    const f = coordinatorFixture();
+    f.config.clinicIds = [2];
+    f.store.db.prepare("UPDATE luxmed_monitorings SET clinic_ids='[2]' WHERE id='m1'").run();
+    const selected = f.store.selectedClinicIdentities(1, 1, [2]);
+    assert.ok(selected);
+    f.store.db.prepare("UPDATE luxmed_smart_monitors SET confirmed_fingerprint=?,confirmed_clinic_fingerprint=? WHERE monitoring_id='m1'")
+        .run(monitorRulesFingerprint(f.config), digest(selected));
+    f.store.verifyClinic(1, clinic.id, 'Renamed - Testowa 2', f.store.places(1).get(clinic.id)!.revision);
+    f.term.term.clinic = 'Renamed - Testowa 2';
+    assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting');
+    assert.equal(f.books(), 0);
+    f.store.db.close();
 });
 test('explicit monitor booleans cannot silently change doctor or automatic booking rules', () => {
     assert.equal(parseMonitorBoolean(undefined, 'autobook', true), true);
@@ -934,6 +1101,8 @@ test('a v4 sidecar without strict lockterm review cannot enable smart booking', 
 test('smart replacement waits until the old visit is identified before any booking work', async () => {
     const f = coordinatorFixture();
     f.config.rebookIfExists = true;
+    f.store.db.prepare("UPDATE luxmed_monitorings SET rebook_if_exists=1 WHERE id='m1'").run();
+    f.store.db.prepare("UPDATE luxmed_smart_monitors SET confirmed_fingerprint=? WHERE monitoring_id='m1'").run(monitorRulesFingerprint(f.config));
     f.api.capabilities = async () => { throw new Error('booking preflight must not run'); };
     const automatic = await f.coordinator.process(f.config, [f.term]);
     const manual = await f.coordinator.process(f.config, [f.term], true);
@@ -1159,13 +1328,19 @@ test('confirmation requires the owning private chat and cannot be replayed', asy
     globalDb.prepare("INSERT OR REPLACE INTO luxmed_accounts(user_id,account_id,username,created_at) VALUES (10,10,'fixture','2026-10-01')").run();
     const monitor = createLuxmedMonitoring({ id: 'confirm-test', userId: 10, accountId: 10, serviceId: 6, serviceName: 'Visit', cityId: 1, cityName: 'Warszawa', clinicIds: null, doctorIds: null, englishOnly: false, dateFrom: '2026-10-01T00:00:00', dateTo: '2026-11-01T00:00:00', timeFrom: '08:00', timeTo: '20:00', autobook: true, rebookIfExists: false });
     store.enroll(monitor.id, 10); const c = store.confirmation(10);
-    store.stageSidecarMonitorPreview(10, monitor.id, monitor.accountId, c, [42]);
+    store.stageSidecarMonitorPreview(10, monitor.id, monitor.accountId, c, [42], monitorRulesFingerprint(monitor),
+        'Visit', digest([6, 'Visit', 1, 'Warszawa', []]), null);
     let callback: (q: any) => void = () => { }; let answers = 0;
-    initSmartBookingTools({ on: (_e: any, fn: any) => { callback = fn; }, answerCallbackQuery: async () => { answers++; }, sendMessage: async () => ({}) } as any);
+    initSmartBookingTools({ on: (_e: any, fn: any) => { callback = fn; }, answerCallbackQuery: async () => {
+        answers++;
+        if (store.enrollment(monitor.id)?.state === 'active') throw new Error('Telegram delivery failed');
+    }, sendMessage: async () => ({}) } as any);
     const oldReady = smartBooking.readiness, oldFetch = globalThis.fetch; smartBooking.readiness = async () => null;
-    let deactivated = 0, enrolled = 0, legacyActive = true;
+    let deactivated = 0, enrolled = 0, legacyActive = true, serviceName = 'Visit';
     globalThis.fetch = async (url, init) => {
         const path = String(url);
+        if (path.endsWith('/services')) return new Response(JSON.stringify({ success: true, data: [{ id: 6, name: serviceName }] }));
+        if (path.endsWith('/cities')) return new Response(JSON.stringify({ success: true, data: [{ id: 1, name: 'Warszawa' }] }));
         if (path.endsWith('/quiesce')) { deactivated++; legacyActive = false; }
         if (path.endsWith('/smart-booking-enrollment') && init?.method === 'POST') {
             assert.equal(store.enrollment(monitor.id)?.state, 'activating');
@@ -1181,6 +1356,12 @@ test('confirmation requires the owning private chat and cannot be replayed', asy
     try {
         const query = { id: 'q', from: { id: 10 }, message: { chat: { id: 10, type: 'private' } }, data: `luxconfirm:${monitor.id}:${c.revision}:${c.token}` };
         callback({ ...query, from: { id: 11 } }); await new Promise(r => setTimeout(r, 10)); assert.notEqual(store.enrollment(monitor.id)?.state, 'active');
+        globalDb.prepare("UPDATE luxmed_monitorings SET time_from='09:00' WHERE id=?").run(monitor.id);
+        callback(query); await new Promise(r => setTimeout(r, 10)); assert.equal(enrolled, 0);
+        globalDb.prepare("UPDATE luxmed_monitorings SET time_from='08:00' WHERE id=?").run(monitor.id);
+        serviceName = 'Different service';
+        callback(query); await new Promise(r => setTimeout(r, 10)); assert.equal(enrolled, 0);
+        serviceName = 'Visit';
         createLuxmedMonitoring({ id: 'legacy-other-confirm-test', userId: 10, accountId: 10, serviceId: 7, serviceName: 'Other visit', cityId: 1, cityName: 'Warszawa', clinicIds: null, doctorIds: null, englishOnly: false, dateFrom: '2026-10-01T00:00:00', dateTo: '2026-11-01T00:00:00', timeFrom: '08:00', timeTo: '20:00', autobook: true, rebookIfExists: false });
         callback(query); await new Promise(r => setTimeout(r, 10));
         assert.notEqual(store.enrollment(monitor.id)?.state, 'active');
@@ -1189,9 +1370,13 @@ test('confirmation requires the owning private chat and cannot be replayed', asy
         callback(query); await new Promise(r => setTimeout(r, 10)); assert.equal(store.enrollment(monitor.id)?.state, 'active');
         assert.equal((globalDb.prepare('SELECT autobook FROM luxmed_monitorings WHERE id=?').get(monitor.id) as { autobook: number }).autobook, 0);
         assert.equal((await import('../userStore.ts')).getActiveLuxmedMonitoringsByUser(10).find(m => m.id === monitor.id)?.autobook, true);
-        callback(query); await new Promise(r => setTimeout(r, 10)); assert.equal(answers, 4); assert.equal(store.policy(10)?.revision, saved.revision);
+        callback(query); await new Promise(r => setTimeout(r, 10)); assert.equal(answers, 6); assert.equal(store.policy(10)?.revision, saved.revision);
         assert.equal(deactivated, 0);
         assert.equal(enrolled, 1);
+        assert.match(store.enrollment(monitor.id)?.status || '', /Monitoring with confirmed availability/);
+        const notices = globalDb.prepare("SELECT message FROM luxmed_notification_outbox WHERE user_id=10 AND id LIKE 'activation-%'").all() as { message: string }[];
+        assert.equal(notices.filter(notice => notice.message.includes('Smart monitoring is active')).length, 1);
+        assert.equal(notices.some(notice => notice.message.includes('stayed paused')), false);
     } finally { smartBooking.readiness = oldReady; globalThis.fetch = oldFetch; }
 });
 test('failed sidecar enrollment leaves the confirmed monitor held before activation', async () => {
@@ -1207,7 +1392,8 @@ test('failed sidecar enrollment leaves the confirmed monitor held before activat
     const monitor = createLuxmedMonitoring({ id: 'enrollment-failure', userId, accountId: 130, serviceId: 6, serviceName: 'Visit', cityId: 1, cityName: 'Warszawa', clinicIds: null, doctorIds: null, englishOnly: false, dateFrom: '2026-10-01T00:00:00', dateTo: '2026-11-01T00:00:00', timeFrom: '08:00', timeTo: '20:00', autobook: true, rebookIfExists: false });
     store.enroll(monitor.id, userId);
     const confirmation = store.confirmation(userId);
-    store.stageSidecarMonitorPreview(userId, monitor.id, monitor.accountId, confirmation, []);
+    store.stageSidecarMonitorPreview(userId, monitor.id, monitor.accountId, confirmation, [], monitorRulesFingerprint(monitor),
+        'Visit', digest([6, 'Visit', 1, 'Warszawa', []]), null);
     let callback: (q: any) => void = () => { };
     let finish!: () => void;
     const done = new Promise<void>(resolve => { finish = resolve; });
@@ -1216,6 +1402,8 @@ test('failed sidecar enrollment leaves the confirmed monitor held before activat
     smartBooking.readiness = async () => null;
     let enrollmentPosts = 0;
     globalThis.fetch = async (url) => {
+        if (String(url).endsWith('/services')) return new Response(JSON.stringify({ success: true, data: [{ id: 6, name: 'Visit' }] }));
+        if (String(url).endsWith('/cities')) return new Response(JSON.stringify({ success: true, data: [{ id: 1, name: 'Warszawa' }] }));
         if (String(url).endsWith('/smart-booking-enrollment')) enrollmentPosts++;
         return new Response(JSON.stringify({ success: false, error: 'Enrollment unavailable' }), { status: 503 });
     };
@@ -1487,6 +1675,8 @@ test('saturated route workers check cold earlier slots without delaying a verifi
     const firstDay = f.config.dateFrom.slice(0, 10);
     const nextDay = DateTime.fromISO(firstDay).plus({ days: 1 }).toISODate()!;
     f.config.dateTo = `${nextDay}T23:59:59`;
+    f.store.db.prepare("UPDATE luxmed_monitorings SET date_to=? WHERE id='m1'").run(f.config.dateTo);
+    f.store.db.prepare("UPDATE luxmed_smart_monitors SET confirmed_fingerprint=? WHERE monitoring_id='m1'").run(monitorRulesFingerprint(f.config));
     const makeTerm = (day: string, time: string, scheduleId: number): LuxmedTerm => {
         const value = structuredClone(f.term);
         value.term.scheduleId = scheduleId;
@@ -1636,6 +1826,8 @@ test('an existing monitor transit limit remains binding after smart enrolment', 
     f.store.draft(1, {...policy,maxTaxiMinutes:0});
     const c = f.store.confirmation(1); f.store.confirm(1, c.token, c.revision);
     f.config.maxTransitMinutes = 10;
+    f.store.db.prepare("UPDATE luxmed_monitorings SET max_transit_minutes=10 WHERE id='m1'").run();
+    f.store.db.prepare("UPDATE luxmed_smart_monitors SET confirmed_fingerprint=? WHERE monitoring_id='m1'").run(monitorRulesFingerprint(f.config));
     assert.equal((await f.coordinator.process(f.config, [f.term])).state, 'waiting');
     assert.equal(f.books(), 0); f.store.db.close();
 });

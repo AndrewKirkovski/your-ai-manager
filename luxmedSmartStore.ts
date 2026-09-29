@@ -6,7 +6,8 @@ import type { LuxmedTerm } from './luxmedAdapter';
 import { providerStreetMatches } from './googleRoutes';
 
 export interface SavedPolicy { userId: number; revision: number; policy: AvailabilityPolicy; state: string; holdToken: string | null; }
-export interface Enrollment { monitoring_id: string; user_id: number; state: string; status: string; next_check: number; failures: number; }
+export interface Enrollment { monitoring_id: string; user_id: number; state: string; status: string; next_check: number; failures: number; confirmed_fingerprint: string | null; confirmed_provider_fingerprint: string | null; confirmed_clinic_fingerprint: string | null; }
+export interface SelectedClinicIdentity { clinicId: number; sourceLabel: string; address: string; placeRevision: string; }
 export interface BookingAttempt {
     id: string; user_id: number; account_id: number; monitoring_id: string | null; fingerprint: string;
     state: string; policy_revision: number; payload: string; reservation_id: number | null; created_at: number; updated_at: number;
@@ -107,25 +108,38 @@ export class SmartBookingStore {
         return { token, revision: saved.revision };
     }
     stageSidecarMonitorPreview(userId: number, monitoringId: string, accountId: number,
-        confirmation: { token: string; revision: number }, autoMonitorIds: number[]): void {
+        confirmation: { token: string; revision: number }, autoMonitorIds: number[], monitorFingerprint: string,
+        providerServiceName: string, providerIdentityFingerprint: string, clinicIdentityFingerprint: string | null): void {
         const ids = [...new Set(autoMonitorIds)].sort((a, b) => a - b);
         if (ids.length !== autoMonitorIds.length || ids.some(id => !Number.isSafeInteger(id) || id <= 0)) {
             throw new Error('Sidecar monitor IDs are invalid. Request a new preview.');
         }
+        if (!/^[a-f0-9]{64}$/.test(monitorFingerprint) || !/^[a-f0-9]{64}$/.test(providerIdentityFingerprint)
+            || (clinicIdentityFingerprint !== null && !/^[a-f0-9]{64}$/.test(clinicIdentityFingerprint))
+            || !providerServiceName.trim() || providerServiceName.length > 300)
+            throw new Error('Monitor or provider service identity is invalid. Request a new preview.');
         this.db.prepare(`INSERT INTO luxmed_sidecar_monitor_previews
-            (user_id,monitoring_id,account_id,policy_revision,confirmation_token,auto_monitor_ids)
-            VALUES (?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+            (user_id,monitoring_id,account_id,policy_revision,confirmation_token,auto_monitor_ids,monitor_fingerprint,provider_service_name,provider_identity_fingerprint,clinic_identity_fingerprint)
+            VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
             monitoring_id=excluded.monitoring_id,account_id=excluded.account_id,
             policy_revision=excluded.policy_revision,confirmation_token=excluded.confirmation_token,
-            auto_monitor_ids=excluded.auto_monitor_ids`)
-            .run(userId, monitoringId, accountId, confirmation.revision, confirmation.token, JSON.stringify(ids));
+            auto_monitor_ids=excluded.auto_monitor_ids,monitor_fingerprint=excluded.monitor_fingerprint,
+            provider_service_name=excluded.provider_service_name,provider_identity_fingerprint=excluded.provider_identity_fingerprint,
+            clinic_identity_fingerprint=excluded.clinic_identity_fingerprint`)
+            .run(userId, monitoringId, accountId, confirmation.revision, confirmation.token, JSON.stringify(ids), monitorFingerprint, providerServiceName.trim(), providerIdentityFingerprint, clinicIdentityFingerprint);
     }
     sidecarMonitorPreview(userId: number, monitoringId: string, accountId: number,
-        confirmation: { token: string; revision: number }): number[] | null {
-        const row = this.db.prepare(`SELECT auto_monitor_ids FROM luxmed_sidecar_monitor_previews WHERE
+        confirmation: { token: string; revision: number }): { autoMonitorIds: number[]; monitorFingerprint: string; providerServiceName: string; providerIdentityFingerprint: string; clinicIdentityFingerprint: string | null } | null {
+        const row = this.db.prepare(`SELECT auto_monitor_ids,monitor_fingerprint,provider_service_name,provider_identity_fingerprint,clinic_identity_fingerprint FROM luxmed_sidecar_monitor_previews WHERE
             user_id=? AND monitoring_id=? AND account_id=? AND policy_revision=? AND confirmation_token=?`)
-            .get(userId, monitoringId, accountId, confirmation.revision, confirmation.token) as { auto_monitor_ids: string } | undefined;
-        return row ? JSON.parse(row.auto_monitor_ids) as number[] : null;
+            .get(userId, monitoringId, accountId, confirmation.revision, confirmation.token) as {
+                auto_monitor_ids: string; monitor_fingerprint: string | null; provider_service_name: string | null;
+                provider_identity_fingerprint: string | null; clinic_identity_fingerprint: string | null
+            } | undefined;
+        if (!row?.monitor_fingerprint || !row.provider_service_name || !row.provider_identity_fingerprint) return null;
+        return { autoMonitorIds: JSON.parse(row.auto_monitor_ids) as number[], monitorFingerprint: row.monitor_fingerprint,
+            providerServiceName: row.provider_service_name, providerIdentityFingerprint: row.provider_identity_fingerprint,
+            clinicIdentityFingerprint: row.clinic_identity_fingerprint };
     }
     confirm(userId: number, token: string, revision: number): boolean {
         return this.db.transaction(() => {
@@ -240,6 +254,22 @@ export class SmartBookingStore {
             && !!this.db.prepare(`SELECT 1 FROM luxmed_smart_clinic_bindings WHERE
             user_id=? AND location_id=? AND source_label=? AND place_revision=?`)
             .get(userId, locationId, sourceLabel.trim(), placeRevision);
+    }
+    selectedClinicIdentities(userId: number, cityId: number, clinicIds: number[]): SelectedClinicIdentity[] | null {
+        if (!Number.isSafeInteger(cityId) || cityId <= 0 || !Array.isArray(clinicIds) || !clinicIds.length
+            || clinicIds.some(id => !Number.isSafeInteger(id) || id <= 0) || new Set(clinicIds).size !== clinicIds.length) return null;
+        const places = this.places(userId);
+        const identities: SelectedClinicIdentity[] = [];
+        for (const clinicId of clinicIds) {
+            const locationId = `clinic:${cityId}:${clinicId}`;
+            const place = places.get(locationId);
+            const binding = this.db.prepare(`SELECT source_label,place_revision FROM luxmed_smart_clinic_bindings
+                WHERE user_id=? AND location_id=?`).get(userId, locationId) as
+                { source_label: string; place_revision: string } | undefined;
+            if (!place || !binding || !this.clinicVerified(userId, locationId, binding.source_label, binding.place_revision)) return null;
+            identities.push({ clinicId, sourceLabel: binding.source_label, address: place.address, placeRevision: place.revision });
+        }
+        return identities;
     }
     scheduleAppointments(userId: number): Commitment[] {
         return (this.db.prepare('SELECT value FROM luxmed_schedule_appointments WHERE user_id=? ORDER BY id').all(userId) as { value: string }[])

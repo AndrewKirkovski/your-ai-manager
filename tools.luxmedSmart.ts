@@ -1,12 +1,13 @@
 import type TelegramBot from 'node-telegram-bot-api';
 import type { Tool } from './tool.types';
-import { smartStore, preparationFacts, requiresPreparation } from './luxmedSmartStore';
-import { smartBooking, smartConfigurationIssue, matchesMonitor, monitorReservationCoverage } from './luxmedSmartBooking';
+import { smartStore, digest, preparationFacts, requiresPreparation, type SelectedClinicIdentity } from './luxmedSmartStore';
+import { smartBooking, smartConfigurationIssue, matchesMonitor, monitorReservationCoverage, monitorRulesFingerprint } from './luxmedSmartBooking';
 import { BOOKING_ZONE, compareFeasible, type TimeRule } from './luxmedAvailability';
 import { DateTime } from 'luxon';
 import { getActiveLuxmedMonitoringsByUser, getLuxmedAccountId, type LuxmedMonitoringConfig } from './userStore';
-import { luxmedSearchSlots, luxmedGetMonitorings, luxmedEnrollSmartAccount, luxmedLegacyBookingBarrier, luxmedSmartEnrollment } from './luxmedAdapter';
-import { resolveStreetAddress } from './googleRoutes';
+import { luxmedSearchSlots, luxmedGetMonitorings, luxmedGetServices, luxmedGetCities, luxmedGetDoctors, luxmedEnrollSmartAccount, luxmedLegacyBookingBarrier, luxmedSmartEnrollment } from './luxmedAdapter';
+import { providerIdentityFingerprint, selectedDoctorNames, uniqueCityName, uniqueServiceName } from './luxmedProviderIdentity';
+import { providerCityMatches, resolveStreetAddress } from './googleRoutes';
 import { availabilityTurn, requireCurrentAvailabilityTurn } from './luxmedConversation';
 
 let telegram: TelegramBot | null = null;
@@ -38,9 +39,36 @@ export function availabilitySummary(userId: number): string {
     ...(p.unresolved.length ? [`Please clarify: ${p.unresolved.join('; ')}`] : []),
     ].join('\n');
 }
-export function monitorFilterSummary(monitor: Pick<LuxmedMonitoringConfig, 'clinicIds' | 'doctorIds' | 'englishOnly'>): string {
+export function monitorFilterSummary(monitor: Pick<LuxmedMonitoringConfig, 'clinicIds' | 'doctorIds' | 'englishOnly'>,
+    doctorNames: Map<number, string> = new Map()): string {
     const ids = (value: number[] | null) => value === null ? 'any' : value.length ? value.join(', ') : 'invalid empty filter';
-    return `Clinic IDs: ${ids(monitor.clinicIds)}.\nDoctor IDs: ${ids(monitor.doctorIds)}.\nEnglish-speaking doctors only: ${monitor.englishOnly ? 'yes' : 'no'}.`;
+    const doctors = monitor.doctorIds === null ? 'any' : monitor.doctorIds.map(id => `${id} (${doctorNames.get(id) || 'unverified'})`).join(', ');
+    return `Clinic IDs: ${ids(monitor.clinicIds)}.\nDoctor IDs: ${doctors}.\nEnglish-speaking doctors only: ${monitor.englishOnly ? 'yes' : 'no'}.`;
+}
+async function verifiedMonitorIdentity(monitor: LuxmedMonitoringConfig): Promise<{
+    serviceName: string; cityName: string; doctorNames: Map<number, string>; fingerprint: string
+}> {
+    const [services, cities, doctors] = await Promise.all([
+        luxmedGetServices(monitor.accountId), luxmedGetCities(monitor.accountId),
+        monitor.doctorIds === null ? Promise.resolve([]) : luxmedGetDoctors(monitor.accountId, monitor.cityId, monitor.serviceId),
+    ]);
+    const serviceName = uniqueServiceName(services, monitor.serviceId);
+    const cityName = uniqueCityName(cities, monitor.cityId);
+    const doctorNames = selectedDoctorNames(doctors, monitor.doctorIds);
+    if (!serviceName || !cityName || !doctorNames)
+        throw new Error('LuxMed could not verify the selected service, city or doctors. Refresh the provider lists and request a new preview.');
+    return { serviceName, cityName, doctorNames,
+        fingerprint: providerIdentityFingerprint(monitor.serviceId, serviceName, monitor.cityId, cityName, doctorNames) };
+}
+function verifiedSelectedClinics(monitor: LuxmedMonitoringConfig, cityName: string): {
+    identities: SelectedClinicIdentity[]; fingerprint: string | null
+} {
+    if (monitor.clinicIds === null) return { identities: [], fingerprint: null };
+    const identities = smartStore.selectedClinicIdentities(monitor.userId, monitor.cityId, monitor.clinicIds);
+    if (!identities || identities.some(clinic => !providerCityMatches(cityName, clinic.address))) {
+        throw new Error('A selected exact clinic ID has no provider-verified name and street address. Wait for an observed slot at that clinic, verify its address, then request a new preview. Facility group IDs are not exact clinic IDs.');
+    }
+    return { identities, fingerprint: digest(identities) };
 }
 export function availabilityContext(userId: number): string {
     const saved = smartStore.policy(userId);
@@ -60,14 +88,27 @@ export function initSmartBookingTools(bot: TelegramBot): void {
                 if (query.message?.chat.type !== 'private' || query.message.chat.id !== userId) throw new Error('Confirm in your private chat.');
                 const monitor = getActiveLuxmedMonitoringsByUser(userId).find(m => m.id === monitorId);
                 if (!monitor) throw new Error('Monitoring is no longer active.');
+                if (monitor.rebookIfExists) throw new Error('Automatic replacement is not available yet. Create a monitor without replacement and request a new preview.');
                 const issue = await smartBooking.readiness(true); if (issue) throw new Error(issue);
                 // Validate ownership, revision and token before any sidecar mutation.
                 const row = smartStore.db.prepare('SELECT revision,confirmation_token,confirmation_expires FROM luxmed_availability WHERE user_id=?').get(userId) as any;
                 if (!row || row.revision !== Number(revisionText) || row.confirmation_token !== token || row.confirmation_expires < Date.now()) throw new Error('This confirmation expired. Request a new preview.');
-                const expectedAutoMonitorIds = smartStore.sidecarMonitorPreview(userId, monitor.id, monitor.accountId,
+                const staged = smartStore.sidecarMonitorPreview(userId, monitor.id, monitor.accountId,
                     { token, revision: Number(revisionText) });
-                if (!expectedAutoMonitorIds) throw new Error('The sidecar monitor list was not confirmed. Request a new preview.');
+                if (!staged || staged.monitorFingerprint !== monitorRulesFingerprint(monitor))
+                    throw new Error('Monitor booking rules changed or were not confirmed. Request a new preview.');
+                const providerIdentity = await verifiedMonitorIdentity(monitor);
+                if (providerIdentity.fingerprint !== staged.providerIdentityFingerprint
+                    || providerIdentity.serviceName !== staged.providerServiceName)
+                    throw new Error('LuxMed changed the selected service, city or doctors. Request a new preview.');
+                if (verifiedSelectedClinics(monitor, providerIdentity.cityName).fingerprint !== staged.clinicIdentityFingerprint)
+                    throw new Error('A selected clinic changed since the preview. Request a new preview.');
                 const accepted = smartStore.db.transaction(() => {
+                    const currentMonitor = getActiveLuxmedMonitoringsByUser(userId).find(m => m.id === monitor.id && m.accountId === monitor.accountId);
+                    if (!currentMonitor || monitorRulesFingerprint(currentMonitor) !== staged.monitorFingerprint)
+                        throw new Error('Monitor booking rules changed. Request a new preview.');
+                    if (verifiedSelectedClinics(currentMonitor, providerIdentity.cityName).fingerprint !== staged.clinicIdentityFingerprint)
+                        throw new Error('A selected clinic changed. Request a new preview.');
                     const otherLegacy = otherLegacyBotAutoMonitors(monitor.accountId, monitor.id);
                     if (otherLegacy.length) throw new Error(`Stop other existing automatic bot monitors on this LuxMed account first: ${otherLegacy.map(m => m.id).join(', ')}.`);
                     if (!smartStore.confirm(userId, token, Number(revisionText))) return false;
@@ -80,29 +121,44 @@ export function initSmartBookingTools(bot: TelegramBot): void {
                 })();
                 if (!accepted) throw new Error('Availability changed. Request a new preview.');
                 activatingMonitorId = monitorId;
-                await luxmedEnrollSmartAccount(monitor.accountId, expectedAutoMonitorIds);
+                await luxmedEnrollSmartAccount(monitor.accountId, staged.autoMonitorIds);
                 if ((await luxmedGetMonitorings(monitor.accountId)).some(m => m.active && m.autobook)) {
                     throw new Error('A sidecar automatic monitor is still active. Smart booking remains paused.');
                 }
                 await smartBooking.refreshReservations(monitor.accountId, monitorReservationCoverage(monitor), true);
+                const finalIdentity = await verifiedMonitorIdentity(monitor);
+                if (finalIdentity.fingerprint !== staged.providerIdentityFingerprint)
+                    throw new Error('LuxMed changed the selected service, city or doctors during activation. Smart booking remains paused.');
+                if (verifiedSelectedClinics(monitor, finalIdentity.cityName).fingerprint !== staged.clinicIdentityFingerprint)
+                    throw new Error('A selected clinic changed during activation. Request a new preview.');
                 const current = smartStore.policy(userId);
                 if (!current || current.state !== 'activating' || current.holdToken || current.revision !== Number(revisionText)
                     || smartStore.accountTransition(userId)
                     || (smartStore.db.prepare('SELECT account_id FROM luxmed_accounts WHERE user_id=?').get(userId) as { account_id: number } | undefined)?.account_id !== monitor.accountId
-                    || !getActiveLuxmedMonitoringsByUser(userId).some(m => m.id === monitor.id && m.accountId === monitor.accountId))
+                    || !getActiveLuxmedMonitoringsByUser(userId).some(m => m.id === monitor.id && m.accountId === monitor.accountId
+                        && monitorRulesFingerprint(m) === staged.monitorFingerprint))
                     throw new Error('Availability or monitoring changed during activation. Smart booking remains paused.');
                 const activated = smartStore.db.transaction(() => {
+                    const currentMonitor = getActiveLuxmedMonitoringsByUser(userId).find(m => m.id === monitor.id && m.accountId === monitor.accountId);
+                    if (!currentMonitor || monitorRulesFingerprint(currentMonitor) !== staged.monitorFingerprint)
+                        throw new Error('Monitor booking rules changed during activation. Smart booking remains paused.');
+                    if (verifiedSelectedClinics(currentMonitor, finalIdentity.cityName).fingerprint !== staged.clinicIdentityFingerprint)
+                        throw new Error('A selected clinic changed during activation. Request a new preview.');
                     const changed = smartStore.db.prepare("UPDATE luxmed_availability SET state='confirmed' WHERE user_id=? AND revision=? AND state='activating' AND hold_token IS NULL")
                         .run(userId, Number(revisionText)).changes;
                     if (!changed) return false;
-                    const monitorChanged = smartStore.db.prepare("UPDATE luxmed_smart_monitors SET state='active',status='Monitoring with confirmed availability',next_check=0 WHERE monitoring_id=? AND user_id=? AND state='activating'")
-                        .run(monitorId, userId).changes;
+                    smartStore.db.prepare('UPDATE luxmed_monitorings SET service_name=? WHERE id=? AND user_id=? AND account_id=?')
+                        .run(staged.providerServiceName, monitorId, userId, monitor.accountId);
+                    const monitorChanged = smartStore.db.prepare("UPDATE luxmed_smart_monitors SET state='active',status='Monitoring with confirmed availability',next_check=0,confirmed_fingerprint=?,confirmed_provider_fingerprint=?,confirmed_clinic_fingerprint=? WHERE monitoring_id=? AND user_id=? AND state='activating'")
+                        .run(staged.monitorFingerprint, staged.providerIdentityFingerprint, staged.clinicIdentityFingerprint, monitorId, userId).changes;
                     if (monitorChanged !== 1) throw new Error('Monitoring changed during activation.');
+                    smartStore.notify(`activation-confirmed:${monitorId}:${Number(revisionText)}`, userId,
+                        `Smart monitoring is active for LuxMed service ${staged.providerServiceName} (ID ${monitor.serviceId}). I will book a suitable appointment automatically${monitor.autobook ? '' : ' only when you request it; this monitor sends notifications'}.`);
                     return true;
                 })();
                 if (!activated) throw new Error('Availability changed during activation. Smart booking remains paused.');
-                await bot.answerCallbackQuery(query.id, { text: 'Availability confirmed. Smart monitoring is active.' });
-                await bot.sendMessage(userId, `Smart monitoring is active for ${monitor.serviceName}. I will book a suitable appointment automatically${monitor.autobook ? '' : ' only when you request it; this monitor sends notifications'}.`);
+                activatingMonitorId = null;
+                await bot.answerCallbackQuery(query.id, { text: 'Availability confirmed. Smart monitoring is active.' }).catch(() => { });
             } catch (error) {
                 const message = error instanceof Error ? error.message : 'Confirmation failed';
                 if (activatingMonitorId) {
@@ -168,27 +224,35 @@ export const LuxmedPreviewAvailability: Tool = {
         if (!telegram) throw new Error('Telegram confirmation is unavailable.');
         const monitor = getActiveLuxmedMonitoringsByUser(userId).find(m => m.id === monitoring_id);
         if (!monitor) throw new Error('Monitoring not found.');
+        if (monitor.rebookIfExists) return { success: false,
+            message: 'Automatic replacement is not available yet. Create a monitor without replacement before confirming smart booking.' };
         const otherLegacy = otherLegacyBotAutoMonitors(monitor.accountId, monitor.id);
         if (otherLegacy.length) return { success: false,
             message: `Stop other existing automatic bot monitors on this LuxMed account before activating smart booking: ${otherLegacy.map(m => `${m.id} (${m.service_name})`).join(', ')}. They continue their current behaviour until stopped.` };
         const issue = await smartBooking.readiness(); if (issue) return { success: false, message: issue, summary: availabilitySummary(userId) };
+        const providerIdentity = await verifiedMonitorIdentity(monitor);
         const legacy = (await luxmedGetMonitorings(monitor.accountId)).filter(m => m.active && m.autobook);
         const terms = await luxmedSearchSlots(monitor.accountId, monitor);
         const preview = await smartBooking.inspect(monitor, terms, true);
         requireCurrentConversation(userId);
         if (smartStore.policy(userId)?.revision !== preview.revision) throw new Error('Availability changed while preparing the preview. Please review it again.');
+        const selectedClinics = verifiedSelectedClinics(monitor, providerIdentity.cityName);
         const confirmation = smartStore.confirmation(userId);
         smartStore.stageSidecarMonitorPreview(userId, monitor.id, monitor.accountId, confirmation,
-            legacy.map(m => m.recordId));
+            legacy.map(m => m.recordId), monitorRulesFingerprint(monitor), providerIdentity.serviceName,
+            providerIdentity.fingerprint, selectedClinics.fingerprint);
         const english = await smartBooking.english(monitor);
         const relevantTerms = terms.filter(term => matchesMonitor(term, monitor, english));
-        const clinicText = [...new Map(relevantTerms.filter(term => !term.term.isTelemedicine)
+        const currentClinicText = [...new Map(relevantTerms.filter(term => !term.term.isTelemedicine)
             .map(term => [term.term.clinicId, term.term])).values()].map(term => {
             const id = `clinic:${monitor.cityId}:${term.clinicId}`;
             const place = smartStore.places(userId).get(id);
             const verified = !!place && smartStore.clinicVerified(userId, id, term.clinic || '', place.revision);
             return `Clinic ${term.clinicId}, ${term.clinic || 'unknown name'}: ${verified ? place!.address : 'street address not verified; these slots are excluded'}`;
         }).join('\n');
+        const selectedClinicText = selectedClinics.identities.map(clinic =>
+            `Selected exact clinic ${clinic.clinicId}, ${clinic.sourceLabel}: ${clinic.address}`).join('\n');
+        const clinicText = [selectedClinicText, currentClinicText].filter(Boolean).join('\n');
         const incompletePreparation = relevantTerms.filter(term => requiresPreparation(term) && !preparationFacts(term)).length;
         const preparations = smartStore.stagePreparation(userId, confirmation.token, confirmation.revision, relevantTerms);
         const preparationText = preparations.map(fact => `Preparation for service ${fact.serviceId} at clinic ${fact.clinicId}:\n${fact.items.map(item => `${item.header ? `${item.header}: ` : ''}${item.text}`).join('\n')}`).join('\n');
@@ -197,7 +261,7 @@ export const LuxmedPreviewAvailability: Tool = {
             const leave = DateTime.fromMillis(c.leaveAt, { zone: BOOKING_ZONE }).toFormat('HH:mm');
             return `${time}: leave by ${leave}, ${Math.ceil(c.travelSeconds / 60)} minutes travelling, ${c.taxiLegs} taxi legs.`;
         });
-         const text = `${availabilitySummary(userId)}\n\nMonitor: ${monitor.serviceName}, ${monitor.dateFrom} to ${monitor.dateTo}, ${monitor.timeFrom} to ${monitor.timeTo}. ${monitor.autobook ? 'Automatic booking' : 'Notifications only'}. Replace an existing appointment: ${monitor.rebookIfExists ? 'yes' : 'no'}.\n${monitorFilterSummary(monitor)}\nSidecar automatic monitors that will be stopped: ${legacy.map(m => `#${m.recordId} ${m.serviceName}`).join(', ') || 'none'}.\n${clinicText ? `Clinics and verified street addresses:\n${clinicText}\n` : ''}${preparationText ? `Confirm these exact preparation instructions:\n${preparationText}\n` : ''}${incompletePreparation ? `${incompletePreparation} slot(s) have incomplete preparation details and cannot be booked automatically.\n` : ''}Preview: ${preview.candidates.length} currently verified suitable slots.\n${examples.join('\n')}\nConfirm these rules to activate this monitor.`;
+        const text = `${availabilitySummary(userId)}\n\nMonitor: LuxMed service ${providerIdentity.serviceName} (ID ${monitor.serviceId}) in ${providerIdentity.cityName} (ID ${monitor.cityId}), ${monitor.dateFrom} to ${monitor.dateTo}, ${monitor.timeFrom} to ${monitor.timeTo}. ${monitor.autobook ? 'Automatic booking' : 'Notifications only'}. Replace an existing appointment: ${monitor.rebookIfExists ? 'yes' : 'no'}.\n${monitorFilterSummary(monitor, providerIdentity.doctorNames)}\nSidecar automatic monitors that will be stopped: ${legacy.map(m => `#${m.recordId} ${m.serviceName}`).join(', ') || 'none'}.\n${clinicText ? `Clinics and verified street addresses:\n${clinicText}\n` : ''}${preparationText ? `Confirm these exact preparation instructions:\n${preparationText}\n` : ''}${incompletePreparation ? `${incompletePreparation} slot(s) have incomplete preparation details and cannot be booked automatically.\n` : ''}Preview: ${preview.candidates.length} currently verified suitable slots.\n${examples.join('\n')}\nConfirm these rules to activate this monitor.`;
         const chunks:string[] = []; let chunk = '';
         for (const line of text.split('\n')) {
             if (chunk.length + line.length > 3500) { chunks.push(chunk); chunk = ''; }

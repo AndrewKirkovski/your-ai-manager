@@ -82,6 +82,19 @@ def client(secret=None, expected_failure=False, smart=False, persisted=False,
     print(result.stdout, flush=True)
 
 
+def booking_route_probe(path, expected):
+    # The v4 probe omits attemptId and must fail before provider work. The old
+    # POST includes an ID but must return a definite upgrade-required outcome.
+    result = docker('run', '--rm', '--network', NETWORK,
+                    '-e', f'SIDECAR_PROBE_URL=http://{SIDECAR}:8080',
+                    '-e', f'SIDECAR_PROBE_SECRET={ENCRYPTION_SECRET}',
+                    '-e', f'SIDECAR_PROBE_PATH={path}',
+                    '-e', f'SIDECAR_PROBE_EXPECT={expected}',
+                    '-v', f'{ROOT / "tests"}:/app/tests:ro',
+                    BOT_IMAGE, 'node', '/app/tests/luxmed-upgrade-route-probe.mjs')
+    print(result.stdout, flush=True)
+
+
 def watchtower(*containers):
     result = docker('run', '--rm', '-v', '/var/run/docker.sock:/var/run/docker.sock',
                     '-e', f'DOCKER_API_VERSION={docker("version", "--format", "{{.Server.APIVersion}}").stdout.strip()}',
@@ -166,6 +179,8 @@ try:
     if os.environ.get('REHEARSAL_V2_BASELINE') == 'true' and not v2_baseline:
         raise AssertionError(f'Expected a v2 baseline, found migration counts {migrations}')
     print(f'Watched sidecar baseline: {"v2" if v2_baseline else "other"} (migration counts {migrations}).', flush=True)
+    if migrations in ('0:0', '1:0'):
+        booking_route_probe('/api/v1/accounts/424259/booking-attempts/v4', 'absent')
     # The new bot can still read the old sidecar while waiting for capabilities.
     client(legacy_read=BASELINE_READABLE and not v2_baseline and not LEGACY_SMART_BASELINE,
            legacy_smart=LEGACY_SMART_BASELINE,
@@ -207,6 +222,14 @@ try:
     for key in ('REST_SECRET', 'DB_PASSWORD', 'DB_USER', 'DB_NAME'):
         assert key not in updated_env, f'New configuration was unexpectedly injected: {key}'
     wait_health()
+    booking_route_probe('/api/v1/accounts/424259/booking-attempts', 'held')
+    booking_route_probe('/api/v1/accounts/424259/booking-attempts/v4', 'present')
+    assert docker('exec', DB, 'psql', '-U', 'lbs', '-d', 'lbs', '-Atc',
+                  'SELECT COUNT(*) FROM booking_attempt WHERE account_id=424259').stdout.strip() == '0'
+    print('Mixed-image smart booking hold: the old bot receives BOT_UPGRADE_REQUIRED '
+          'without a provider attempt.', flush=True)
+    if migrations in ('0:0', '1:0'):
+        print('The old sidecar has no v4 booking POST route.', flush=True)
     if v2_baseline:
         client(image=legacy_bot if ORDER == 'sidecar-first' else BOT_IMAGE, legacy_read=True,
                legacy_barrier_ack='v1' if ORDER == 'sidecar-first' else 'v2')

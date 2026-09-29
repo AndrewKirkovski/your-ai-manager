@@ -1397,7 +1397,7 @@ export interface LuxmedMonitoringConfig {
     createdAt: string;
 }
 
-function rowToMonitoringConfig(row: any): LuxmedMonitoringConfig {
+export function rowToMonitoringConfig(row: any): LuxmedMonitoringConfig {
     return {
         id: row.id,
         userId: row.user_id,

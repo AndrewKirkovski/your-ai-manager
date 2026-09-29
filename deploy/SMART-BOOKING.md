@@ -79,8 +79,12 @@ until the new bot verifies and acknowledges the reservation. This prevents a
 duplicate retry but can interrupt legacy booking if the bot update fails.
 An old v2 bot cannot supply the exact reservation facts required by a v4
 sidecar. A sidecar-first update therefore pauses its automatic smart booking
-until Watchtower replaces the bot. This is a safe service pause, not continuous
-booking availability.
+until Watchtower replaces the bot. Its unversioned booking POST receives a
+definite `BOT_UPGRADE_REQUIRED` failure before any LuxMed provider call. In the
+opposite image order, the new bot's `/booking-attempts/v4` POST has no matching
+route on the v2 sidecar, so smart booking waits for the sidecar update. This is
+a safe service pause, not continuous booking availability. The Watchtower
+rehearsal checks both paths with fixture requests that cannot book a visit.
 The current bot also requires the sidecar's `smart-booking-lockterm-review-v1`
 capability. A bot-first update pauses smart booking until the sidecar checks
 LuxMed's lockterm warnings, doctor identity, referral and procedure flags.

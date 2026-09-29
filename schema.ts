@@ -142,13 +142,35 @@ export function applyColumnMigrations(db: Database.Database): void {
     {
         const cols = db.prepare('PRAGMA table_info(luxmed_smart_monitors)').all() as { name: string }[];
         if (!cols.some(c => c.name === 'desired_autobook')) db.exec('ALTER TABLE luxmed_smart_monitors ADD COLUMN desired_autobook INTEGER');
+        if (!cols.some(c => c.name === 'confirmed_fingerprint')) db.exec('ALTER TABLE luxmed_smart_monitors ADD COLUMN confirmed_fingerprint TEXT');
+        if (!cols.some(c => c.name === 'confirmed_provider_fingerprint')) db.exec('ALTER TABLE luxmed_smart_monitors ADD COLUMN confirmed_provider_fingerprint TEXT');
+        if (!cols.some(c => c.name === 'confirmed_clinic_fingerprint')) db.exec('ALTER TABLE luxmed_smart_monitors ADD COLUMN confirmed_clinic_fingerprint TEXT');
         db.transaction(() => {
             db.exec(`UPDATE luxmed_smart_monitors SET desired_autobook=(
                 SELECT autobook FROM luxmed_monitorings WHERE id=monitoring_id)
                 WHERE desired_autobook IS NULL`);
             db.exec(`UPDATE luxmed_monitorings SET autobook=0 WHERE id IN (
                 SELECT monitoring_id FROM luxmed_smart_monitors WHERE desired_autobook IS NOT NULL)`);
+            // Earlier previews did not show the exact monitor filters. Require
+            // those enrollments to be reviewed under the new confirmation flow.
+            db.exec(`UPDATE luxmed_smart_monitors SET state='paused',
+                status='Review monitor filters and confirm availability again'
+                WHERE state IN ('active','activating') AND confirmed_fingerprint IS NULL`);
+            db.exec(`UPDATE luxmed_smart_monitors SET state='paused',
+                status='Review provider identity and confirm availability again'
+                WHERE state IN ('active','activating') AND confirmed_provider_fingerprint IS NULL`);
+            db.exec(`UPDATE luxmed_smart_monitors SET state='paused',
+                status='Review selected clinic identities and confirm availability again'
+                WHERE state IN ('active','activating') AND confirmed_clinic_fingerprint IS NULL
+                AND EXISTS (SELECT 1 FROM luxmed_monitorings m WHERE m.id=monitoring_id AND m.clinic_ids IS NOT NULL)`);
         })();
+    }
+    {
+        const cols = db.prepare('PRAGMA table_info(luxmed_sidecar_monitor_previews)').all() as { name: string }[];
+        if (!cols.some(c => c.name === 'monitor_fingerprint')) db.exec('ALTER TABLE luxmed_sidecar_monitor_previews ADD COLUMN monitor_fingerprint TEXT');
+        if (!cols.some(c => c.name === 'provider_service_name')) db.exec('ALTER TABLE luxmed_sidecar_monitor_previews ADD COLUMN provider_service_name TEXT');
+        if (!cols.some(c => c.name === 'provider_identity_fingerprint')) db.exec('ALTER TABLE luxmed_sidecar_monitor_previews ADD COLUMN provider_identity_fingerprint TEXT');
+        if (!cols.some(c => c.name === 'clinic_identity_fingerprint')) db.exec('ALTER TABLE luxmed_sidecar_monitor_previews ADD COLUMN clinic_identity_fingerprint TEXT');
     }
 }
 

@@ -4,11 +4,12 @@ import { smartStore, SmartBookingStore, digest, requiresPreparation, snapshotCov
 import { TravelCache, queueTravelRequest } from './luxmedTravel';
 import { rankWithJev } from './luxmedJev';
 import { providerStreetMatches, providerCityMatches, resolveStreetAddress } from './googleRoutes';
-import { LuxmedApiError, luxmedCapabilities, luxmedGetReserved, luxmedGetDoctors, luxmedGetCities, luxmedGetMonitorings, luxmedBookSlot, luxmedBookingAttempt, luxmedAcknowledgeBookingAttempt, luxmedLegacyBookingBarrier, luxmedAcknowledgeLegacyBooking, luxmedCancellationReceipts, luxmedAcknowledgeMovedVisit, type BookingOutcome, type BookingReservationFact, type LuxmedTerm, type LuxmedEvent } from './luxmedAdapter';
-import { getActiveLuxmedMonitoringsByUser, type LuxmedMonitoringConfig } from './userStore';
+import { LuxmedApiError, luxmedCapabilities, luxmedGetReserved, luxmedGetDoctors, luxmedGetCities, luxmedGetServices, luxmedGetMonitorings, luxmedBookSlot, luxmedBookingAttempt, luxmedAcknowledgeBookingAttempt, luxmedLegacyBookingBarrier, luxmedAcknowledgeLegacyBooking, luxmedCancellationReceipts, luxmedAcknowledgeMovedVisit, type BookingOutcome, type BookingReservationFact, type LuxmedTerm, type LuxmedEvent } from './luxmedAdapter';
+import { providerIdentityFingerprint, selectedDoctorNames, uniqueCityName, uniqueServiceName } from './luxmedProviderIdentity';
+import { rowToMonitoringConfig, type LuxmedMonitoringConfig } from './userStore';
 
 export const smartDependencies = {
-    capabilities: luxmedCapabilities, reserved: luxmedGetReserved, doctors: luxmedGetDoctors, cities: luxmedGetCities, monitorings: luxmedGetMonitorings,
+    capabilities: luxmedCapabilities, reserved: luxmedGetReserved, doctors: luxmedGetDoctors, cities: luxmedGetCities, services: luxmedGetServices, monitorings: luxmedGetMonitorings,
     book: luxmedBookSlot, attempt: luxmedBookingAttempt, acknowledgeAttempt: luxmedAcknowledgeBookingAttempt,
     legacyBarrier: luxmedLegacyBookingBarrier,
     acknowledgeLegacy: luxmedAcknowledgeLegacyBooking, cancellations: luxmedCancellationReceipts,
@@ -92,6 +93,12 @@ export function monitorReservationCoverage(config: LuxmedMonitoringConfig): Rese
     const to = zonedTime(/^\d{4}-\d{2}-\d{2}$/.test(config.dateTo) ? `${config.dateTo}T23:59:59` : config.dateTo);
     return reservationCoverage(from, to);
 }
+export function monitorRulesFingerprint(config: LuxmedMonitoringConfig): string {
+    return digest([config.userId, config.accountId, config.serviceId, config.cityId,
+        config.clinicIds, config.doctorIds, config.englishOnly, config.dateFrom, config.dateTo,
+        config.timeFrom, config.timeTo, config.autobook, config.rebookIfExists,
+        config.maxTransitMinutes ?? null]);
+}
 export function matchesMonitor(term: LuxmedTerm, c: LuxmedMonitoringConfig, englishIds?: Set<number>): boolean {
     const t = term.term, s = slotFromTerm(term, c.cityId);
     if (t.isImpediment !== false || !!t.impedimentText?.trim()
@@ -136,9 +143,42 @@ export class SmartBookingCoordinator {
         return row?.account_id === accountId && !this.store.accountTransition(userId);
     }
     private activeMonitor(config: LuxmedMonitoringConfig): boolean {
-        const row = this.store.db.prepare('SELECT active FROM luxmed_monitorings WHERE id=? AND user_id=? AND account_id=?')
-            .get(config.id, config.userId, config.accountId) as { active: number } | undefined;
-        return row?.active === 1 && this.store.enrollment(config.id)?.state === 'active';
+        const row = this.store.db.prepare(`SELECT m.*,s.desired_autobook AS smart_autobook FROM luxmed_monitorings m
+            LEFT JOIN luxmed_smart_monitors s ON s.monitoring_id=m.id
+            WHERE m.id=? AND m.user_id=? AND m.account_id=? AND m.active=1`)
+            .get(config.id, config.userId, config.accountId);
+        if (!row) return false;
+        let current: LuxmedMonitoringConfig;
+        try { current = rowToMonitoringConfig(row); }
+        catch { return false; }
+        const enrollment = this.store.enrollment(config.id);
+        if (current.clinicIds !== null) {
+            const clinics = this.store.selectedClinicIdentities(config.userId, config.cityId, current.clinicIds);
+            if (!clinics || !enrollment?.confirmed_clinic_fingerprint
+                || digest(clinics) !== enrollment.confirmed_clinic_fingerprint) return false;
+        }
+        return enrollment?.state === 'active'
+            && enrollment.confirmed_fingerprint === monitorRulesFingerprint(current)
+            && monitorRulesFingerprint(current) === monitorRulesFingerprint(config);
+    }
+    private async providerIdentityIssue(config: LuxmedMonitoringConfig): Promise<string | null> {
+        const expected = this.store.enrollment(config.id)?.confirmed_provider_fingerprint;
+        if (!expected) return 'The confirmed LuxMed service, city and doctor identities are missing. Request a new preview.';
+        const [services, cities, doctors] = await Promise.all([
+            this.api.services(config.accountId), this.api.cities(config.accountId),
+            config.doctorIds === null ? Promise.resolve([]) : this.api.doctors(config.accountId, config.cityId, config.serviceId),
+        ]);
+        const serviceName = uniqueServiceName(services, config.serviceId);
+        const cityName = uniqueCityName(cities, config.cityId);
+        const doctorNames = selectedDoctorNames(doctors, config.doctorIds);
+        if (!serviceName || !cityName || !doctorNames
+            || providerIdentityFingerprint(config.serviceId, serviceName, config.cityId, cityName, doctorNames) !== expected
+            || serviceName !== config.serviceName || cityName !== config.cityName) {
+            this.store.db.prepare("UPDATE luxmed_smart_monitors SET state='paused',status='LuxMed service, city or doctor identity changed; confirm a new preview' WHERE monitoring_id=? AND state='active' AND confirmed_provider_fingerprint=?")
+                .run(config.id, expected);
+            return 'LuxMed changed a selected service, city or doctor. Smart booking is paused until a new preview is confirmed.';
+        }
+        return null;
     }
     cache(userId: number): TravelCache {
         let cache = this.travel.get(userId);
@@ -578,6 +618,11 @@ export class SmartBookingCoordinator {
                     // or the facts Jev used. Rank the verified candidates again.
                     remaining = remaining.map(value => value === candidate ? rechecked : value);
                     continue;
+                }
+                if (!manual) {
+                    const providerIssue = await this.providerIdentityIssue(config)
+                        .catch(() => 'LuxMed provider identities could not be verified. Smart booking is waiting.');
+                    if (providerIssue) return { state: 'waiting', message: providerIssue };
                 }
                 // All awaits are complete. Recheck synchronously immediately before persistence/submission.
                 const latest = this.store.policy(config.userId);

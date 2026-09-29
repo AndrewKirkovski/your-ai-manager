@@ -150,10 +150,12 @@ export interface LuxmedMonitoring {
 const accountBackoff = new Map<string,{until:number;failures:number}>();
 async function sidecarRequest<T>(method: string, path: string, body?: unknown, guard?:()=>boolean): Promise<T> {
     const accountId=/\/accounts\/(\d+)\//.exec(path)?.[1];
+    const bookingSubmission=method==='POST' && (path.endsWith('/book') || path.endsWith('/booking-attempts')
+        || path.endsWith('/booking-attempts/v4'));
     const run=async()=>{
         if(guard&&!guard())throw new LuxmedApiError('Availability changed before submission','BOOKING_GUARD_CHANGED');
         const backoff=accountId ? accountBackoff.get(accountId) : undefined;
-        const upstream=!!accountId&&!path.includes('/booking-attempts/');
+        const upstream=!!accountId&&(bookingSubmission||!path.includes('/booking-attempts/'));
         if(upstream&&backoff&&backoff.until>Date.now()) {
             const error=new LuxmedApiError('LuxMed account is waiting before another request','ACCOUNT_BACKOFF',429);
             error.retryAfterMs=backoff.until-Date.now();throw error;
@@ -171,7 +173,7 @@ async function sidecarRequest<T>(method: string, path: string, body?: unknown, g
             throw error;
         }
     };
-    return accountId ? luxmedAccountQueue.run(Number(accountId),path.endsWith('/book')||path.endsWith('/booking-attempts')?10:path.includes('visits/reserved')?5:0,run) : run();
+    return accountId ? luxmedAccountQueue.run(Number(accountId),bookingSubmission?10:path.includes('visits/reserved')?5:0,run) : run();
 }
 async function requestSidecar<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${SIDECAR_URL}${path}`;
@@ -346,7 +348,7 @@ export async function luxmedBookSlot(accountId: number, term: LuxmedTerm, cityId
     const t = term.term;
     const dateTimeFrom = t.dateTimeFrom.dateTimeLocal || t.dateTimeFrom.dateTimeTz || '';
     const dateTimeTo = t.dateTimeTo.dateTimeLocal || t.dateTimeTo.dateTimeTz || '';
-    return sidecarRequest('POST', `/api/v1/accounts/${accountId}/${attemptId ? 'booking-attempts' : 'book'}`, {
+    return sidecarRequest('POST', `/api/v1/accounts/${accountId}/${attemptId ? 'booking-attempts/v4' : 'book'}`, {
         cityId,
         clinicId: t.clinicId,
         clinicGroupId: t.clinicGroupId,

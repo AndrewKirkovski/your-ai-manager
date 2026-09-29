@@ -3,6 +3,7 @@ import { smartStore } from './luxmedSmartStore';
 import { smartBooking } from './luxmedSmartBooking';
 import { validBookingTimeRange, zonedTime } from './luxmedAvailability';
 import { textify } from './telegramFormat';
+import { uniqueCityName, uniqueServiceName } from './luxmedProviderIdentity';
 import {
     luxmedLogin, luxmedGetCities, luxmedGetServices,
     luxmedSearchSlots, luxmedCancelVisit, luxmedCancellationReceipts, luxmedGetReserved, luxmedCapabilities,
@@ -16,32 +17,13 @@ import {
     getUserAddress, saveUserAddress, getLuxmedClinicByName, saveLuxmedClinic,
 } from './userStore';
 
-// Cache valid service IDs per account to catch AI hallucinations
-const serviceIdCache = new Map<number, { ids: Set<number>; expires: number }>();
-
 async function validateServiceId(accountId: number, serviceId: number): Promise<string | null> {
-    let cached = serviceIdCache.get(accountId);
-    if (!cached || Date.now() > cached.expires) {
-        try {
-            const services = await luxmedGetServices(accountId);
-            const ids = new Set<number>();
-            const flatten = (list: any[]) => {
-                for (const s of list) {
-                    if (s.id != null) ids.add(s.id);
-                    if (s.children?.length) flatten(s.children);
-                }
-            };
-            flatten(services);
-            cached = { ids, expires: Date.now() + 60 * 60 * 1000 }; // 1 hour
-            serviceIdCache.set(accountId, cached);
-        } catch {
-            return null; // can't validate, let it through
-        }
+    try {
+        return uniqueServiceName(await luxmedGetServices(accountId), serviceId) ? null
+            : `Service ID ${serviceId} is missing or ambiguous in LuxMed. Use LuxmedListServices to choose the correct ID.`;
+    } catch {
+        return 'Could not verify the LuxMed service. Try again when the provider dictionary is available.';
     }
-    if (!cached.ids.has(serviceId)) {
-        return `Service ID ${serviceId} not found. Use LuxmedListServices to find the correct ID.`;
-    }
-    return null;
 }
 
 function requireAccount(userId: number): number {
@@ -559,12 +541,20 @@ export const LuxmedMonitorSlot: Tool = {
     execute: async (args: { userId: number; service_id: number; service_name: string; city_id?: number; city_name?: string; clinic_ids?: string; doctor_ids?: string; english_only?: string; date_from: string; date_to: string; time_from: string; time_to: string; max_transit_minutes?: number; autobook?: string; rebook_if_exists?: string }) => {
         const accountId = requireAccount(args.userId);
         const prefs = getLuxmedPreferences(args.userId);
-        const cityId = args.city_id || prefs.defaultCityId;
-        if (!cityId) {
+        const cityId = args.city_id == null ? prefs.defaultCityId : args.city_id;
+        if (typeof cityId !== 'number' || !Number.isSafeInteger(cityId) || cityId <= 0) {
             return { success: false, message: 'City not specified and no default city set.' };
         }
-        const serviceError = await validateServiceId(accountId, args.service_id);
-        if (serviceError) return { success: false, message: serviceError };
+        let serviceName: string, cityName: string;
+        try {
+            const [services, cities] = await Promise.all([luxmedGetServices(accountId), luxmedGetCities(accountId)]);
+            serviceName = uniqueServiceName(services, args.service_id) || '';
+            cityName = uniqueCityName(cities, cityId) || '';
+        } catch {
+            return { success: false, message: 'Could not verify the LuxMed service and city. Try again when the provider dictionary is available.' };
+        }
+        if (!serviceName) return { success: false, message: `Service ID ${args.service_id} is missing or ambiguous in LuxMed. Use LuxmedListServices to choose the correct ID.` };
+        if (!cityName) return { success: false, message: `City ID ${cityId} is missing or ambiguous in LuxMed. Use LuxmedListCities to choose the correct ID.` };
 
         let clinicIds: number[] | null, doctorIds: number[] | null;
         let englishOnly: boolean, autobook: boolean, rebookIfExists: boolean;
@@ -578,7 +568,6 @@ export const LuxmedMonitorSlot: Tool = {
             return { success: false, message: error instanceof Error ? error.message : 'Invalid clinic or doctor IDs.' };
         }
 
-        const serviceName = textify(args.service_name);
         if (!validBookingTimeRange(args.time_from, args.time_to))
             return { success: false, message: 'time_from and time_to must be valid HH:mm values in ascending order.' };
         const parsedDateFrom = new Date(args.date_from);
@@ -590,8 +579,6 @@ export const LuxmedMonitorSlot: Tool = {
         if (maxTransitMinutes != null && (!Number.isFinite(maxTransitMinutes) || maxTransitMinutes < 0)) {
             return { success: false, message: 'max_transit_minutes must be a finite non-negative number.' };
         }
-        const cityName = textify(args.city_name) || prefs.defaultCityName || 'Unknown';
-
         console.log(`[LuxMed] Creating monitoring: ${serviceName}, city=${cityId}, time=${args.time_from}-${args.time_to}, clinics=${clinicIds?.join(',') ?? 'any'}, doctors=${doctorIds?.join(',') ?? 'any'}, english=${englishOnly}, autobook=${autobook}`);
         const monitoring = smartStore.db.transaction(() => {
         const created = createLuxmedMonitoring({
@@ -625,7 +612,7 @@ export const LuxmedMonitorSlot: Tool = {
 
         return {
             success: true,
-            message: `Monitoring prepared (${monitoring.id}): ${serviceName}, ${args.time_from}-${args.time_to}.${filterStr} When can you book? Confirm availability and locations using LuxmedDraftAvailability, then send LuxmedPreviewAvailability. Booking remains disabled until the user clicks Confirm.`,
+            message: `Monitoring prepared (${monitoring.id}): LuxMed service ${serviceName} (ID ${args.service_id}) in ${cityName} (ID ${cityId}), ${args.time_from}-${args.time_to}.${filterStr} When can you book? Confirm availability and locations using LuxmedDraftAvailability, then send LuxmedPreviewAvailability. Booking remains disabled until the user clicks Confirm.`,
             monitoring_id:monitoring.id,
         };
     },

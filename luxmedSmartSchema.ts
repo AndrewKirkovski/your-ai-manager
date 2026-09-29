@@ -7,13 +7,16 @@ CREATE TABLE IF NOT EXISTS luxmed_availability (
 CREATE TABLE IF NOT EXISTS luxmed_sidecar_monitor_previews (
     user_id INTEGER PRIMARY KEY REFERENCES users(user_id), monitoring_id TEXT NOT NULL,
     account_id INTEGER NOT NULL, policy_revision INTEGER NOT NULL,
-    confirmation_token TEXT NOT NULL, auto_monitor_ids TEXT NOT NULL
+    confirmation_token TEXT NOT NULL, auto_monitor_ids TEXT NOT NULL,
+    monitor_fingerprint TEXT, provider_service_name TEXT, provider_identity_fingerprint TEXT,
+    clinic_identity_fingerprint TEXT
 );
 CREATE TABLE IF NOT EXISTS luxmed_smart_monitors (
     monitoring_id TEXT PRIMARY KEY REFERENCES luxmed_monitorings(id), user_id INTEGER NOT NULL,
     state TEXT NOT NULL DEFAULT 'draft', status TEXT NOT NULL DEFAULT 'When can you book?',
     next_check INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
-    desired_autobook INTEGER
+    desired_autobook INTEGER, confirmed_fingerprint TEXT,
+    confirmed_provider_fingerprint TEXT, confirmed_clinic_fingerprint TEXT
 );
 CREATE TABLE IF NOT EXISTS luxmed_smart_places (
     user_id INTEGER NOT NULL, id TEXT NOT NULL, revision TEXT NOT NULL,
