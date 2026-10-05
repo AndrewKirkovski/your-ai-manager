@@ -4,6 +4,7 @@
  */
 
 import { createHmac } from 'node:crypto';
+import { DateTime } from 'luxon';
 import { luxmedAccountQueue } from './luxmedAccountQueue';
 
 const SIDECAR_URL = process.env.LUXMED_SIDECAR_URL || 'http://localhost:8080';
@@ -149,6 +150,16 @@ export interface LuxmedMonitoring {
 
 const accountBackoff = new Map<string,{until:number;failures:number}>();
 const bookingOutcomeBackoff = new Map<string,{until:number;failures:number}>();
+export function parseLuxmedRetryAfter(value: string | null, now = Date.now()): number | undefined {
+    if (value === null) return undefined;
+    const header = value.trim();
+    if (/^\d+$/.test(header)) {
+        const delay = Number(header) * 1000;
+        return Number.isSafeInteger(delay) && Number.isSafeInteger(now + delay) ? delay : undefined;
+    }
+    const date = DateTime.fromHTTP(header, { zone: 'UTC' });
+    return date.isValid ? Math.max(0, date.toMillis() - now) : undefined;
+}
 function failedBeforeSidecarDispatch(error: unknown): boolean {
     const seen = new Set<unknown>();
     const inspect = (value: unknown): boolean => {
@@ -242,8 +253,7 @@ async function requestSidecar<T>(method: string, path: string, body?: unknown): 
         const elapsed = Date.now() - start;
         console.error(`[LuxMed API] ${method} ${path} ${response.status} non-JSON (${elapsed}ms)`);
         const error=new LuxmedApiError(`LuxMed API error (${response.status}): non-JSON response`, 'SIDECAR_INVALID_RESPONSE', response.status);
-        const retry=response.headers.get('Retry-After');
-        if(retry)error.retryAfterMs=/^\d+$/.test(retry)?Number(retry)*1000:Math.max(0,Date.parse(retry)-Date.now());
+        error.retryAfterMs=parseLuxmedRetryAfter(response.headers.get('Retry-After'));
         throw error;
     }
 
@@ -257,8 +267,7 @@ async function requestSidecar<T>(method: string, path: string, body?: unknown): 
             : undefined);
         console.error(`[LuxMed API] ${method} ${path} FAILED (${elapsed}ms): ${error}`);
         const apiError = new LuxmedApiError(error || `LuxMed API error (${response.status})`, code || 'LUXMED_API_ERROR', response.status);
-        const retryAfter = response.headers.get('retry-after');
-        if (retryAfter) apiError.retryAfterMs = /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now());
+        apiError.retryAfterMs = parseLuxmedRetryAfter(response.headers.get('Retry-After'));
         throw apiError;
     }
 

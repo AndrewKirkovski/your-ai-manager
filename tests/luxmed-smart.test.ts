@@ -2062,7 +2062,9 @@ test('cached inbound travel uses an earlier real connection and applies its allo
 test('scheduler combines duplicate searches and does not poll before the next due time', async () => {
     const {createLuxmedMonitoring, deactivateLuxmedMonitoring} = await import('../userStore.ts');
     const {smartBooking} = await import('../luxmedSmartBooking.ts');
-    const {runLuxmedMonitoringCycle} = await import('../luxmedMonitor.ts');
+    const {runLuxmedMonitoringCycle, smartMonitorIntervalMs} = await import('../luxmedMonitor.ts');
+    assert.equal(smartMonitorIntervalMs(() => 0), 600000);
+    assert.equal(smartMonitorIntervalMs(() => 0.999999), 900000);
     const store = new SmartBookingStore(globalDb);
     deactivateLuxmedMonitoring('confirm-test', 10);
     globalDb.prepare('INSERT OR IGNORE INTO users(user_id) VALUES (20)').run();
@@ -2071,13 +2073,21 @@ test('scheduler combines duplicate searches and does not poll before the next du
     store.verifyLocation(20, home.id, verifiedHome.revision); store.draft(20, policy);
     const confirmation = store.confirmation(20); store.confirm(20, confirmation.token, confirmation.revision);
     const date = DateTime.now().plus({days:2}).toISODate()!;
+    const endDate = DateTime.now().plus({days:33}).toISODate()!;
     for (const id of ['duplicate-a', 'duplicate-b']) {
-        createLuxmedMonitoring({id,userId:20,accountId:20,serviceId:6,serviceName:'Fixture',cityId:1,cityName:'Warszawa',clinicIds:null,doctorIds:null,englishOnly:false,dateFrom:date,dateTo:date,timeFrom:'08:00',timeTo:'20:00',autobook:true,rebookIfExists:false});
+        createLuxmedMonitoring({id,userId:20,accountId:20,serviceId:6,serviceName:'Fixture',cityId:1,cityName:'Warszawa',clinicIds:null,doctorIds:null,englishOnly:false,dateFrom:date,dateTo:endDate,timeFrom:'08:00',timeTo:'20:00',autobook:true,rebookIfExists:false});
         store.enroll(id, 20); globalDb.prepare("UPDATE luxmed_smart_monitors SET state='active' WHERE monitoring_id=?").run(id);
     }
-    const old = {fetch:globalThis.fetch,readiness:smartBooking.readiness,legacy:smartBooking.legacyMonitorIssue,refresh:smartBooking.refreshReservations,process:smartBooking.process,reconcile:smartBooking.reconcile};
+    const old = {fetch:globalThis.fetch,readiness:smartBooking.readiness,legacy:smartBooking.legacyMonitorIssue,refresh:smartBooking.refreshReservations,process:smartBooking.process,reconcile:smartBooking.reconcile,
+        refreshActive:smartBooking.refreshActiveReservations, now:Date.now, random:Math.random};
+    let clock = Date.now(); Date.now = () => clock; Math.random = () => 0;
+    smartBooking.refreshActiveReservations = async () => {};
     let searches = 0, decisions = 0;
-    globalThis.fetch = async () => { searches++; return new Response(JSON.stringify({success:true,data:[]})); };
+    const windows: {dateFrom:string;dateTo:string}[] = [];
+    globalThis.fetch = async (_url, init) => {
+        searches++; windows.push(JSON.parse(init!.body as string));
+        return new Response(JSON.stringify({success:true,data:[]}));
+    };
     smartBooking.readiness = async () => null; smartBooking.legacyMonitorIssue = async () => null; smartBooking.refreshReservations = async () => {};
     smartBooking.reconcile = async () => {};
     smartBooking.process = async () => { decisions++; return {state:'waiting',message:'Fixture'}; };
@@ -2086,11 +2096,18 @@ test('scheduler combines duplicate searches and does not poll before the next du
         await runLuxmedMonitoringCycle(); assert.equal(searches, 0); assert.equal(decisions, 0);
         globalDb.prepare('UPDATE luxmed_smart_monitors SET next_check=0 WHERE user_id=20').run();
         smartBooking.legacyMonitorIssue = async () => null;
-        await runLuxmedMonitoringCycle(); assert.equal(searches, 1); assert.equal(decisions, 2);
-        const due = store.enrollment('duplicate-a')!.next_check; assert.ok(due - Date.now() > 28000 && due - Date.now() <= 33000);
-        await runLuxmedMonitoringCycle(); assert.equal(searches, 1); assert.equal(decisions, 2);
+        await runLuxmedMonitoringCycle(); assert.equal(searches, 3); assert.equal(decisions, 2);
+        assert.ok(windows[0].dateFrom.startsWith(date));
+        assert.ok(windows[2].dateTo.startsWith(endDate));
+        assert.equal(Date.parse(windows[1].dateFrom), Date.parse(windows[0].dateTo) + 1000);
+        assert.equal(Date.parse(windows[2].dateFrom), Date.parse(windows[1].dateTo) + 1000);
+        const due = store.enrollment('duplicate-a')!.next_check; assert.equal(due - clock, 600000);
+        const reopened = new Database(globalDb.serialize());
+        assert.equal(new SmartBookingStore(reopened).enrollment('duplicate-a')!.next_check, due);
+        reopened.close();
+        await runLuxmedMonitoringCycle(); assert.equal(searches, 3); assert.equal(decisions, 2);
         globalDb.prepare('UPDATE luxmed_smart_monitors SET next_check=0 WHERE user_id=20').run();
-        await runLuxmedMonitoringCycle(); assert.equal(searches, 1); assert.equal(decisions, 4);
+        await runLuxmedMonitoringCycle(); assert.equal(searches, 3); assert.equal(decisions, 4);
         smartBooking.process = async () => { decisions++; return {state:'retryable_failure',message:'Provider did not accept preparation'}; };
         globalDb.prepare('UPDATE luxmed_smart_monitors SET next_check=0 WHERE user_id=20').run();
         await runLuxmedMonitoringCycle();
@@ -2098,14 +2115,58 @@ test('scheduler combines duplicate searches and does not poll before the next du
         for (const id of ['duplicate-a', 'duplicate-b']) {
             const enrollment = store.enrollment(id)!;
             assert.equal(enrollment.failures, 1);
-            assert.ok(enrollment.next_check - Date.now() > 50000);
+            assert.equal(enrollment.next_check - clock, 600000);
         }
         await runLuxmedMonitoringCycle(); assert.equal(decisions, 5);
+        clock += 599999;
+        await runLuxmedMonitoringCycle(); assert.equal(decisions, 5);
+        clock++;
+        Math.random = () => 0.999999;
+        smartBooking.process = async () => { decisions++; return {state:'waiting',message:'Recovered'}; };
+        await runLuxmedMonitoringCycle(); assert.equal(searches, 6); assert.equal(decisions, 7);
+        assert.equal(store.enrollment('duplicate-a')!.next_check - clock, 900000);
+        assert.equal(store.enrollment('duplicate-a')!.failures, 0);
+        deactivateLuxmedMonitoring('duplicate-b', 20);
+        Math.random = () => 0;
+        for (const retry of [null, '0', '60', '1800', 'http-date', 'broken', '-1', '1.5', 'Tue, 31 Feb 2026 12:00:00 GMT']) {
+            clock = Math.ceil((clock + 3600000) / 1000) * 1000;
+            const header = retry === 'http-date' ? new Date(clock + 1500000).toUTCString() : retry;
+            const before = globalDb.prepare("SELECT last_check,active FROM luxmed_monitorings WHERE id='duplicate-a'").get() as {last_check:string;active:number};
+            globalThis.fetch = async () => {
+                searches++;
+                return new Response(JSON.stringify({success:false,error:'LuxMed request rate limit exceeded. Try again later.'}),
+                    {status:429,headers:header === null ? {} : {'Retry-After':header}});
+            };
+            const callsBefore = searches;
+            await runLuxmedMonitoringCycle();
+            assert.equal(searches, callsBefore + 1);
+            const enrollment = store.enrollment('duplicate-a')!;
+            const delay = retry === '1800' ? 1800000 : retry === 'http-date' ? 1500000 : 600000;
+            assert.equal(enrollment.next_check, clock + delay, `Retry-After=${retry}`);
+            assert.equal(enrollment.state, 'active');
+            assert.ok(enrollment.failures > 0);
+            assert.deepEqual(globalDb.prepare("SELECT last_check,active FROM luxmed_monitorings WHERE id='duplicate-a'").get(), before);
+            clock += delay - 1;
+            await runLuxmedMonitoringCycle(); assert.equal(searches, callsBefore + 1);
+        }
     } finally {
         globalThis.fetch = old.fetch; smartBooking.readiness = old.readiness; smartBooking.legacyMonitorIssue = old.legacy; smartBooking.refreshReservations = old.refresh;
         smartBooking.process = old.process; smartBooking.reconcile = old.reconcile;
+        smartBooking.refreshActiveReservations = old.refreshActive; Date.now = old.now; Math.random = old.random;
         for (const id of ['duplicate-a', 'duplicate-b']) deactivateLuxmedMonitoring(id, 20);
     }
+});
+
+test('Retry-After accepts HTTP dates and rejects invalid deadlines', async () => {
+    const {parseLuxmedRetryAfter} = await import('../luxmedAdapter.ts');
+    assert.equal(parseLuxmedRetryAfter(null, now), undefined);
+    assert.equal(parseLuxmedRetryAfter('0', now), 0);
+    assert.equal(parseLuxmedRetryAfter('60', now), 60000);
+    assert.equal(parseLuxmedRetryAfter(new Date(now + 1800000).toUTCString(), now), 1800000);
+    for (const invalid of ['broken', '-1', '1.5', 'Infinity', '9'.repeat(100), '2026-10-06', 'Tue, 31 Feb 2026 12:00:00 GMT'])
+        assert.equal(parseLuxmedRetryAfter(invalid, now), undefined, invalid);
+    for (const past of ['Sun, 06 Nov 1994 08:49:37 GMT', 'Sunday, 06-Nov-94 08:49:37 GMT', 'Sun Nov  6 08:49:37 1994'])
+        assert.equal(parseLuxmedRetryAfter(past, now), 0);
 });
 
 test('a failed background refresh preserves the previous route and observes cooldown', async () => {

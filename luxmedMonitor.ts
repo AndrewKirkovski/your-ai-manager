@@ -183,7 +183,12 @@ function formatTermForNotification(t: LuxmedTerm): string {
     return `${escapeHtml(dt)} — ${escapeHtml(doctor)}, ${escapeHtml(clinic)}${tele}`;
 }
 
-async function processMonitoring(config: LuxmedMonitoringConfig, search:typeof luxmedSearchSlots = luxmedSearchSlots): Promise<void> {
+export function smartMonitorIntervalMs(random: () => number = Math.random): number {
+    return (600 + Math.floor(random() * 301)) * 1000;
+}
+
+async function processMonitoring(config: LuxmedMonitoringConfig, search:typeof luxmedSearchSlots = luxmedSearchSlots,
+    intervalMs = smartMonitorIntervalMs()): Promise<void> {
     const smart=smartStore.enrollment(config.id);
     if(smart&&smart.state!=='active')return;
     if (getLuxmedAccountId(config.userId) !== config.accountId) {
@@ -230,10 +235,9 @@ async function processMonitoring(config: LuxmedMonitoringConfig, search:typeof l
             smartStore.status(config.id,result.message);
             if(result.state==='retryable_failure') {
                 const failures=(smartStore.enrollment(config.id)?.failures||0)+1;
-                const delay=Math.min(600000,30000*2**Math.min(failures,5));
-                smartStore.db.prepare(`UPDATE luxmed_smart_monitors SET status=?,failures=?,next_check=? WHERE user_id=? AND state='active'
+                smartStore.db.prepare(`UPDATE luxmed_smart_monitors SET status=?,failures=?,next_check=MAX(next_check,?) WHERE user_id=? AND state='active'
                     AND monitoring_id IN (SELECT id FROM luxmed_monitorings WHERE account_id=? AND user_id=? AND active=1)`)
-                    .run(result.message,failures,Date.now()+delay,config.userId,config.accountId,config.userId);
+                    .run(result.message,failures,Date.now()+intervalMs,config.userId,config.accountId,config.userId);
                 return;
             }
             smartStore.db.prepare('UPDATE luxmed_smart_monitors SET failures=0 WHERE monitoring_id=?').run(config.id);
@@ -313,8 +317,8 @@ async function processMonitoring(config: LuxmedMonitoringConfig, search:typeof l
         const errMsg = err instanceof Error ? err.message : String(err);
         if(smart) {
             const failures=(smartStore.enrollment(config.id)?.failures||0)+1;
-            const delay=err instanceof LuxmedApiError&&Number.isFinite(err.retryAfterMs)?err.retryAfterMs!:Math.min(600000,30000*2**Math.min(failures-1,5));
-            smartStore.db.prepare('UPDATE luxmed_smart_monitors SET status=?,failures=?,next_check=? WHERE monitoring_id=?').run(errMsg,failures,Date.now()+delay,config.id);
+            const delay=Math.max(intervalMs,err instanceof LuxmedApiError&&Number.isFinite(err.retryAfterMs)?err.retryAfterMs!:0);
+            smartStore.db.prepare('UPDATE luxmed_smart_monitors SET status=?,failures=?,next_check=MAX(next_check,?) WHERE monitoring_id=?').run(errMsg,failures,Date.now()+delay,config.id);
         }
         console.error(`[LuxMed Monitor] ${config.id}: Error checking "${config.serviceName}": ${errMsg}`);
         // If auth error, notify user and deactivate
@@ -381,9 +385,10 @@ export async function runLuxmedMonitoringCycle(): Promise<void> {
                 const started=Date.now();
                 const smart=smartStore.enrollment(config.id);
                 if(smart&&(smart.state!=='active'||smart.next_check>started))continue;
-                if(smart)smartStore.db.prepare('UPDATE luxmed_smart_monitors SET next_check=? WHERE monitoring_id=?').run(started+30000+Math.floor(Math.random()*3000),config.id);
+                const intervalMs=smart ? smartMonitorIntervalMs() : 600000;
+                if(smart)smartStore.db.prepare('UPDATE luxmed_smart_monitors SET next_check=? WHERE monitoring_id=?').run(started+intervalMs,config.id);
                 if(config.lastCheck)console.log('[LuxMed monitor] Time since previous result',{monitorId:config.id,sinceResultMs:started-Date.parse(config.lastCheck)});
-                await processMonitoring(config,search);
+                await processMonitoring(config,search,intervalMs);
                 lastAccountMonitor.set(accountId,config.id);
             }
         }finally{runningAccounts.delete(accountId);}

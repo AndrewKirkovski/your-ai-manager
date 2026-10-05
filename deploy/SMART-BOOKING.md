@@ -172,7 +172,20 @@ An external move between the sidecar's start-time check and the DELETE can
 still cancel the moved visit. The pending receipt prevents an automatic retry;
 the operator must inspect the result in LuxMed.
 
-Smart searches target 30 seconds plus jitter. Requests are serialised per account,
+Each complete smart-monitor check waits a random 10 to 15 minutes before its
+next check. A complete check retains all date windows in the configured range.
+The next check time is saved across restarts. Failed checks keep the monitor
+enabled and wait at least the same interval. A longer valid LuxMed `Retry-After`
+extends that wait. The failure counter remains until a successful check, and a
+failed search leaves the last successful search timestamp unchanged.
+Legacy monitoring retains its ten-minute interval.
+
+The sidecar returns upstream rate limits as HTTP 429 with the existing
+`{success:false,error:string}` body and a fixed diagnostic message. It accepts
+both JSON and HTML upstream responses. Valid `Retry-After` seconds and HTTP dates
+are forwarded; malformed values are omitted.
+
+Requests are serialised per account,
 with bookings ahead of queued searches. Effective polling intervals and decision
 times are logged separately. `pollGapMs` measures time between actual search
 starts, `searchMs` records the upstream search duration, and `bookingMs` records
