@@ -5,6 +5,7 @@ dotenv.config();
 import { startWebServer } from './webServer';
 
 import TelegramBot from 'node-telegram-bot-api';
+import { telegramBotOptions } from './telegramBotOptions';
 import OpenAI from 'openai';
 import cron from 'node-cron';
 import { initLuxmedMonitor, runLuxmedMonitoringCycle } from './luxmedMonitor';
@@ -312,9 +313,7 @@ const WHISPER_MODEL = process.env.WHISPER_MODEL || 'whisper-1';
 const VISION_MODEL = process.env.VISION_MODEL || 'claude-sonnet-4-20250514';
 const STICKER_LOOKUP_MODEL = process.env.STICKER_LOOKUP_MODEL || 'claude-haiku-4-5-20251001';
 
-// Telegram keeps the last allowed_updates list, so request callback queries explicitly or inline buttons are silently dropped.
-// The library form-encodes getUpdates params, so the array must be sent as a JSON string.
-const bot = new TelegramBot(TELEGRAM_TOKEN, {polling: {params: {allowed_updates: JSON.stringify(['message', 'callback_query']) as unknown as string[]}}});
+const bot = new TelegramBot(TELEGRAM_TOKEN, telegramBotOptions());
 initLuxmedMonitor(bot);
 initSmartBookingTools(bot);
 // Start the admin/webhook server after the bot exists so the LuxMed webhook
