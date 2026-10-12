@@ -194,14 +194,16 @@ function hasVisibleText(raw: string): boolean {
  * SDK-exhaustion and errors thrown after the SSE stream had begun. */
 const MAX_STREAM_ATTEMPTS = 3;
 
-/** User-facing lines for the three terminal failure classes. Deliberately
- * vague and in-character: the technical detail lives in the server log, never
- * in the user's chat. */
+/** User-facing lines for the terminal failure classes. Vague where the cause is
+ * genuinely unknown to us — but NOT where we know it exactly. An exhausted
+ * balance is fixed by one specific human action, so saying "проблема с
+ * доступом" just makes the user guess at something we already know. */
 const AI_ERROR_TRANSIENT = 'Связь с ИИ сейчас нестабильна 🐺 Подожди минутку и повтори, пожалуйста.';
+const AI_ERROR_CREDITS = 'У меня кончились токены 🐺 Пополни баланс Anthropic — до этого я отвечать не смогу.';
 const AI_ERROR_AUTH = 'У меня сейчас проблема с доступом к ИИ 🐺 Это сбой на моей стороне — уже вижу его.';
 const AI_ERROR_INTERNAL = 'Что-то заглючило у меня в голове 🐺 Попробуй переспросить.';
 
-type ProviderErrorKind = 'transient' | 'auth' | 'malformed' | 'unknown';
+type ProviderErrorKind = 'transient' | 'credits' | 'auth' | 'malformed' | 'unknown';
 
 /** Short message for logging, without dragging a whole stack into one line. */
 function errMsg(err: unknown): string {
@@ -221,21 +223,31 @@ function isAbortLikeError(err: unknown): boolean {
 /** Classify a provider failure so we know whether to retry it and, if it
  * survives all retries, which friendly line to show.
  *  - transient: retry it (429 / 5xx / 529 overloaded / dropped connection)
+ *  - credits:   balance exhausted — no retry, and we name it outright because
+ *               exactly one action fixes it (top up)
  *  - auth:      unrecoverable, tell the user it's on our side (bad/absent key,
- *               revoked access, exhausted credit) — no retry, it won't change
+ *               revoked access) — no retry, it won't change
  *  - malformed: we built a bad request (400/404/422) — a bug to fix, not retry
  *  - unknown:   anything unrecognised — treat conservatively (no retry) */
-function classifyProviderError(err: unknown): ProviderErrorKind {
+export function classifyProviderError(err: unknown): ProviderErrorKind {
     const anyErr = err as { status?: number; code?: string; name?: string; constructor?: { name?: string } };
     const status = typeof anyErr?.status === 'number' ? anyErr.status : undefined;
     const code = typeof anyErr?.code === 'string' ? anyErr.code : undefined;
     const ctor = anyErr?.constructor?.name ?? anyErr?.name;
     const msg = errMsg(err).toLowerCase();
 
-    // Auth / billing: fixed by a human, never by retrying. Anthropic returns a
-    // low-credit balance as a 400, so match it by message, not just status.
+    // Out of money. Checked BEFORE the generic auth branch because Anthropic
+    // returns it as a 400 with an ordinary invalid_request_error — status alone
+    // is indistinguishable from a malformed request, so match the message.
+    // `insufficient_quota` is the OpenAI-compat shape of the same thing.
+    if (/credit balance|insufficient[\s_-]?(credit|quota|funds)|billing/.test(msg)
+        || code === 'insufficient_quota') {
+        return 'credits';
+    }
+
+    // Auth: fixed by a human, never by retrying.
     if (status === 401 || status === 403
-        || /invalid[\s_-]?api[\s_-]?key|authentication|x-api-key|permission denied|credit balance/.test(msg)) {
+        || /invalid[\s_-]?api[\s_-]?key|authentication|x-api-key|permission denied/.test(msg)) {
         return 'auth';
     }
 
@@ -1091,10 +1103,12 @@ export class AIService {
             // 'transient' here means the retry loop already exhausted its
             // attempts (or the failure landed after we'd shown text and couldn't
             // retry) — the network/provider stayed unhealthy, which is a
-            // legitimate thing to tell the user about. 'auth' is the critical
-            // token/credit case. 'malformed'/'unknown' are our own bugs: show a
-            // neutral line, and the loud log above is what actually gets acted on.
-            const userText = kind === 'auth' ? AI_ERROR_AUTH
+            // legitimate thing to tell the user about. 'credits' names the cause
+            // outright; 'auth' is the vaguer key/access case. 'malformed'/
+            // 'unknown' are our own bugs: show a neutral line, and the loud log
+            // above is what actually gets acted on.
+            const userText = kind === 'credits' ? AI_ERROR_CREDITS
+                : kind === 'auth' ? AI_ERROR_AUTH
                 : kind === 'transient' ? AI_ERROR_TRANSIENT
                 : AI_ERROR_INTERNAL;
             await safeSend(bot, userId, userText);

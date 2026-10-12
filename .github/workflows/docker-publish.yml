@@ -65,8 +65,8 @@ jobs:
       - name: Test smart booking with simulated providers
         run: yarn test:luxmed
 
-      - name: Test Telegram polling recovery
-        run: yarn test:telegram
+      - name: Test Telegram polling recovery and AI error replies
+        run: yarn test:bot
 
       - name: Test registry release guard with simulated Docker results
         env:
