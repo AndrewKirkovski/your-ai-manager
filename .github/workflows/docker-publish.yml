@@ -65,6 +65,9 @@ jobs:
       - name: Test smart booking with simulated providers
         run: yarn test:luxmed
 
+      - name: Test Telegram polling recovery
+        run: yarn test:telegram
+
       - name: Test registry release guard with simulated Docker results
         env:
           PYTHONDONTWRITEBYTECODE: '1'

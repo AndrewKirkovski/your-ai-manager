@@ -21,6 +21,13 @@ const { LuxmedBookSlot, parseMonitorIds, parseMonitorBoolean } = await import('.
 const globalDb = (await import('../database.ts')).default;
 const now = zonedTime('2026-10-05T07:00:00');
 const at = (value: string) => zonedTime(`2026-10-06T${value}:00`);
+// The fixtures are pinned to these dates, but route freshness and booking
+// deadlines also read the real clock (a stale `now` must not make an old route
+// look fresh). Start the wall clock at the fixture time and keep it advancing,
+// so the suite does not expire as the calendar moves past the fixtures.
+const realDateNow = Date.now;
+const fixtureClockOffset = now - realDateNow();
+Date.now = () => realDateNow() + fixtureClockOffset;
 const home: Place = { id: 'home', revision: 'home-v1', address: 'Home', lat: 52, lng: 21 };
 const clinic: Place = { id: 'clinic:1:2', revision: 'clinic-v1', address: 'Testowa 2, Warszawa', lat: 52.1, lng: 21.1 };
 const school: Place = { id: 'school', revision: 'school-v1', address: 'School', lat: 52.2, lng: 21.2 };
