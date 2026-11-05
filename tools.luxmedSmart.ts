@@ -459,7 +459,7 @@ export const LuxmedAvailabilityReviewed: Tool = {
         if (!turn || turn.userId !== userId) return { success: false };
         // The prompt still shows the token for the rest of this chain, so a repeat
         // call is normal. It touches nothing, so a newer hold stays in place.
-        if (turn.releasedToken === hold_token) return { success: true };
+        if (hold_token && turn.releasedToken === hold_token) return { success: true };
         if (turn.holdToken !== hold_token || !smartStore.release(userId, hold_token)) return { success: false, message: 'This hold token is not current. Do not retry.' };
         turn.holdToken = null; // this turn released its own hold; a newer message sets a new token and still rejects it
         turn.releasedToken = hold_token;

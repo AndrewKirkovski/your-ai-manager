@@ -717,7 +717,8 @@ cron.schedule('* * * * *', async () => {
                     const batch: BatchReminderTask[] = survivors.map(t => ({
                         id: t.id, name: t.name, requiresAction: t.requiresAction,
                         annoyance: t.annoyance, dueAt: t.dueAt,
-                        earliestNextPing: nextPingFloor(t, remindedAt) ?? undefined,
+                        // Heads-up tasks are complete after this reminder, so they have no next ping.
+                        earliestNextPing: t.requiresAction ? nextPingFloor(t, remindedAt) ?? undefined : undefined,
                     }));
 
                     const sinceUserWrote = messagesSinceUserWrote(await getRecentMessageHistory(user.userId, REMINDER_HISTORY_ROWS));
@@ -757,14 +758,19 @@ cron.schedule('* * * * *', async () => {
                     if (!delivered) {
                         const names = survivors.map(t => stripSystemTags(t.name)).join(', ');
                         console.warn(`🔇→🗣 ${user.userId}: batch reminder produced no visible text — sending minimal reminder for: ${names}`);
-                        const sent = await safeSend(bot, user.userId, `напомню: ${names} 🐺`);
+                        // The model never spoke, so the wait has to be stated here.
+                        const floors = survivors.flatMap(t => t.requiresAction ? nextPingFloor(t, remindedAt) ?? [] : []);
+                        const comeBack = floors.length
+                            ? `, вернусь к этому ${formatDateHuman(new Date(Math.min(...floors.map(f => f.getTime()))))}`
+                            : '';
+                        const sent = await safeSend(bot, user.userId, `напомню: ${names}${comeBack} 🐺`);
                         if (sent) delivered = true;
                     }
 
                     // Deterministic backstop: settle what the model left behind, so
                     // batching never strands a task and no ping lands too soon.
                     for (const dt of survivors) {
-                        if (dt.requiresAction) await settleRemindedTask(user.userId, dt.id, remindedAt);
+                        if (dt.requiresAction) await settleRemindedTask(user.userId, dt.id, remindedAt, delivered);
                     }
 
                     console.log(result);
@@ -780,7 +786,7 @@ cron.schedule('* * * * *', async () => {
                     for (const dt of marked) {
                         if (!dt.requiresAction) continue;
                         try {
-                            await settleRemindedTask(user.userId, dt.id);
+                            await settleRemindedTask(user.userId, dt.id, new Date(), false);
                         } catch { /* best effort */ }
                     }
                 }

@@ -42,7 +42,7 @@ export class OpenAIProvider implements AIProvider {
 
         if (tools?.length) {
             requestOptions.tools = tools;
-            requestOptions.tool_choice = 'auto';
+            requestOptions.tool_choice = request.forbidToolUse ? 'none' : 'auto';
         }
 
         // Enable extended thinking via extra_body (Anthropic compat layer)

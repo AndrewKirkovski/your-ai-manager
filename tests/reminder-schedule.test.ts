@@ -62,6 +62,27 @@ test('a high task the model left unscheduled still re-pings within minutes', asy
     assert.equal((await getTask(userId, id))?.pingAt.getTime(), NOW.getTime() + 4 * 60_000);
 });
 
+test('a reminder that never reached the user retries soon, with no floor', async () => {
+    const { userId, id } = await task({ status: 'needs_replanning' });
+    await settleRemindedTask(userId, id, NOW, false);
+    const settled = await getTask(userId, id);
+    assert.equal(settled?.status, 'pending');
+    assert.equal(settled?.pingAt.getTime(), NOW.getTime() + 150 * 60_000);
+});
+
+test('a failed turn leaves a task the user has since moved alone', async () => {
+    const chosen = new Date(NOW.getTime() + 3_600_000);
+    const { userId, id } = await task({ pingAt: chosen });
+    await settleRemindedTask(userId, id, NOW, false);
+    assert.equal((await getTask(userId, id))?.pingAt.getTime(), chosen.getTime());
+});
+
+test('an unknown annoyance value still settles', async () => {
+    const { userId, id } = await task({ status: 'needs_replanning', annoyance: 'medium' as never });
+    await settleRemindedTask(userId, id, NOW, false);
+    assert.equal((await getTask(userId, id))?.pingAt.getTime(), NOW.getTime() + 45 * 60_000);
+});
+
 test('a deadline task keeps the ping the model chose', async () => {
     const chosen = new Date(NOW.getTime() + 3_600_000);
     const { userId, id } = await task({ pingAt: chosen, dueAt: new Date(NOW.getTime() + 5 * DAY_MS) });

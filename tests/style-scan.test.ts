@@ -41,6 +41,7 @@ test('media descriptions and synthetic prompts are not the user\'s words', () =>
     assert.equal(userWordsInRow('[User shared location]\nlat 52'), '');
     assert.equal(userWordsInRow('<system>due</system>'), '');
     assert.equal(userWordsInRow('просто текст'), 'просто текст');
+    assert.equal(userWordsInRow('[Custom emojis in this message:\n- 😀 (cache_key=1): laughing wolf\n]\nок'), 'ок');
 });
 
 test('a thin sample does not reach the model and leaves the notes alone', async () => {

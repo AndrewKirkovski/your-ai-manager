@@ -25,7 +25,9 @@ const MIN_KEPT_LENGTH_RATIO = 0.5;
 /** The words the user actually wrote in a stored row, without synthetic prompts
  * and without media descriptions, which describe the image and not the user. */
 export function userWordsInRow(content: string): string {
-    const withoutMedia = stripSystemTags(content).replace(/\[User sent a [\s\S]*?\[End of [^\]]*\]/g, '');
+    const withoutMedia = stripSystemTags(content)
+        .replace(/\[User sent a [\s\S]*?\[End of [^\]]*\]/g, '')
+        .replace(/\[Custom emojis in this message:[\s\S]*?\n\]/g, '');
     const marker = withoutMedia.search(/\[User (?:sent a|shared)/);
     return (marker >= 0 ? withoutMedia.slice(0, marker) : withoutMedia).replace(/\s+/g, ' ').trim();
 }

@@ -65,7 +65,7 @@ export class AnthropicProvider implements AIProvider {
 
         if (tools?.length) {
             params.tools = tools;
-            params.tool_choice = { type: 'auto' };
+            params.tool_choice = { type: request.forbidToolUse ? 'none' : 'auto' };
         }
 
         // Forward the AbortSignal from the burst-coalescing layer down to the

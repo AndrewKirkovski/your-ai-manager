@@ -30,6 +30,10 @@ marked.setOptions({ breaks: true, gfm: true });
  * (sanitize-html always outputs HTML-safe). Idempotent on subsequent passes.
  * Matches the behavior already applied on the display path via mdToTelegramHtml. */
 export function stripSystemTags(text: string): string {
+    // The parser reads any "<" before a letter as a tag, which drops the rest of the
+    // text ("если a<b то" became "если a"), and it entity-encodes what it keeps. So it
+    // runs only when there is a tag to strip.
+    if (!/<\s*\/?\s*system/i.test(text)) return text;
     return sanitizeHtml(text, {
         allowedTags: false as unknown as undefined,
         allowedAttributes: false as unknown as undefined,

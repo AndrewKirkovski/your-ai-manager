@@ -30,7 +30,11 @@ export function findCompactableRuns(history: MessageHistory[]): CompactableRun[]
     const runs: CompactableRun[] = [];
 
     const addRun = (start: number, end: number) => {
-        const firstCompactable = start > 0 ? start + 1 : start;
+        // One reply per unanswered user row: messages sent during a slow reply leave
+        // user rows side by side, and their replies land side by side too.
+        let repliesAtStart = 0;
+        while (repliesAtStart < start && history[start - 1 - repliesAtStart].role === 'user') repliesAtStart++;
+        const firstCompactable = start + repliesAtStart;
         const lastCompactable = end - VERBATIM_RUN_TAIL;
         // Measured, not sliced first: near the start of a history this end index goes
         // negative, and slice() would read it as counting from the end of the array.

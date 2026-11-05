@@ -7,7 +7,7 @@ process.env.DB_PATH = ':memory:';
 const { resolveOutputConfig, resolveThinkingConfig, ROUTE_EFFORT } = await import('../aiProvider.ts');
 const { AnthropicProvider } = await import('../aiProvider.anthropic.ts');
 const { AIService } = await import('../aiService.ts');
-const { addMessageToHistory, getMessageHistoryWithIds, setUser } = await import('../userStore.ts');
+const { addMessageToHistory, getMessageHistoryWithIds, getTokenUsageStats, recordAITokens, setUser } = await import('../userStore.ts');
 const { estimateCacheCostUsd, estimateCostUsd } = await import('../pricing.ts');
 
 const OPUS = 'claude-opus-5-5';
@@ -208,6 +208,33 @@ test('a refusal after a tool ran keeps the tool record and still tells the user'
     assert.match(rows[0].content, /\[Tool: get_current_time\]/);
 });
 
+test('a refusal after partial text sends only the plain line', async () => {
+    const userId = 6004;
+    await setUser(blankUser(userId));
+    await addMessageToHistory(userId, 'user', 'привет');
+    const { provider } = scriptedProvider([[
+        { type: 'text', content: 'создал напоминание' },
+        { type: 'stop_reason', reason: 'refusal', category: null },
+        { type: 'done' },
+    ]]);
+    const { bot, sent } = fakeBot();
+    await AIService.streamAIResponse({
+        userId, userMessage: '', systemPrompt: '', bot, provider, model: OPUS,
+        addUserToHistory: false, addAssistantToHistory: true, enableToolCalls: true,
+    });
+
+    assert.deepEqual(sent, ['С этим не помогу 🐺']);
+});
+
+test('tools stay declared with tool_choice none when use is forbidden', async () => {
+    const { provider, calls } = providerWith([endOfTurn]);
+    const tools = [{ name: 'Tool', description: 'd', parameters: { type: 'object', properties: {} } }];
+    await collect(provider.streamChat({ ...request(), tools, forbidToolUse: true }));
+
+    assert.equal((calls[0].params.tools as unknown[]).length, 1);
+    assert.deepEqual(calls[0].params.tool_choice, { type: 'none' });
+});
+
 test('calls from a declined model are dropped when the fallback takes over', async () => {
     const userId = 6003;
     await setUser(blankUser(userId));
@@ -226,6 +253,24 @@ test('calls from a declined model are dropped when the fallback takes over', asy
     });
 
     assert.equal(requests.length, 1);
+});
+
+test('cache cost reaches the user report and every breakdown, without counting as tokens', async () => {
+    const userId = 6005;
+    await setUser(blankUser(userId));
+    await recordAITokens(userId, 1000, 100, 'reply', OPUS, 1_000_000, 0);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const report = getTokenUsageStats({
+        scope: 'me', userId, from: new Date(Date.now() - 60_000), to: new Date(Date.now() + 60_000),
+    });
+
+    assert.equal(report.input_tokens, 1000);
+    assert.equal(report.output_tokens, 100);
+    assert.equal(report.request_count, 1);
+    const expected = estimateCostUsd(OPUS, 1000, 100) + 0.20;
+    assert.ok(Math.abs(report.cost_usd - expected) < 1e-9, `total ${report.cost_usd}`);
+    assert.ok(Math.abs(report.by_purpose.reply.cost_usd - expected) < 1e-9);
+    assert.ok(Math.abs(report.by_model[OPUS].cost_usd - expected) < 1e-9);
 });
 
 test('prices cover the new model, and cache traffic has its own price', () => {

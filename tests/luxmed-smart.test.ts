@@ -1553,6 +1553,17 @@ test('a repeated release in one turn succeeds and leaves a newer hold in place',
     });
     store.release(10, store.policy(10)!.holdToken!);
 });
+test('a release with no token never reports success', async () => {
+    const { LuxmedAvailabilityReviewed } = await import('../tools.luxmedSmart.ts');
+    const { availabilityTurn } = await import('../luxmedConversation.ts');
+    const store = new SmartBookingStore(globalDb); const token = store.hold(10)!;
+    await availabilityTurn.run({ userId: 10, holdToken: token }, async () => {
+        const noToken = { userId: 10 } as unknown as { userId: number; hold_token: string };
+        assert.equal((await LuxmedAvailabilityReviewed.execute(noToken)).success, false);
+        assert.equal(store.policy(10)!.holdToken, token);
+    });
+    store.release(10, token);
+});
 test('a stale conversation cannot add or remove an occupied schedule appointment', async () => {
     const { availabilityTurn } = await import('../luxmedConversation.ts');
     const { LuxmedSetScheduleAppointment, LuxmedDeleteScheduleAppointment } = await import('../tools.scheduleAppointments.ts');

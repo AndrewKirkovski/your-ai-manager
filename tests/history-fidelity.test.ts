@@ -118,6 +118,110 @@ test('a message written to history at the start of a turn reaches the model once
     assert.equal(copies.length, 1);
 });
 
+test('a bot prompt written to history at the start of a turn still reaches the model', async () => {
+    // /start and /goal pass prompts that are only <system>, which rendering strips.
+    const userId = await userWithMessage();
+    const prompt = '<system>New user just started the bot. Greet them.</system>';
+    const { provider, requests } = scriptedProvider([textTurn('ок')]);
+    await AIService.streamAIResponse({ ...replyOptions, userId, userMessage: prompt, addUserToHistory: true, bot: fakeBot().bot, provider });
+
+    assert.equal(requests[0].messages.at(-1)?.content, prompt);
+    assert.equal(requests[0].messages.filter(m => m.content.includes('Greet them')).length, 1);
+});
+
+test('a prompt is sent as written, with no bare UTC stamp, when it is not stored', async () => {
+    const userId = await userWithMessage();
+    const prompt = '<system>due</system>';
+    const { provider, requests } = scriptedProvider([textTurn('ок')]);
+    await AIService.streamAIResponse({ ...replyOptions, userId, userMessage: prompt, bot: fakeBot().bot, provider });
+
+    assert.equal(requests[0].messages.at(-1)?.content, prompt);
+});
+
+test('the forced retry does not send a stored message twice', async () => {
+    const userId = await userWithMessage();
+    const { provider, requests } = scriptedProvider([textTurn('ок')]);
+    await AIService.streamAIResponse({
+        ...replyOptions, userId, userMessage: '<system>prompt</system>', userRowWritten: true, bot: fakeBot().bot, provider,
+    });
+
+    assert.equal(requests[0].messages.filter(m => m.content.includes('prompt')).length, 1);
+});
+
+test('a tool record that lands after a newer message stays visible to the model', async () => {
+    // A user message during a tool chain leaves rows user, user, assistant.
+    const userId = await userWithMessage();
+    await addMessageToHistory(userId, 'assistant', 'ранний ответ');
+    await addMessageToHistory(userId, 'user', 'первый');
+    await addMessageToHistory(userId, 'user', 'второй');
+    await addMessageToHistory(userId, 'assistant', 'поздний\n\n[Tool: AddTask]\nInput: {"name":"молоко"}\nOutput: {"success":true}\n');
+    const { provider, requests } = scriptedProvider([textTurn('ок')]);
+    await AIService.streamAIResponse({ ...replyOptions, userId, bot: fakeBot().bot, provider });
+
+    const sent = requests[0].messages;
+    assert.equal(sent.at(-1)?.role, 'user');
+    assert.match(sent.at(-1)!.content, /второй/);
+    assert.ok(sent.some(m => m.role === 'assistant' && m.content.includes('Tools run: AddTask')));
+});
+
+test('a user-only history with a trailing bot row still ends on a user message', async () => {
+    const userId = nextUserId++;
+    await setUser(blankUser(userId));
+    await addMessageToHistory(userId, 'user', 'один');
+    await addMessageToHistory(userId, 'assistant', 'ответ');
+    const { provider, requests } = scriptedProvider([textTurn('ок')]);
+    await AIService.streamAIResponse({ ...replyOptions, userId, bot: fakeBot().bot, provider });
+
+    assert.equal(requests[0].messages.at(-1)?.role, 'user');
+});
+
+test('at the tool depth limit tools stay declared and the model must answer', async () => {
+    const userId = await userWithMessage();
+    const rounds = Array.from({ length: 5 }, () => toolTurn('get_current_time'));
+    const { provider, requests } = scriptedProvider([...rounds, textTurn('всё')]);
+    await AIService.streamAIResponse({ ...replyOptions, userId, bot: fakeBot().bot, provider });
+
+    assert.equal(requests.length, 6);
+    assert.ok(requests[5].tools?.length);
+    assert.deepEqual(requests[5].tools, requests[0].tools);
+    assert.equal(requests[5].forbidToolUse, true);
+    assert.equal(requests[4].forbidToolUse, false);
+
+    // The note comes after the tool results and changes nothing before it.
+    const last = requests[5].messages;
+    assert.equal(last.at(-2)?.role, 'tool_result');
+    assert.match(last.at(-1)!.content, /last tool round/);
+    assert.deepEqual(last.slice(0, requests[4].messages.length), requests[4].messages);
+});
+
+test('a tool call cut off by max_tokens does not run, and the turn asks for budget', async () => {
+    const userId = await userWithMessage();
+    const { provider, requests } = scriptedProvider([[
+        { type: 'text', content: 'начал' },
+        { type: 'tool_call_start', index: 0, id: 'c1', name: 'get_current_time' },
+        { type: 'tool_call_args', index: 0, args: '{"task' },
+        { type: 'stop_reason', reason: 'max_tokens' },
+        { type: 'done' },
+    ]]);
+    const { bot, sent } = fakeBot();
+    const result = await AIService.streamAIResponse({ ...replyOptions, userId, bot, provider });
+
+    assert.equal(requests.length, 1);
+    assert.equal(result.ranOutOfTokens, true);
+    assert.match(sent.at(-1) ?? '', /лимит/);
+});
+
+test('text with a less-than sign survives into history', async () => {
+    const userId = await userWithMessage();
+    const { provider } = scriptedProvider([toolTurn('get_current_time', { note: 'лампы <E27' }, 'если a<b то'), textTurn('готово')]);
+    await AIService.streamAIResponse({ ...replyOptions, userId, bot: fakeBot().bot, provider });
+
+    const [row] = await assistantRows(userId);
+    assert.match(row, /если a<b то/);
+    assert.match(row, /лампы <E27/);
+    assert.match(row, /готово/);
+});
+
 test('tool records render inside the wrapper, away from what the model says', () => {
     const stored = 'текст\n\n[Tool: UpdateTask]\nInput: {"a":1}\nOutput: {"success":true}\nдальше';
     assert.equal(

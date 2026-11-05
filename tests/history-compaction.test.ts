@@ -28,6 +28,11 @@ test('runs between user rows are handled separately', () => {
     assert.deepEqual(spans('uaaaaaauaaaaaa'), [[2, 3], [9, 10]]);
 });
 
+test('every unanswered user row keeps its reply', () => {
+    assert.deepEqual(spans('uuaaaaaaa'), [[4, 5]]);
+    assert.deepEqual(spans('uuuaaaaaa'), []);
+});
+
 test('a reply near the start of a history selects nothing', () => {
     // These ended a run at index 1 or 2, where the tail cut-off goes negative. slice()
     // then read it from the end and swallowed the whole history, user rows included.

@@ -177,6 +177,9 @@ export interface StreamRequest {
      */
     disableThinking?: boolean;
     effort?: Effort;
+    /** Keep `tools` declared but stop the model calling them. Set at the tool depth
+     * limit, where messages already hold tool blocks that need `tools` present. */
+    forbidToolUse?: boolean;
 }
 
 export interface CompletionRequest {

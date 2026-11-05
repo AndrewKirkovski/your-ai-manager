@@ -69,6 +69,9 @@ export interface AIStreamOptions {
      * lands mid-chain would change messages the model already answered.
      */
     baseMessages?: ProviderMessage[];
+    /** An earlier attempt at this turn already wrote the user row, so a re-run must not
+     * count it as a new message. Set by the forced-answer floor. */
+    userRowWritten?: boolean;
     /** Callback to handle images from search results (sent separately, not in history) */
     onImageResults?: (images: string[]) => Promise<void>;
     /** Recorded into stat_entries.note for the token-usage stat. Default 'reply'. */
@@ -223,6 +226,13 @@ const ASK_MORE_AFTER_NOTHING = 'Не хватило лимита токенов,
  * NOT a budget overrun (a refusal, an empty completion), so the user is never
  * left staring at silence wondering whether the bot is alive. */
 const NO_OUTPUT_FALLBACK = 'Задумался и потерял мысль 🐺 Повтори, пожалуйста?';
+
+/** How many tool rounds one turn may take before the model has to answer. */
+const MAX_TOOL_DEPTH = 5;
+
+/** Added after the last tool results at the limit. With tools forbidden and no note,
+ * the model can end the turn with no text at all. */
+const TOOL_LIMIT_NOTE = '<system>That was the last tool round for this turn. Answer the user now, in text, with what you have, and say what is left undone.</system>';
 
 /** Delivered when the model declined the request, so the user knows it wasn't a
  * glitch and repeating it won't help. */
@@ -403,7 +413,7 @@ export class AIService {
         const withDefaults = (opts: AIStreamOptions): AIStreamOptions => ({
             ...opts,
             // Tools are always enabled by default (unless recursion limit reached)
-            enableToolCalls: (opts.currentRecursionDepth ?? 0) >= 5 ? false : (opts.enableToolCalls ?? true),
+            enableToolCalls: (opts.currentRecursionDepth ?? 0) >= MAX_TOOL_DEPTH ? false : (opts.enableToolCalls ?? true),
         });
 
         const isTopLevel = (options.currentRecursionDepth ?? 0) === 0;
@@ -447,11 +457,6 @@ export class AIService {
         // spoke is self-inflicted noise, not a safety net.
         if (options.proactive) return result;
 
-        if (result.refused) {
-            await safeSend(options.bot, options.userId, REFUSAL_LINE);
-            return { ...result, message: REFUSAL_LINE, rawResponse: REFUSAL_LINE };
-        }
-
         // "Did the user actually SEE text this turn?" — the only reliable signal
         // across recursion. `delivered` flips on any confirmed send at any depth
         // (a tool-first reply's answer streams from depth 1+, and result.message
@@ -472,6 +477,7 @@ export class AIService {
                     ...observed,
                     disableThinking: true,
                     addUserToHistory: false, // the user row was written on the first attempt
+                    userRowWritten: observed.addUserToHistory ?? true,
                 });
                 // Return the forced attempt if it delivered or produced visible
                 // text (it may have gone tool-first, delivering via recursion
@@ -487,6 +493,13 @@ export class AIService {
                 await this.askForMoreTokens(options, sawText);
                 return result;
             }
+        }
+
+        // Below the budget block so these also cover the forced re-run above.
+        if (result.emptyReason === 'aborted') return result;
+        if (result.refused) {
+            await safeSend(options.bot, options.userId, REFUSAL_LINE);
+            return { ...result, message: REFUSAL_LINE, rawResponse: REFUSAL_LINE };
         }
 
         // Never-silent floor for a non-budget empty (refusal, odd completion).
@@ -673,13 +686,19 @@ export class AIService {
                 timestamp: new Date().toISOString()
             });
 
-            const baseMessages = options.baseMessages ?? await this.buildBaseMessages(userId, userMessage, addUserToHistory);
+            const baseMessages = options.baseMessages
+                ?? await this.buildBaseMessages(userId, userMessage, addUserToHistory || !!options.userRowWritten);
             const messages: ProviderMessage[] = [...baseMessages, ...(appendMessagesAfterUser || [])];
+            const atToolLimit = currentRecursionDepth >= MAX_TOOL_DEPTH;
+            if (atToolLimit) messages.push({ role: 'user', content: TOOL_LIMIT_NOTE });
 
             // Get tool definitions if enabled. allowedTools narrows the offer —
             // background runs (collision fixer) get only schedule tools so the
             // model can't reach user-facing or unrelated tools at all.
-            const toolDefs: ToolDefinition[] | undefined = enableToolCalls
+            // At the limit the model must answer, but `tools` stays declared. Messages
+            // already hold tool blocks, and those need it, and removing it would also
+            // invalidate the thinking blocks replayed in this chain.
+            const toolDefs: ToolDefinition[] | undefined = enableToolCalls || atToolLimit
                 ? getAllToolDefinitions()
                     .filter(t => !options.allowedTools || options.allowedTools.includes(t.function.name))
                     .map(t => ({
@@ -744,6 +763,7 @@ export class AIService {
                             systemPromptCachePrefix,
                             messages,
                             tools: toolDefs,
+                            forbidToolUse: atToolLimit,
                             maxTokens,
                             model,
                             signal: options.signal,
@@ -900,15 +920,22 @@ export class AIService {
             // Every attempt commits its own visible text now — there is no
             // supersede-and-replace, so a truncated answer is the real answer
             // (the consent ask offers to extend it) and must be shown and kept.
-            await updateTelegramMessage(true);
-
-            // A decline ends the turn: text before it isn't an answer to keep, and
-            // tool calls before it must not run.
+            // A decline ends the turn: text before it isn't an answer to send or keep,
+            // and tool calls before it must not run.
             const refused = stopReason === 'refusal';
             if (refused) {
                 console.warn(`🚫 ${userId}: the model declined this turn`, { category: refusalCategory ?? 'none' });
                 toolCalls.length = 0;
                 historyResponseAccumulated = '';
+            } else {
+                await updateTelegramMessage(true);
+            }
+
+            // A tool call cut off by max_tokens has partial arguments, so it can't run.
+            // Dropping it lets the budget ask handle the turn instead of spending the
+            // same budget on another round.
+            if (stopReason === 'max_tokens') {
+                toolCalls.length = 0;
             }
 
             // Carries the deepest generation's terminal state up so the top level
@@ -1229,14 +1256,16 @@ export class AIService {
      * Recent history plus this turn's message, as sent on every request of a chain.
      *
      * When userMessage is empty (burst-coalesce path: the bursted messages are
-     * already in history) or addUserToHistory just wrote it, the newest row IS the
-     * current turn, so no second copy goes in.
+     * already in history) the newest row IS the current turn. When addUserToHistory
+     * just wrote it, the raw message replaces that row: rendering strips <system>, and
+     * bot prompts such as the greeting are nothing but <system>.
      */
     private static async buildBaseMessages(userId: number, userMessage: string, alreadyInHistory: boolean): Promise<ProviderMessage[]> {
-        const messages: ProviderMessage[] = [
-            ...await this.getRecentMessages(userId, 30),
-            ...(userMessage && !alreadyInHistory ? [{ role: 'user' as const, content: userMessage }] : []),
-        ];
+        const messages = await this.getRecentMessages(userId, 30);
+        if (userMessage) {
+            if (alreadyInHistory && messages[messages.length - 1]?.role === 'user') messages.pop();
+            messages.push({ role: 'user', content: userMessage });
+        }
 
         // The 4.6+ models reject a conversation that ends with an assistant
         // message ("does not support assistant message prefill"). That can
@@ -1244,12 +1273,19 @@ export class AIService {
         // turn is still running, a newer user message is recorded, then the
         // slow turn's assistant/tool-summary rows land AFTER it — so history
         // now ends with an assistant row and the burst reply 400s (seen in
-        // prod 2026-07-17, request req_011Cd7x4). Trim trailing assistant
-        // rows so the array ends on the user's actual last message; the
-        // trimmed summaries' facts (created tasks/routines) still reach the
-        // model via getCurrentInfo.
+        // prod 2026-07-17, request req_011Cd7x4). Those rows go just before the
+        // unanswered user messages, so the array ends on the user's last message
+        // and the model still sees what ran, instead of repeating a tool.
+        const trailing: ProviderMessage[] = [];
         while (messages.length && messages[messages.length - 1].role === 'assistant') {
-            messages.pop();
+            trailing.unshift(messages.pop()!);
+        }
+        let insertAt = messages.length;
+        while (insertAt > 1 && messages[insertAt - 1].role === 'user') {
+            insertAt--;
+        }
+        if (insertAt < messages.length) {
+            messages.splice(insertAt, 0, ...trailing);
         }
         return messages;
     }

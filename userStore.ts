@@ -1125,8 +1125,10 @@ export async function recordAITokens(userId: number, inputTokens: number, output
     // input_tokens leaves out cached tokens, so without these the report understates spend.
     for (const [name, value] of [['ai_tokens_cache_read', cacheReadTokens], ['ai_tokens_cache_write', cacheWriteTokens]] as const) {
         if (value <= 0) continue;
-        addStatEntry(0, name, value, undefined, purpose, undefined, m).catch(err =>
-            console.warn(`[token-stat] ${name} failed:`, err instanceof Error ? err.message : err));
+        for (const owner of userId === 0 ? [0] : [userId, 0]) {
+            addStatEntry(owner, name, value, undefined, purpose, undefined, m).catch(err =>
+                console.warn(`[token-stat] ${name} failed:`, err instanceof Error ? err.message : err));
+        }
     }
     if (inputTokens > 0) {
         addStatEntry(userId, 'ai_tokens_in', inputTokens, undefined, purpose, undefined, m).catch(err =>
@@ -1241,43 +1243,42 @@ export function getTokenUsageStats(filter: {
 
     for (const r of rows) {
         const isIn = r.name === 'ai_tokens_in';
+        // Cache traffic adds cost only: it isn't input or output, and its stat rows
+        // aren't requests, so it stays out of the token and request counts.
+        const isOut = r.name === 'ai_tokens_out';
         const purpose = r.note || 'unknown';
         const day = r.day;
         const modelKey = r.model || 'unknown';
-        // Cache traffic adds cost only: it isn't input or output, and its stat rows
-        // aren't requests, so it stays out of the token and request counts.
-        if (r.name === 'ai_tokens_cache_read' || r.name === 'ai_tokens_cache_write') {
-            report.cost_usd += estimateCacheCostUsd(r.model, r.name === 'ai_tokens_cache_read' ? r.total : 0, r.name === 'ai_tokens_cache_write' ? r.total : 0);
-            continue;
-        }
-        const cost = estimateCostUsd(r.model, isIn ? r.total : 0, isIn ? 0 : r.total);
+        const cost = isIn || isOut
+            ? estimateCostUsd(r.model, isIn ? r.total : 0, isIn ? 0 : r.total)
+            : estimateCacheCostUsd(r.model, r.name === 'ai_tokens_cache_read' ? r.total : 0, r.name === 'ai_tokens_cache_write' ? r.total : 0);
 
         if (isIn) report.input_tokens += r.total;
-        else report.output_tokens += r.total;
+        else if (isOut) report.output_tokens += r.total;
         report.cost_usd += cost;
 
         // by_day
         let d = dayMap.get(day);
         if (!d) { d = { input: 0, output: 0, count: 0, cost_usd: 0 }; dayMap.set(day, d); }
-        if (isIn) d.input += r.total; else d.output += r.total;
+        if (isIn) d.input += r.total; else if (isOut) d.output += r.total;
         d.cost_usd += cost;
 
         // by_purpose
         let p = purposeMap.get(purpose);
         if (!p) { p = { input: 0, output: 0, count: 0, cost_usd: 0 }; purposeMap.set(purpose, p); }
-        if (isIn) p.input += r.total; else p.output += r.total;
+        if (isIn) p.input += r.total; else if (isOut) p.output += r.total;
         p.cost_usd += cost;
 
         // by_model
         let m = modelMap.get(modelKey);
         if (!m) { m = { input: 0, output: 0, count: 0, cost_usd: 0, priced: pricingFor(r.model) !== null }; modelMap.set(modelKey, m); }
-        if (isIn) m.input += r.total; else m.output += r.total;
+        if (isIn) m.input += r.total; else if (isOut) m.output += r.total;
         m.cost_usd += cost;
 
         // request count tracking
         const ck: CountKey = `${purpose}|${modelKey}|${day}`;
         if (isIn) inCount.set(ck, (inCount.get(ck) ?? 0) + r.cnt);
-        else outCount.set(ck, (outCount.get(ck) ?? 0) + r.cnt);
+        else if (isOut) outCount.set(ck, (outCount.get(ck) ?? 0) + r.cnt);
     }
 
     // Reconcile per-day, per-purpose, and per-model request counts: max(in, out) per bucket.

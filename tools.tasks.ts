@@ -24,7 +24,7 @@ const NO_DEADLINE_PING_FLOOR_MS: Partial<Record<Task['annoyance'], number>> = {
 
 /** Backoff when a reminder turn left a task unscheduled and no floor applies, so it
  * re-pings instead of vanishing until the user next chats. */
-const REPING_MS: Record<Task['annoyance'], number> = {
+const REPING_MS: Record<string, number> = {
     low: 150 * 60_000, // ~2.5h
     med: 45 * 60_000,
     high: 4 * 60_000,
@@ -38,14 +38,16 @@ export function nextPingFloor(task: Pick<Task, 'dueAt' | 'routineId' | 'annoyanc
 }
 
 /** Runs after a reminder turn, never after a chat turn, so a ping the user asked
- * for ("напомни через час") is left alone. */
-export async function settleRemindedTask(userId: number, taskId: string, now: Date = new Date()): Promise<void> {
+ * for ("напомни через час") is left alone. The floor applies only when the reminder
+ * reached the user: one they never saw retries soon, and a failed turn may be running
+ * over a task the user has since moved, so it leaves pending tasks alone. */
+export async function settleRemindedTask(userId: number, taskId: string, now: Date = new Date(), delivered = true): Promise<void> {
     const fresh = await getTask(userId, taskId);
     if (!fresh) return;
-    const floor = nextPingFloor(fresh, now);
+    const floor = delivered ? nextPingFloor(fresh, now) : null;
 
     if (fresh.status === 'needs_replanning') {
-        const pingAt = floor ?? new Date(now.getTime() + REPING_MS[fresh.annoyance]);
+        const pingAt = floor ?? new Date(now.getTime() + (REPING_MS[fresh.annoyance] ?? REPING_MS.med));
         await updateUserTask(userId, taskId, (t) => {
             if (t.status !== 'needs_replanning') return;
             t.status = 'pending';

@@ -265,7 +265,7 @@ RULES (cross-cutting — domain specifics already live in the sections above; th
 6. Precedence when layers seem to conflict: the NUDGING DOCTRINE governs nudging; what the user told you about reminders (in Memory) beats default spacing unless a deadline is at risk; otherwise the per-turn <system> prompt governs the current action; style-scan notes tune tone but never override doctrine.
 
 SYSTEM CONTEXT (auto-prepended each turn — this is what the block before your message actually looks like):
-- Now: today's date and time in Warsaw with its UTC offset. This line is the only source for today's date. Write ping_at and due_at with that offset.
+- Now: today's date and time in Warsaw with its UTC offset. This line is the only source for today's date. Write ping_at and due_at as Warsaw time, with the UTC offset that applies on that date.
 - "<system>At ...</system>" before a message is when that message was sent. On your own past messages it can also list "Tools run: ...", a record of the tools that ran in that turn. You never write this yourself.
 - Goal: <text, or 'not set'>
 - Routines/Schedule: id, cron, defaultAnnoyance, name, timesCompleted, timesFailed
