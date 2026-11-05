@@ -215,7 +215,10 @@ function verifiedSelectedClinics(monitor: LuxmedMonitoringConfig, cityName: stri
 export function availabilityContext(userId: number): string {
     const saved = smartStore.policy(userId);
     if (!saved) return '';
-    return `\nLuxMed availability: ${JSON.stringify(saved)}\nSaved locations: ${JSON.stringify([...smartStore.places(userId).values()])}\nWhen a message changes availability, use LuxmedDraftAvailability and clarify missing details. Never assume a reminder or due date blocks time. Never claim a policy is active before the user clicks its confirmation button. If this message does not change scheduling, use LuxmedAvailabilityReviewed with the exact hold token above. Do not release a hold for an ambiguous scheduling message.\n`;
+    const review = saved.holdToken
+        ? ' If this message does not change scheduling, call LuxmedAvailabilityReviewed with the holdToken above before writing any text. Do not release a hold for an ambiguous scheduling message.'
+        : '';
+    return `\nLuxMed availability: ${JSON.stringify(saved)}\nSaved locations: ${JSON.stringify([...smartStore.places(userId).values()])}\nWhen a message changes availability, use LuxmedDraftAvailability and clarify missing details. Never assume a reminder or due date blocks time. Never claim a policy is active before the user clicks its confirmation button.${review}\n`;
 }
 
 export function initSmartBookingTools(bot: TelegramBot): void {
@@ -453,8 +456,13 @@ export const LuxmedAvailabilityReviewed: Tool = {
     parameters: { type: 'object', properties: { hold_token: { type: 'string' } }, required: ['hold_token'] },
     execute: async ({ userId, hold_token }: { userId: number; hold_token: string }) => {
         const turn = availabilityTurn.getStore();
-        if (!turn || turn.userId !== userId || turn.holdToken !== hold_token || !smartStore.release(userId, hold_token)) return { success: false };
+        if (!turn || turn.userId !== userId) return { success: false };
+        // The prompt still shows the token for the rest of this chain, so a repeat
+        // call is normal. It touches nothing, so a newer hold stays in place.
+        if (turn.releasedToken === hold_token) return { success: true };
+        if (turn.holdToken !== hold_token || !smartStore.release(userId, hold_token)) return { success: false, message: 'This hold token is not current. Do not retry.' };
         turn.holdToken = null; // this turn released its own hold; a newer message sets a new token and still rejects it
+        turn.releasedToken = hold_token;
         return { success: true };
     },
 };

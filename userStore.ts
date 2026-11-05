@@ -2,7 +2,7 @@ import db from './database';
 import { smartStore } from './luxmedSmartStore';
 import {DateTime} from 'luxon';
 import { validBookingTimeRange } from './luxmedAvailability';
-import {estimateCostUsd, pricingFor} from './pricing';
+import {estimateCacheCostUsd, estimateCostUsd, pricingFor} from './pricing';
 
 // Generate shorter IDs (8 characters)
 function generateShortId(): string {
@@ -1112,8 +1112,14 @@ export async function getTodayStats(userId: number, timezone?: string): Promise<
  *
  * Fire-and-forget: failures never block the AI path.
  * No-op if both token counts are 0. */
-export async function recordAITokens(userId: number, inputTokens: number, outputTokens: number, purpose: string, model: string): Promise<void> {
+export async function recordAITokens(userId: number, inputTokens: number, outputTokens: number, purpose: string, model: string, cacheReadTokens = 0, cacheWriteTokens = 0): Promise<void> {
     const m = model || undefined;
+    // input_tokens leaves out cached tokens, so without these the report understates spend.
+    for (const [name, value] of [['ai_tokens_cache_read', cacheReadTokens], ['ai_tokens_cache_write', cacheWriteTokens]] as const) {
+        if (value <= 0) continue;
+        addStatEntry(0, name, value, undefined, purpose, undefined, m).catch(err =>
+            console.warn(`[token-stat] ${name} failed:`, err instanceof Error ? err.message : err));
+    }
     if (inputTokens > 0) {
         addStatEntry(userId, 'ai_tokens_in', inputTokens, undefined, purpose, undefined, m).catch(err =>
             console.warn('[token-stat] in (per-user) failed:', err instanceof Error ? err.message : err));
@@ -1195,7 +1201,7 @@ export function getTokenUsageStats(filter: {
     const rows = db.prepare<unknown[], Row>(
         `SELECT name, note, model, substr(timestamp, 1, 10) AS day, SUM(value) AS total, COUNT(*) AS cnt
          FROM stat_entries
-         WHERE name IN ('ai_tokens_in','ai_tokens_out') AND timestamp >= ? AND timestamp <= ? ${userClause} ${modelClause}
+         WHERE name IN ('ai_tokens_in','ai_tokens_out','ai_tokens_cache_read','ai_tokens_cache_write') AND timestamp >= ? AND timestamp <= ? ${userClause} ${modelClause}
          GROUP BY name, note, model, day
          ORDER BY day ASC`
     ).all(fromIso, toIso, ...params);
@@ -1230,6 +1236,12 @@ export function getTokenUsageStats(filter: {
         const purpose = r.note || 'unknown';
         const day = r.day;
         const modelKey = r.model || 'unknown';
+        // Cache traffic adds cost only: it isn't input or output, and its stat rows
+        // aren't requests, so it stays out of the token and request counts.
+        if (r.name === 'ai_tokens_cache_read' || r.name === 'ai_tokens_cache_write') {
+            report.cost_usd += estimateCacheCostUsd(r.model, r.name === 'ai_tokens_cache_read' ? r.total : 0, r.name === 'ai_tokens_cache_write' ? r.total : 0);
+            continue;
+        }
         const cost = estimateCostUsd(r.model, isIn ? r.total : 0, isIn ? 0 : r.total);
 
         if (isIn) report.input_tokens += r.total;

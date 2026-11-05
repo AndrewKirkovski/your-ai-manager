@@ -10,6 +10,56 @@ function assertParseableDate(value: string, field: string): void {
         throw new Error(`Invalid ${field}: "${value}" is not a parseable ISO date-time`);
     }
 }
+
+const DAY_MS = 24 * 60 * 60_000;
+
+/** Earliest next ping after a reminder, for a task with no deadline and no routine.
+ * Nothing is lost if such a task waits, and hourly pings on one read as spam. The
+ * prompt alone did not hold: the model saw the user's weekly rule and still chose
+ * the default spacing, so the limit lives in code. */
+const NO_DEADLINE_PING_FLOOR_MS: Partial<Record<Task['annoyance'], number>> = {
+    low: 7 * DAY_MS,
+    med: DAY_MS,
+};
+
+/** Backoff when a reminder turn left a task unscheduled and no floor applies, so it
+ * re-pings instead of vanishing until the user next chats. */
+const REPING_MS: Record<Task['annoyance'], number> = {
+    low: 150 * 60_000, // ~2.5h
+    med: 45 * 60_000,
+    high: 4 * 60_000,
+};
+
+export function nextPingFloor(task: Pick<Task, 'dueAt' | 'routineId' | 'annoyance'>, now: Date): Date | null {
+    if (task.dueAt || task.routineId) return null;
+    const floor = NO_DEADLINE_PING_FLOOR_MS[task.annoyance];
+    // Whole minutes, because that is how the limit is shown and how the model picks.
+    return floor ? new Date(Math.floor((now.getTime() + floor) / 60_000) * 60_000) : null;
+}
+
+/** Runs after a reminder turn, never after a chat turn, so a ping the user asked
+ * for ("напомни через час") is left alone. */
+export async function settleRemindedTask(userId: number, taskId: string, now: Date = new Date()): Promise<void> {
+    const fresh = await getTask(userId, taskId);
+    if (!fresh) return;
+    const floor = nextPingFloor(fresh, now);
+
+    if (fresh.status === 'needs_replanning') {
+        const pingAt = floor ?? new Date(now.getTime() + REPING_MS[fresh.annoyance]);
+        await updateUserTask(userId, taskId, (t) => {
+            if (t.status !== 'needs_replanning') return;
+            t.status = 'pending';
+            t.pingAt = pingAt;
+        });
+        console.log(`♻️ Reset un-rescheduled task to pending (until ${pingAt.toISOString()}):`, { userId, taskId, name: fresh.name });
+    } else if (fresh.status === 'pending' && floor && fresh.pingAt < floor) {
+        const chosen = fresh.pingAt.getTime();
+        await updateUserTask(userId, taskId, (t) => {
+            if (t.status === 'pending' && t.pingAt.getTime() === chosen) t.pingAt = floor;
+        });
+        console.log(`⏳ Moved a too-early ping out to the floor (${floor.toISOString()}):`, { userId, taskId, name: fresh.name });
+    }
+}
 import {
     addUserTask,
     generateShortId,

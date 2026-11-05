@@ -1,6 +1,7 @@
 import {getAllUsers, getMessageHistoryWithIds, MessageHistory, compactMessages} from './userStore';
-import {formatDateHuman} from './dateUtils';
+import {formatDateAbsolute, neutralizeRelativeDates} from './dateUtils';
 import {HISTORY_COMPACTION_PROMPT} from './constants';
+import {ROUTE_EFFORT} from './aiProvider';
 import type {AIProvider} from './aiProvider';
 import {stripSystemTags} from './telegramFormat';
 
@@ -13,47 +14,52 @@ type CompactableRun = {
 
 const MAX_COMPACTIONS_PER_RUN = 5;
 
+/** The newest rows of a run stay verbatim, so the model can read its own recent
+ * reminders. When each reminder was summarized before the next one, the model
+ * never saw its wording and repeated itself. */
+const VERBATIM_RUN_TAIL = 3;
+const MIN_COMPACTABLE_ROWS = 2;
+
 /**
- * Find runs of 2+ consecutive assistant messages in history.
+ * Find the part of each run of consecutive assistant messages that may be
+ * summarized. The first row after a user row is the reply to that user, so it
+ * stays as written, and so does the tail of the run.
  * Messages must have IDs (from SQLite autoincrement).
  */
-function findCompactableRuns(history: MessageHistory[]): CompactableRun[] {
+export function findCompactableRuns(history: MessageHistory[]): CompactableRun[] {
     const runs: CompactableRun[] = [];
-    let runStart: number | null = null;
 
+    const addRun = (start: number, end: number) => {
+        const firstCompactable = start > 0 ? start + 1 : start;
+        const msgs = history.slice(firstCompactable, end - VERBATIM_RUN_TAIL);
+        if (msgs.length < MIN_COMPACTABLE_ROWS) return;
+        runs.push({
+            startId: msgs[0].id,
+            endId: msgs[msgs.length - 1].id,
+            messages: msgs,
+        });
+    };
+
+    let runStart: number | null = null;
     for (let i = 0; i < history.length; i++) {
         if (history[i].role === 'assistant') {
             if (runStart === null) {
                 runStart = i;
             }
         } else {
-            if (runStart !== null && i - runStart >= 2) {
-                const msgs = history.slice(runStart, i);
-                runs.push({
-                    startId: msgs[0].id,
-                    endId: msgs[msgs.length - 1].id,
-                    messages: msgs,
-                });
-            }
+            if (runStart !== null) addRun(runStart, i);
             runStart = null;
         }
     }
 
     // Handle run that ends at the end of history
-    if (runStart !== null && history.length - runStart >= 2) {
-        const msgs = history.slice(runStart);
-        runs.push({
-            startId: msgs[0].id,
-            endId: msgs[msgs.length - 1].id,
-            messages: msgs,
-        });
-    }
+    if (runStart !== null) addRun(runStart, history.length);
 
     return runs;
 }
 
 function buildDateRange(run: CompactableRun): string {
-    return `${formatDateHuman(run.messages[0].timestamp)} — ${formatDateHuman(run.messages[run.messages.length - 1].timestamp)}`;
+    return `${formatDateAbsolute(run.messages[0].timestamp)} — ${formatDateAbsolute(run.messages[run.messages.length - 1].timestamp)}`;
 }
 
 /**
@@ -68,19 +74,26 @@ async function summarizeRun(
     // Strip <system> from each message body so a leaked tag in historical content
     // can't forge a fake system directive in the summarizer's prompt.
     const messagesText = run.messages
-        .map(m => `[${formatDateHuman(m.timestamp)}] ${stripSystemTags(m.content)}`)
+        .map(m => `[${formatDateAbsolute(m.timestamp)}] ${stripSystemTags(m.content)}`)
         .join('\n\n---\n\n');
 
     const prompt = HISTORY_COMPACTION_PROMPT(dateRange, messagesText);
 
+    // Thinking counts toward maxTokens and can't be turned off on current models.
     const summary = await provider.completeChat({
         model,
-        maxTokens: 800,
+        maxTokens: 4000,
+        effort: ROUTE_EFFORT.compaction,
         messages: [{ role: 'user', content: prompt }],
     });
     // Strip the summary too — if the summarizer echoes any <system> from input it
-    // would nest inside our own <system>Compacted…</system> wrapper.
-    return stripSystemTags(summary);
+    // would nest inside our own <system>Compacted…</system> wrapper. The rewrite is
+    // the guard for what the prompt asks: a stored "сегодня" would be read as today
+    // for as long as the row stays in the window.
+    const cleaned = neutralizeRelativeDates(stripSystemTags(summary)).trim();
+    // compactMessages replaces the rows, so an empty summary would erase them.
+    if (!cleaned) throw new Error('Summarizer returned no text');
+    return cleaned;
 }
 
 /**

@@ -1540,6 +1540,19 @@ test('releasing the hold keeps the same turn current until a newer message arriv
     });
     store.release(10, store.policy(10)!.holdToken!);
 });
+test('a repeated release in one turn succeeds and leaves a newer hold in place', async () => {
+    const { LuxmedAvailabilityReviewed } = await import('../tools.luxmedSmart.ts');
+    const { availabilityTurn } = await import('../luxmedConversation.ts');
+    const store = new SmartBookingStore(globalDb); const token = store.hold(10)!;
+    await availabilityTurn.run({ userId: 10, holdToken: token }, async () => {
+        assert.equal((await LuxmedAvailabilityReviewed.execute({ userId: 10, hold_token: token })).success, true);
+        const newer = store.hold(10)!;
+        assert.equal((await LuxmedAvailabilityReviewed.execute({ userId: 10, hold_token: token })).success, true);
+        assert.equal(store.policy(10)!.holdToken, newer);
+        assert.equal((await LuxmedAvailabilityReviewed.execute({ userId: 10, hold_token: newer })).success, false);
+    });
+    store.release(10, store.policy(10)!.holdToken!);
+});
 test('a stale conversation cannot add or remove an occupied schedule appointment', async () => {
     const { availabilityTurn } = await import('../luxmedConversation.ts');
     const { LuxmedSetScheduleAppointment, LuxmedDeleteScheduleAppointment } = await import('../tools.scheduleAppointments.ts');

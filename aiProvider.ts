@@ -15,9 +15,16 @@ export type ThinkingBlockData =
     | { type: 'thinking'; thinking: string; signature: string }
     | { type: 'redacted_thinking'; data: string };
 
+/** One block of an assistant turn, in the order the model produced it. */
+export type AssistantBlock =
+    | ThinkingBlockData
+    | { type: 'text'; text: string }
+    | { type: 'tool_use'; id: string; name: string; input: unknown };
+
 export type ProviderMessage =
     | { role: 'user'; content: string }
-    | { role: 'assistant'; content: string; toolCalls?: ToolCallInfo[]; thinkingBlocks?: ThinkingBlockData[] }
+    /** `blocks` is the turn exactly as streamed, for providers that must replay it unchanged. */
+    | { role: 'assistant'; content: string; toolCalls?: ToolCallInfo[]; blocks?: AssistantBlock[] }
     | { role: 'tool_result'; toolCallId: string; content: string };
 
 // --- Stream chunk types ---
@@ -27,13 +34,17 @@ export type StreamChunk =
     | { type: 'tool_call_start'; index: number; id: string; name: string }
     | { type: 'tool_call_args'; index: number; args: string }
     | { type: 'thinking'; content: string }
-    | { type: 'thinking_blocks'; blocks: ThinkingBlockData[] }
+    | { type: 'assistant_blocks'; blocks: AssistantBlock[] }
     | { type: 'usage'; input_tokens: number; output_tokens: number; cache_creation_tokens?: number; cache_read_tokens?: number }
     /** Why the model stopped. 'max_tokens' on a turn with no text is the
-     * signature of thinking having consumed the whole allowance. Diagnostic
-     * only — the no-silence recovery keys off "no output", not off a reason,
-     * so an unreported or unexpected stop reason can't defeat it. */
-    | { type: 'stop_reason'; reason: string }
+     * signature of thinking having consumed the whole allowance. The no-silence
+     * recovery keys off "no output", not off a reason, so an unreported or
+     * unexpected stop reason can't defeat it. 'refusal' carries a category
+     * when the API gives one. */
+    | { type: 'stop_reason'; reason: string; category?: string | null }
+    /** The request moved to a fallback model mid-stream. Tool calls from before
+     * this point were never run and must not be. */
+    | { type: 'fallback' }
     | { type: 'done' };
 
 // --- Request types ---
@@ -51,9 +62,23 @@ export type ThinkingConfig =
     | { type: 'enabled'; budget_tokens: number }
     | { type: 'disabled' };
 
-/** Thinking depth for adaptive models. Set explicitly rather than inheriting the
- * API default so the depth is a value we own and can see in the request. */
-export const THINKING_EFFORT = 'high' as const;
+export type Effort = 'low' | 'medium' | 'high';
+
+/** Thinking depth per route, keyed on `purpose`. Set explicitly rather than
+ * inheriting the API default, which differs between models. Thinking stays on at
+ * every level; a lower level only keeps it shorter. */
+export const ROUTE_EFFORT: Record<string, Effort> = {
+    reply: 'high',
+    'task-reminder': 'medium',
+    'collision-fix': 'medium',
+    'style-scan': 'medium',
+    compaction: 'low',
+};
+export const DEFAULT_EFFORT: Effort = 'high';
+
+/** The last-resort retry keeps the same budget and thinks less, so more of the
+ * allowance can reach visible text. */
+export const FORCED_ANSWER_EFFORT: Effort = 'low';
 
 /** Pre-4.6 models have no `adaptive` mode, only a fixed token budget. */
 const LEGACY_THINKING_BUDGET = 2000;
@@ -76,18 +101,20 @@ const LEGACY_BUDGET_MODELS = /claude-3[.-]7|sonnet-4-5|sonnet-4-0|sonnet-4-2|opu
 
 /** Thinking is always on here and cannot be turned off; an explicit
  * `{type:'disabled'}` is a 400, so the config must simply be omitted. */
-const ALWAYS_THINKING_MODELS = /fable|mythos/i;
+const ALWAYS_THINKING_MODELS = /fable|mythos|opus-5-5/i;
 
 /**
- * Resolve a model's thinking config, or null when the model can't think.
+ * Resolve a model's thinking config, or null when the model can't think or the
+ * config must be omitted.
  *
- * `disableThinking` is the escape hatch behind the no-silence guarantee.
- * `max_tokens` caps thinking AND visible text *together*, and adaptive thinking
- * expands to fill whatever it is given — so a model can spend the entire budget
- * thinking and return zero text and zero tool calls. That is not a budget too
- * small to fix by raising it; no value rules it out. Re-running with thinking
- * off gives the whole budget to visible text, which is what makes the guarantee
- * hold at ANY max_tokens. See AIService.streamAIResponse.
+ * `disableThinking` is the escape hatch behind the no-silence floor. `max_tokens`
+ * caps thinking AND visible text *together*, and adaptive thinking expands to fill
+ * whatever it is given — so a model can spend the entire budget thinking and return
+ * zero text and zero tool calls. That is not a budget too small to fix by raising
+ * it; no value rules it out. On a model that can turn thinking off, re-running that
+ * way gives the whole budget to visible text. An always-thinking model can't, so its
+ * retry runs at FORCED_ANSWER_EFFORT, which leaves more room for text but guarantees
+ * none. See AIService.streamAIResponse.
  */
 export function resolveThinkingConfig(model: string, disableThinking = false): ThinkingConfig | null {
     if (!THINKING_MODELS.test(model)) return null; // never thinks; send no thinking param
@@ -100,6 +127,13 @@ export function resolveThinkingConfig(model: string, disableThinking = false): T
     return LEGACY_BUDGET_MODELS.test(model)
         ? { type: 'enabled', budget_tokens: LEGACY_THINKING_BUDGET }
         : { type: 'adaptive' };
+}
+
+/** `output_config` for a request, or null when it takes none. Adaptive models take
+ * effort, and so does an always-thinking model run with `thinking` omitted. */
+export function resolveOutputConfig(model: string, thinking: ThinkingConfig | null, effort: Effort): { effort: Effort } | null {
+    const takesEffort = thinking?.type === 'adaptive' || (thinking === null && ALWAYS_THINKING_MODELS.test(model));
+    return takesEffort ? { effort } : null;
 }
 
 /**
@@ -142,6 +176,7 @@ export interface StreamRequest {
      * text and no tool calls. See resolveThinkingConfig.
      */
     disableThinking?: boolean;
+    effort?: Effort;
 }
 
 export interface CompletionRequest {
@@ -149,6 +184,7 @@ export interface CompletionRequest {
     messages: ProviderMessage[];
     maxTokens: number;
     model: string;
+    effort?: Effort;
 }
 
 // --- Provider interface ---
@@ -156,6 +192,8 @@ export interface CompletionRequest {
 export interface AIProvider {
     readonly name: string;
     streamChat(request: StreamRequest): AsyncIterable<StreamChunk>;
+    /** Throws rather than return empty or cut-off text: callers replace stored rows
+     * with the result, so a bad completion must not reach them. */
     completeChat(request: CompletionRequest): Promise<string>;
 }
 

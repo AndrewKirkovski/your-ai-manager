@@ -1,9 +1,10 @@
 import TelegramBot from 'node-telegram-bot-api';
 import {addMessageToHistory, getRecentMessageHistory, recordAITokens, bumpStickerUsedCount, getReplyMaxTokens, getActiveTokenGrant, setTokenConsentPending} from './userStore';
 import {executeTool, getAllToolDefinitions, tools} from './tools';
-import {formatDateHuman} from "./dateUtils";
+import {formatDateHuman, formatNowForPrompt} from "./dateUtils";
 import {safeSend, safeEdit, stripSystemTags, stripInternalMarkers, exceedsTelegramLimit, mdToTelegramHtml} from './telegramFormat';
-import type {AIProvider, ProviderMessage, ToolCallInfo, ToolDefinition, ThinkingBlockData} from './aiProvider';
+import {DEFAULT_EFFORT, FORCED_ANSWER_EFFORT, ROUTE_EFFORT} from './aiProvider';
+import type {AIProvider, AssistantBlock, ProviderMessage, ToolCallInfo, ToolDefinition} from './aiProvider';
 
 export interface AIStreamOptions {
     userId: number;
@@ -54,13 +55,20 @@ export interface AIStreamOptions {
     currentRecursionDepth?: number;
     enableToolCalls?: boolean;
     /**
-     * Force thinking off for this run. Set only by the thinking-off floor in
-     * streamAIResponse, when even the maximum granted budget produced no visible
-     * text on a tool-less turn — handing the whole allowance to text guarantees
-     * an answer comes out rather than the bot asking for more forever.
+     * Think as little as the model allows on this run. Set only by the forced-answer
+     * floor in streamAIResponse, when even the maximum granted budget produced no
+     * visible text on a tool-less turn. Thinking goes off where the model allows it
+     * and drops to FORCED_ANSWER_EFFORT where it doesn't, so more of the allowance
+     * reaches text rather than the bot asking for more forever.
      */
     disableThinking?: boolean;
     appendMessagesAfterUser?: ProviderMessage[];
+    /**
+     * The history and current message, built once at depth 0 and handed down the
+     * recursion. A chain must not re-read history between tool calls: a row that
+     * lands mid-chain would change messages the model already answered.
+     */
+    baseMessages?: ProviderMessage[];
     /** Callback to handle images from search results (sent separately, not in history) */
     onImageResults?: (images: string[]) => Promise<void>;
     /** Recorded into stat_entries.note for the token-usage stat. Default 'reply'. */
@@ -109,26 +117,84 @@ export interface AIStreamResult {
     ranOutOfTokens?: boolean;
     /**
      * Any tool executed anywhere in this turn (propagated through recursion).
-     * Gates the thinking-off floor: a tool-less turn is safe to re-run, a
+     * Gates the forced-answer floor: a tool-less turn is safe to re-run, a
      * tool-using one is not (addUserTask has no dedup) and must ask instead.
      */
     usedTools?: boolean;
+    /** The model declined at some depth of this turn. Propagated up like ranOutOfTokens. */
+    refused?: boolean;
 }
+
+/** postponeCount goes up each time the bot itself reschedules a reminder, so it
+ * says nothing about the user. Shown to the model it became the whole subject of
+ * the reminders ("91 переносов"), so it stops at this boundary. */
+const MODEL_HIDDEN_RESULT_FIELDS = new Set(['postponeCount']);
 
 /** Recursively strip <system> from all string leaves in a tool-result value.
  * External data (web search snippets, LuxMed doctor/clinic names, geocoded
  * addresses) reaches the next-turn provider message via tool_result content;
  * without this, a `</system>` in any of those fields could escape our
- * <system>At…</system> wrapper in the following turn. */
+ * <system>At…</system> wrapper in the following turn. Dates pass through
+ * untouched: Object.entries on a Date is empty, so walking one serialized every
+ * task date as `{}` and the model could not read a time back. */
 function deepStripSystemTagsInResult(value: unknown): unknown {
     if (typeof value === 'string') return stripSystemTags(value);
+    if (value instanceof Date) return value;
     if (Array.isArray(value)) return value.map(deepStripSystemTagsInResult);
     if (value && typeof value === 'object') {
         const out: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(value)) out[k] = deepStripSystemTagsInResult(v);
+        for (const [k, v] of Object.entries(value)) {
+            if (!MODEL_HIDDEN_RESULT_FIELDS.has(k)) out[k] = deepStripSystemTagsInResult(v);
+        }
         return out;
     }
     return value;
+}
+
+/** Bookkeeping tools the model has to call that say nothing about the conversation.
+ * Their calls stay out of history and out of `usedTools`, so an ordinary reply
+ * reads as an ordinary reply. */
+const HISTORY_HIDDEN_TOOLS = new Set(['LuxmedAvailabilityReviewed']);
+
+/** One tool record inside a stored assistant row, as written at the tool loop. */
+const STORED_TOOL_RECORD = /\n*\[Tool: ([^\]\n]+)\]\n(?:Input: (.*)\n)?(?:(?:Output|Error|Blocked): (.*)\n)?/g;
+const RENDERED_TOOL_RECORD_CHARS = 200;
+
+/** A stored assistant row split into what the bot said and the tools it ran. */
+function parseStoredRow(content: string): { prose: string; records: string[] } {
+    // Strips on read too: legacy rows predating the write-time strip may still
+    // carry stray <system> chars from past user inputs.
+    const records: string[] = [];
+    const prose = stripSystemTags(content).replace(STORED_TOOL_RECORD, (_row, name: string, input?: string, output?: string) => {
+        if (!HISTORY_HIDDEN_TOOLS.has(name)) {
+            records.push(`${name}(${input ?? ''}) -> ${output ?? ''}`.slice(0, RENDERED_TOOL_RECORD_CHARS));
+        }
+        return '\n';
+    }).trim();
+    return { prose, records };
+}
+
+/**
+ * What the model reads for a stored row. Tool records move into the `<system>`
+ * wrapper, because `[Tool: X]` text in the assistant role teaches the model to
+ * type tool calls as plain text, and that text would reach Telegram. Anything
+ * imitating the wrapper is stripped from display and from history.
+ */
+export function renderHistoryRow(role: 'user' | 'assistant', content: string, when: string): string {
+    if (role !== 'assistant') return `<system>At ${when}</system>\n${stripSystemTags(content)}`;
+    const { prose, records } = parseStoredRow(content);
+    const tools = records.length ? `. Tools run: ${records.join('; ')}` : '';
+    return `<system>At ${when}${tools}</system>\n${prose}`;
+}
+
+/** The bot's own words since the user last wrote, oldest first. Empty when the user
+ * wrote last. */
+export function messagesSinceUserWrote(history: { role: string; content: string }[], limit = 3): string[] {
+    const lastUserRow = history.map(m => m.role).lastIndexOf('user');
+    return history.slice(lastUserRow + 1)
+        .map(m => parseStoredRow(m.content).prose)
+        .filter(Boolean)
+        .slice(-limit);
 }
 
 /**
@@ -157,6 +223,10 @@ const ASK_MORE_AFTER_NOTHING = 'Не хватило лимита токенов,
  * NOT a budget overrun (a refusal, an empty completion), so the user is never
  * left staring at silence wondering whether the bot is alive. */
 const NO_OUTPUT_FALLBACK = 'Задумался и потерял мысль 🐺 Повтори, пожалуйста?';
+
+/** Delivered when the model declined the request, so the user knows it wasn't a
+ * glitch and repeating it won't help. */
+const REFUSAL_LINE = 'С этим не помогу 🐺';
 
 /** Light ack when a turn did real work via a tool (UpdateMemory, TrackStat, …)
  * but the model added no text. "Потерял мысль" would be wrong there — it DID the
@@ -311,7 +381,7 @@ export class AIService {
      * or simply truncate a long answer. The response is consent-gated, not auto:
      *
      *   1. RE-ALLOCATE for free. Ordinary chat fits the base budget; nothing to
-     *      do. (Using the same budget differently — e.g. the thinking-off floor
+     *      do. (Using the same budget differently — e.g. the forced-answer floor
      *      below — is not "spending more" and needs no consent.)
      *   2. ASK to spend more. When the turn couldn't finish within budget, the
      *      bot tells the user and asks permission (setTokenConsentPending). It
@@ -321,10 +391,11 @@ export class AIService {
      *      time-boxed elevated-budget WINDOW. Every request inside it — including
      *      tool-result recursion — resolves to the elevated budget (see
      *      resolveReplyBudget), so a multi-step task finishes on one grant.
-     *   4. THINKING-OFF FLOOR. If even the maximum granted budget yields no text
-     *      on a tool-less turn, re-running would only ask forever — so hand the
-     *      whole allowance to text once to force an answer out. Safe because no
-     *      tool ran (nothing to duplicate).
+     *   4. FORCED-ANSWER FLOOR. If even the maximum granted budget yields no text
+     *      on a tool-less turn, re-running would only ask forever — so re-run once
+     *      with as little thinking as the model allows. Safe because no tool ran
+     *      (nothing to duplicate). No guarantee on always-thinking models, which
+     *      is why step 5 follows it.
      *   5. SPEAK ANYWAY. A non-budget empty (refusal, odd completion) still gets
      *      a fallback line, so the user is never left with silence.
      */
@@ -335,12 +406,17 @@ export class AIService {
             enableToolCalls: (opts.currentRecursionDepth ?? 0) >= 5 ? false : (opts.enableToolCalls ?? true),
         });
 
+        const isTopLevel = (options.currentRecursionDepth ?? 0) === 0;
+
         // Track confirmed delivery across the whole turn, including the tool-call
         // recursion — onTextDelivered fires per level, and a tool-first reply's
         // only visible text may come from depth 1+.
         let delivered = false;
         const observed = withDefaults({
             ...options,
+            // The only place the model learns today's date. Depth 0 only: recursion
+            // inherits this prompt, so the time holds still through a tool chain.
+            systemPrompt: isTopLevel ? `${formatNowForPrompt()}\n${options.systemPrompt}` : options.systemPrompt,
             onTextDelivered: () => {
                 delivered = true;
                 options.onTextDelivered?.();
@@ -350,14 +426,13 @@ export class AIService {
         // One generation. The effective budget (base, persistent, or an active
         // grant window) is resolved inside — freshly, at every recursion level —
         // so a grant the model opens mid-turn covers the continuation too.
-        // `let` because the thinking-off floor may replace it with its retry.
+        // `let` because the forced-answer floor may replace it with its retry.
         let result = await this.streamAIResponseInternal(observed);
 
-        // The consent ask, thinking-off floor, and never-silent fallback are the
+        // The consent ask, forced-answer floor, and never-silent fallback are the
         // turn's final word: only the top level, only for a real user, speaks
         // them. A recursion level (depth > 0) and a silent background run both
         // return their result untouched.
-        const isTopLevel = (options.currentRecursionDepth ?? 0) === 0;
         const userFacing = options.shouldUpdateTelegram ?? true;
         if (!isTopLevel || !userFacing) return result;
 
@@ -367,10 +442,15 @@ export class AIService {
         // Proactive (bot-initiated) turns have nobody waiting: real text was
         // already streamed if there was any, and an empty turn is a valid
         // "nothing to say this tick". Suppress every synthetic floor below — the
-        // consent ask, the thinking-off re-run, and the NO_OUTPUT fallback —
+        // consent ask, the forced-answer re-run, and the NO_OUTPUT fallback —
         // because "Задумался и потерял мысль, повтори" fired at a user who never
         // spoke is self-inflicted noise, not a safety net.
         if (options.proactive) return result;
+
+        if (result.refused) {
+            await safeSend(options.bot, options.userId, REFUSAL_LINE);
+            return { ...result, message: REFUSAL_LINE, rawResponse: REFUSAL_LINE };
+        }
 
         // "Did the user actually SEE text this turn?" — the only reliable signal
         // across recursion. `delivered` flips on any confirmed send at any depth
@@ -382,12 +462,12 @@ export class AIService {
         const sawText = delivered || hasVisibleText(result.message);
 
         if (result.ranOutOfTokens) {
-            // Thinking-off floor: a tool-less, text-less turn at the maximum
+            // Forced-answer floor: a tool-less, text-less turn at the maximum
             // granted budget can't be helped by asking for still more — the model
-            // just needs the whole allowance for text. Force an answer out.
+            // needs more of the allowance for text. Try once to force an answer out.
             const grantActive = (await getActiveTokenGrant(options.userId)) !== null;
             if (!result.usedTools && !sawText && grantActive) {
-                console.warn(`🔇→🗣 ${options.userId}: granted budget still produced no text — forcing an answer with thinking off`);
+                console.warn(`🔇→🗣 ${options.userId}: granted budget still produced no text — retrying with as little thinking as the model allows`);
                 const forced = await this.streamAIResponseInternal({
                     ...observed,
                     disableThinking: true,
@@ -496,6 +576,8 @@ export class AIService {
         // internal token accounting honest about what we actually paid for.
         let usageInputTokens = 0;
         let usageOutputTokens = 0;
+        let usageCacheReadTokens = 0;
+        let usageCacheWriteTokens = 0;
 
         try {
             // Tracks the message THIS generation is streaming into, so mid-stream
@@ -591,37 +673,8 @@ export class AIService {
                 timestamp: new Date().toISOString()
             });
 
-            // Get recent message history for context
-            const recentMessages = await this.getRecentMessages(userId, 30);
-
-            // Build messages for provider. When userMessage is empty (burst-
-            // coalesce path: the bursted messages are already in history and
-            // we don't have a single fresh "current" turn to wrap), skip the
-            // synthetic stub — otherwise the model sees N user msgs followed
-            // by an empty-bodied wrapper and can get confused about what to
-            // answer. The most-recent history row IS the "current" turn.
-            const messages: ProviderMessage[] = [
-                ...recentMessages,
-                ...(userMessage
-                    ? [{ role: 'user' as const, content: `<system>At ${new Date().toISOString()}</system>\n${userMessage}` }]
-                    : []),
-                ...(appendMessagesAfterUser || []),
-            ];
-
-            // The 4.6+ models reject a conversation that ends with an assistant
-            // message ("does not support assistant message prefill"). That can
-            // happen on the empty-userMessage burst path: while a slow tool-call
-            // turn is still running, a newer user message is recorded, then the
-            // slow turn's assistant/tool-summary rows land AFTER it — so history
-            // now ends with an assistant row and the burst reply 400s (seen in
-            // prod 2026-07-17, request req_011Cd7x4). Trim trailing assistant
-            // rows so the array ends on the user's actual last message; the
-            // trimmed summaries' facts (created tasks/routines) still reach the
-            // model via getCurrentInfo. tool_result tails are fine — they are
-            // part of a user turn — so only 'assistant' is trimmed.
-            while (messages.length && messages[messages.length - 1].role === 'assistant') {
-                messages.pop();
-            }
+            const baseMessages = options.baseMessages ?? await this.buildBaseMessages(userId, userMessage, addUserToHistory);
+            const messages: ProviderMessage[] = [...baseMessages, ...(appendMessagesAfterUser || [])];
 
             // Get tool definitions if enabled. allowedTools narrows the offer —
             // background runs (collision fixer) get only schedule tools so the
@@ -640,14 +693,15 @@ export class AIService {
                 model,
                 maxTokens,
                 toolCount: toolDefs?.length ?? 0,
-                ...(options.disableThinking ? { thinking: 'off (no-silence retry)' } : {}),
+                ...(options.disableThinking ? { thinking: 'minimal (no-silence retry)' } : {}),
             });
 
             let aiResponseAccumulated = '';
             let historyResponseAccumulated = '';
             const toolCalls: ToolCallInfo[] = [];
-            let thinkingBlocks: ThinkingBlockData[] | undefined;
+            let assistantBlocks: AssistantBlock[] | undefined;
             let stopReason: string | undefined;
+            let refusalCategory: string | null | undefined;
             // usageInputTokens/usageOutputTokens are declared at function scope
             // above (so the catch block can read them on abort).
 
@@ -694,6 +748,9 @@ export class AIService {
                             model,
                             signal: options.signal,
                             disableThinking: options.disableThinking,
+                            effort: options.disableThinking
+                                ? FORCED_ANSWER_EFFORT
+                                : ROUTE_EFFORT[options.purpose ?? 'reply'] ?? DEFAULT_EFFORT,
                         });
 
                         for await (const chunk of stream) {
@@ -704,6 +761,12 @@ export class AIService {
 
                                 case 'stop_reason':
                                     stopReason = chunk.reason;
+                                    refusalCategory = chunk.category;
+                                    break;
+
+                                case 'fallback':
+                                    // Calls from the declined model were never run.
+                                    toolCalls.length = 0;
                                     break;
 
                                 case 'tool_call_start': {
@@ -731,14 +794,16 @@ export class AIService {
                                     console.debug(`💭 [thinking] ${chunk.content.substring(0, 200)}`);
                                     break;
 
-                                case 'thinking_blocks':
-                                    // Captured thinking blocks (with signatures) for multi-turn continuity
-                                    thinkingBlocks = chunk.blocks;
+                                case 'assistant_blocks':
+                                    // The turn in stream order, for multi-turn thinking continuity
+                                    assistantBlocks = chunk.blocks;
                                     break;
 
                                 case 'usage':
                                     usageInputTokens = chunk.input_tokens;
                                     usageOutputTokens = chunk.output_tokens;
+                                    usageCacheReadTokens = chunk.cache_read_tokens ?? 0;
+                                    usageCacheWriteTokens = chunk.cache_creation_tokens ?? 0;
                                     break;
 
                                 case 'done':
@@ -762,10 +827,12 @@ export class AIService {
                         // reply (which would set messageId and block the retry).
                         aiResponseAccumulated = '';
                         toolCalls.length = 0;
-                        thinkingBlocks = undefined;
+                        assistantBlocks = undefined;
                         stopReason = undefined;
                         usageInputTokens = 0;
                         usageOutputTokens = 0;
+                        usageCacheReadTokens = 0;
+                        usageCacheWriteTokens = 0;
 
                         const delay = retryDelayMs(attempt, streamErr);
                         console.warn(`⟳ [${userId}] provider ${kind} error (attempt ${attempt}/${MAX_STREAM_ATTEMPTS}) — retrying in ${delay}ms: ${errMsg(streamErr)}`);
@@ -788,7 +855,7 @@ export class AIService {
             if (options.signal?.aborted) {
                 console.log(`🛑 AI reply aborted for ${userId} (SDK silent-exit on signal)`);
                 if (usageInputTokens || usageOutputTokens) {
-                    recordAITokens(userId, usageInputTokens, usageOutputTokens, options.purpose ?? 'reply', model)
+                    recordAITokens(userId, usageInputTokens, usageOutputTokens, options.purpose ?? 'reply', model, usageCacheReadTokens, usageCacheWriteTokens)
                         .catch(err => console.warn('[token-stat] partial recordAITokens (silent abort) failed:', err instanceof Error ? err.message : err));
                 }
                 // This is the USUAL abort path (the catch block is the rare
@@ -803,7 +870,7 @@ export class AIService {
             // Catch is required: SQLite write contention can reject and we don't want
             // an unhandled rejection killing the process.
             const purpose = options.purpose ?? 'reply';
-            recordAITokens(userId, usageInputTokens, usageOutputTokens, purpose, model)
+            recordAITokens(userId, usageInputTokens, usageOutputTokens, purpose, model, usageCacheReadTokens, usageCacheWriteTokens)
                 .catch(err => console.warn('[token-stat] recordAITokens failed:', err instanceof Error ? err.message : err));
 
             // Detect inline custom-emoji + sticker references the AI emitted in its reply.
@@ -835,6 +902,15 @@ export class AIService {
             // (the consent ask offers to extend it) and must be shown and kept.
             await updateTelegramMessage(true);
 
+            // A decline ends the turn: text before it isn't an answer to keep, and
+            // tool calls before it must not run.
+            const refused = stopReason === 'refusal';
+            if (refused) {
+                console.warn(`🚫 ${userId}: the model declined this turn`, { category: refusalCategory ?? 'none' });
+                toolCalls.length = 0;
+                historyResponseAccumulated = '';
+            }
+
             // Carries the deepest generation's terminal state up so the top level
             // can tell whether the WHOLE turn finished within budget.
             let recursiveResult: AIStreamResult | undefined;
@@ -856,7 +932,10 @@ export class AIService {
                         name: tc.name,
                         arguments: tc.arguments || '{}',
                     })),
-                    thinkingBlocks,
+                    // Text is stripped as above; thinking and tool blocks replay as they came.
+                    blocks: assistantBlocks
+                        ?.map(block => block.type === 'text' ? { ...block, text: stripSystemTags(block.text) } : block)
+                        .filter(block => block.type !== 'text' || block.text),
                 });
 
                 for (const toolCall of toolCalls) {
@@ -895,6 +974,7 @@ export class AIService {
                     try {
                         parsedArgs = JSON.parse(toolArgs || '{}');
                     } catch { /* ignore parse errors */ }
+                    const hiddenFromHistory = HISTORY_HIDDEN_TOOLS.has(toolName);
 
                     // Log tool call with arguments
                     console.log(`\n🔧 Tool Call: ${toolName}`);
@@ -923,7 +1003,7 @@ export class AIService {
                         }
 
                         // Log result summary
-                        const resultStr = JSON.stringify(result);
+                        const resultStr = JSON.stringify(deepStripSystemTagsInResult(result));
                         const logSummary = resultStr.length > 500
                             ? resultStr.substring(0, 500) + '...'
                             : resultStr;
@@ -936,10 +1016,12 @@ export class AIService {
                         newAppendedMessages.push({
                             role: 'tool_result',
                             toolCallId: toolCall.id,
-                            content: JSON.stringify(deepStripSystemTagsInResult(result)),
+                            content: resultStr,
                         });
 
-                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nOutput: ${stripSystemTags(historySummary)}\n`;
+                        if (!hiddenFromHistory) {
+                            historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nOutput: ${stripSystemTags(historySummary)}\n`;
+                        }
                     } catch (error) {
                         const errorMsg = error instanceof Error ? error.message : String(error);
                         console.log(`   ❌ Error: ${errorMsg}\n`);
@@ -950,7 +1032,9 @@ export class AIService {
                             content: JSON.stringify({error: errorMsg}),
                         });
 
-                        historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nError: ${stripSystemTags(errorMsg)}\n`;
+                        if (!hiddenFromHistory) {
+                            historyResponseAccumulated = `${historyResponseAccumulated}\n\n[Tool: ${toolName}]\nInput: ${JSON.stringify(parsedArgs)}\nError: ${stripSystemTags(errorMsg)}\n`;
+                        }
                     }
                 }
 
@@ -973,8 +1057,9 @@ export class AIService {
                         }
                     }
                     // Aborted, not empty — tools already ran here, so this must
-                    // never be re-run (addUserTask has no dedup).
-                    return { message: '', rawResponse: '', emptyReason: 'aborted' };
+                    // never be re-run (addUserTask has no dedup). A child hands its
+                    // record up, because only depth 0 writes history.
+                    return { message: '', rawResponse: historyResponseAccumulated, emptyReason: 'aborted' };
                 }
 
                 console.log(`🔄 Continuing with ${newAppendedMessages.length} tool result(s), depth: ${currentRecursionDepth + 1}`);
@@ -983,8 +1068,13 @@ export class AIService {
                     ...options,
                     currentRecursionDepth: currentRecursionDepth + 1,
                     appendMessagesAfterUser: newAppendedMessages,
+                    baseMessages,
                     addUserToHistory: false, // Don't add recursive calls to history
-                    // disableThinking belongs to THIS level's thinking-off floor
+                    // Depth 0 writes one row for the whole chain. A row per level
+                    // left consecutive assistant rows, which compaction then
+                    // rewrote as third-person summaries.
+                    addAssistantToHistory: false,
+                    // disableThinking belongs to THIS level's forced-answer floor
                     // only; letting it leak down would silently disable thinking
                     // for the rest of the chain. The child resolves its own budget
                     // from the DB, so a grant applies without being passed in.
@@ -1013,7 +1103,7 @@ export class AIService {
                         ? safeAssistantContent.substring(0, 100) + '...'
                         : safeAssistantContent;
                     console.log(`📝 Added assistant message to history: "${preview.replace(/\n/g, ' ')}"`);
-                } else {
+                } else if (!refused) {
                     // Thinking-only completion — no text, no tools. Nothing to
                     // persist; the top level asks the user for more budget.
                     console.warn(`⚠️ AI emitted thinking-only response for ${userId} — no visible output, no history row written`, { stopReason });
@@ -1024,18 +1114,22 @@ export class AIService {
             // recursed, the deepest child is the turn's tail and carries the
             // verdict; otherwise it's our own stop_reason with nothing left to
             // run. usedTools is true if any tool ran at this level or below —
-            // it gates the thinking-off floor (only a tool-less turn is safe to
+            // it gates the forced-answer floor (only a tool-less turn is safe to
             // re-run).
             const ownRanOut = stopReason === 'max_tokens' && toolCalls.length === 0;
             const ranOutOfTokens = recursiveResult ? !!recursiveResult.ranOutOfTokens : ownRanOut;
-            const usedTools = toolCalls.length > 0 || !!recursiveResult?.usedTools;
+            const usedTools = toolCalls.some(tc => !HISTORY_HIDDEN_TOOLS.has(tc.name)) || !!recursiveResult?.usedTools;
 
             return {
                 message: aiResponseAccumulated,
-                rawResponse: aiResponseAccumulated,
+                // This level's text, tool records and everything below it, so the
+                // row depth 0 writes keeps tool records from every depth.
+                rawResponse: historyResponseAccumulated,
+                ...(recursiveResult?.emptyReason ? { emptyReason: recursiveResult.emptyReason } : {}),
                 toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
                 ...(ranOutOfTokens ? { ranOutOfTokens: true } : {}),
                 ...(usedTools ? { usedTools: true } : {}),
+                ...(refused || recursiveResult?.refused ? { refused: true } : {}),
             };
 
         } catch (error) {
@@ -1061,7 +1155,7 @@ export class AIService {
                 // before the for-await throws, so usageInputTokens may be set.
                 // Record it so internal stats reflect what the provider billed.
                 if (usageInputTokens || usageOutputTokens) {
-                    recordAITokens(userId, usageInputTokens, usageOutputTokens, options.purpose ?? 'reply', model)
+                    recordAITokens(userId, usageInputTokens, usageOutputTokens, options.purpose ?? 'reply', model, usageCacheReadTokens, usageCacheWriteTokens)
                         .catch(err => console.warn('[token-stat] partial recordAITokens (abort) failed:', err instanceof Error ? err.message : err));
                 }
                 // Marked 'aborted' so the top level treats this silence as
@@ -1132,6 +1226,35 @@ export class AIService {
     }
 
     /**
+     * Recent history plus this turn's message, as sent on every request of a chain.
+     *
+     * When userMessage is empty (burst-coalesce path: the bursted messages are
+     * already in history) or addUserToHistory just wrote it, the newest row IS the
+     * current turn, so no second copy goes in.
+     */
+    private static async buildBaseMessages(userId: number, userMessage: string, alreadyInHistory: boolean): Promise<ProviderMessage[]> {
+        const messages: ProviderMessage[] = [
+            ...await this.getRecentMessages(userId, 30),
+            ...(userMessage && !alreadyInHistory ? [{ role: 'user' as const, content: userMessage }] : []),
+        ];
+
+        // The 4.6+ models reject a conversation that ends with an assistant
+        // message ("does not support assistant message prefill"). That can
+        // happen on the empty-userMessage burst path: while a slow tool-call
+        // turn is still running, a newer user message is recorded, then the
+        // slow turn's assistant/tool-summary rows land AFTER it — so history
+        // now ends with an assistant row and the burst reply 400s (seen in
+        // prod 2026-07-17, request req_011Cd7x4). Trim trailing assistant
+        // rows so the array ends on the user's actual last message; the
+        // trimmed summaries' facts (created tasks/routines) still reach the
+        // model via getCurrentInfo.
+        while (messages.length && messages[messages.length - 1].role === 'assistant') {
+            messages.pop();
+        }
+        return messages;
+    }
+
+    /**
      * Get recent messages for context
      */
     private static async getRecentMessages(userId: number, limit: number = 30): Promise<ProviderMessage[]> {
@@ -1139,9 +1262,7 @@ export class AIService {
 
         return recentMessages.map(m => ({
             role: m.role as 'user' | 'assistant',
-            // Defense-in-depth: legacy rows predating the write-time strip may still carry
-            // stray <system> chars from past user inputs. Strip on read too.
-            content: `<system>At ${formatDateHuman(m.timestamp)}</system>\n${stripSystemTags(m.content)}`
+            content: renderHistoryRow(m.role as 'user' | 'assistant', m.content, formatDateHuman(m.timestamp)),
         }));
     }
 }

@@ -7,7 +7,7 @@ import type {
     ProviderMessage,
     ToolDefinition,
 } from './aiProvider';
-import { resolveThinkingConfig, floorMaxTokensForThinking, THINKING_EFFORT } from './aiProvider';
+import { resolveThinkingConfig, resolveOutputConfig, floorMaxTokensForThinking, DEFAULT_EFFORT } from './aiProvider';
 
 export class OpenAIProvider implements AIProvider {
     readonly name = 'openai';
@@ -48,14 +48,16 @@ export class OpenAIProvider implements AIProvider {
         // Enable extended thinking via extra_body (Anthropic compat layer)
         if (this.isAnthropicEndpoint) {
             const thinkingConfig = resolveThinkingConfig(request.model, request.disableThinking);
+            // Pin thinking depth explicitly rather than inheriting the API
+            // default — mirrors the native provider.
+            const outputConfig = resolveOutputConfig(request.model, thinkingConfig, request.effort ?? DEFAULT_EFFORT);
+            if (thinkingConfig || outputConfig) {
+                requestOptions.extra_body = {
+                    ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
+                    ...(outputConfig ? { output_config: outputConfig } : {}),
+                };
+            }
             if (thinkingConfig) {
-                const extraBody: Record<string, unknown> = { thinking: thinkingConfig };
-                // Pin adaptive thinking depth explicitly rather than inheriting
-                // the API default — mirrors the native provider.
-                if (thinkingConfig.type === 'adaptive') {
-                    extraBody.output_config = { effort: THINKING_EFFORT };
-                }
-                requestOptions.extra_body = extraBody;
                 requestOptions.max_tokens = floorMaxTokensForThinking(request.maxTokens, thinkingConfig);
             }
         }
@@ -149,7 +151,12 @@ export class OpenAIProvider implements AIProvider {
             messages,
         });
 
-        return response.choices[0]?.message?.content || '';
+        const choice = response.choices[0];
+        const text = choice?.message?.content || '';
+        if (!text.trim() || choice?.finish_reason === 'length' || choice?.finish_reason === 'content_filter') {
+            throw new Error(`Completion unusable: finish_reason=${choice?.finish_reason}`);
+        }
+        return text;
     }
 
     private convertMessages(

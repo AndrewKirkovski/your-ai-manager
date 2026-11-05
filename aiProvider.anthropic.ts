@@ -1,14 +1,27 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type {
     AIProvider,
+    AssistantBlock,
     StreamRequest,
     CompletionRequest,
     StreamChunk,
     ProviderMessage,
     ToolDefinition,
-    ThinkingBlockData,
 } from './aiProvider';
-import { resolveThinkingConfig, floorMaxTokensForThinking, THINKING_EFFORT } from './aiProvider';
+import { resolveThinkingConfig, resolveOutputConfig, floorMaxTokensForThinking, DEFAULT_EFFORT } from './aiProvider';
+
+/** Models that opt in to the server retrying a declined request on another model.
+ * Without this a request on these models simply stops on a refusal. */
+const SERVER_FALLBACK_MODELS = /opus-5-5/i;
+const SERVER_FALLBACK_BETA = 'server-side-fallback-2026-07-01';
+
+function parseToolInput(json: string): unknown {
+    try {
+        return JSON.parse(json || '{}');
+    } catch {
+        return {};
+    }
+}
 
 export class AnthropicProvider implements AIProvider {
     readonly name = 'anthropic';
@@ -24,6 +37,7 @@ export class AnthropicProvider implements AIProvider {
 
         const thinkingConfig = resolveThinkingConfig(request.model, request.disableThinking);
         const maxTokens = floorMaxTokensForThinking(request.maxTokens, thinkingConfig);
+        const outputConfig = resolveOutputConfig(request.model, thinkingConfig, request.effort ?? DEFAULT_EFFORT);
         // Build the system param. When `systemPromptCachePrefix` is provided we
         // emit it as a separate text block with cache_control={type:'ephemeral'}
         // so Anthropic prompt-caching applies to the static scaffolding. The
@@ -43,10 +57,9 @@ export class AnthropicProvider implements AIProvider {
             system: systemParam,
             messages,
             ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
-            // Effort drives adaptive thinking depth; the API defaults it to
-            // 'high' but say so explicitly so the depth is visible at the call
-            // site rather than inherited.
-            ...(thinkingConfig?.type === 'adaptive' ? { output_config: { effort: THINKING_EFFORT } } : {}),
+            // Effort drives thinking depth. API defaults differ between models,
+            // so say it explicitly and keep the depth visible at the call site.
+            ...(outputConfig ? { output_config: outputConfig } : {}),
             stream: true as const,
         };
 
@@ -59,17 +72,23 @@ export class AnthropicProvider implements AIProvider {
         // SDK's underlying fetch. When the signal aborts, the for-await loop
         // below throws AbortError; the try/finally still runs and closes the
         // socket. Anthropic SDK reads `signal` from the second arg's options.
-        const stream = await this.client.messages.create(
-            params,
-            request.signal ? { signal: request.signal } : undefined,
-        );
+        const requestOptions = request.signal ? { signal: request.signal } : undefined;
+        const stream = SERVER_FALLBACK_MODELS.test(request.model)
+            ? await this.client.beta.messages.create(
+                { ...params, betas: [SERVER_FALLBACK_BETA], fallbacks: 'default' } as unknown as Anthropic.Beta.Messages.MessageCreateParamsStreaming,
+                requestOptions,
+            )
+            : await this.client.messages.create(params, requestOptions);
 
         // Track tool call indices — Anthropic uses content_block index, we map to sequential tool index
         let toolIndex = -1;
 
-        // Capture thinking blocks (text + cryptographic signature) for multi-turn continuity
-        const thinkingBlocks: ThinkingBlockData[] = [];
+        // The turn in stream order. Thinking can sit between text and tool blocks,
+        // and it must be replayed exactly where it came, with its signature.
+        const blocks: AssistantBlock[] = [];
         let currentThinking: { thinking: string; signature: string } | null = null;
+        let currentText: string | null = null;
+        let currentTool: { id: string; name: string; json: string } | null = null;
         // Anthropic emits prompt-side input_tokens in message_start, output_tokens in message_delta usage.
         let inputTokens = 0;
         let cacheCreationTokens = 0;
@@ -79,22 +98,33 @@ export class AnthropicProvider implements AIProvider {
         // throw, return, or generator.throw — we abort the underlying HTTP socket
         // instead of letting the SDK keep it open until the server hangs up.
         try {
-        for await (const event of stream as AsyncIterable<Anthropic.MessageStreamEvent>) {
+        for await (const event of stream as unknown as AsyncIterable<Anthropic.MessageStreamEvent>) {
             switch (event.type) {
                 case 'content_block_start': {
                     const block = event.content_block;
                     if (block.type === 'tool_use') {
                         toolIndex++;
+                        currentTool = { id: block.id, name: block.name, json: '' };
                         yield {
                             type: 'tool_call_start',
                             index: toolIndex,
                             id: block.id,
                             name: block.name,
                         };
+                    } else if (block.type === 'text') {
+                        currentText = '';
                     } else if (block.type === 'thinking') {
                         currentThinking = { thinking: '', signature: '' };
                     } else if (block.type === 'redacted_thinking') {
-                        thinkingBlocks.push({ type: 'redacted_thinking', data: (block as { data: string }).data });
+                        blocks.push({ type: 'redacted_thinking', data: (block as { data: string }).data });
+                    } else if ((block as { type: string }).type === 'fallback') {
+                        // Only text carries over to the fallback model. Thinking and
+                        // tool blocks before this point must not be echoed back.
+                        const text = blocks.filter(b => b.type === 'text');
+                        blocks.length = 0;
+                        blocks.push(...text);
+                        toolIndex = -1;
+                        yield { type: 'fallback' };
                     }
                     break;
                 }
@@ -102,6 +132,9 @@ export class AnthropicProvider implements AIProvider {
                 case 'content_block_delta': {
                     const delta = event.delta;
                     if (delta.type === 'text_delta') {
+                        if (currentText !== null) {
+                            currentText += delta.text;
+                        }
                         yield { type: 'text', content: delta.text };
                     } else if (delta.type === 'thinking_delta') {
                         if (currentThinking) {
@@ -113,6 +146,9 @@ export class AnthropicProvider implements AIProvider {
                             currentThinking.signature += delta.signature;
                         }
                     } else if (delta.type === 'input_json_delta') {
+                        if (currentTool) {
+                            currentTool.json += delta.partial_json;
+                        }
                         yield {
                             type: 'tool_call_args',
                             index: toolIndex,
@@ -124,12 +160,23 @@ export class AnthropicProvider implements AIProvider {
 
                 case 'content_block_stop': {
                     if (currentThinking) {
-                        thinkingBlocks.push({
+                        blocks.push({
                             type: 'thinking',
                             thinking: currentThinking.thinking,
                             signature: currentThinking.signature,
                         });
                         currentThinking = null;
+                    } else if (currentTool) {
+                        blocks.push({
+                            type: 'tool_use',
+                            id: currentTool.id,
+                            name: currentTool.name,
+                            input: parseToolInput(currentTool.json),
+                        });
+                        currentTool = null;
+                    } else if (currentText !== null) {
+                        if (currentText) blocks.push({ type: 'text', text: currentText });
+                        currentText = null;
                     }
                     break;
                 }
@@ -156,13 +203,13 @@ export class AnthropicProvider implements AIProvider {
                 }
 
                 case 'message_delta': {
-                    // Emit accumulated thinking blocks before done (needed for recursive tool calls)
-                    if (thinkingBlocks.length > 0) {
-                        yield { type: 'thinking_blocks', blocks: thinkingBlocks };
+                    // Emit the whole turn before done (needed for recursive tool calls)
+                    if (blocks.length > 0) {
+                        yield { type: 'assistant_blocks', blocks };
                     }
-                    const stop = (event as Anthropic.MessageDeltaEvent).delta?.stop_reason;
-                    if (stop) {
-                        yield { type: 'stop_reason', reason: stop };
+                    const delta = (event as Anthropic.MessageDeltaEvent).delta as { stop_reason?: string | null; stop_details?: { category?: string | null } | null };
+                    if (delta?.stop_reason) {
+                        yield { type: 'stop_reason', reason: delta.stop_reason, category: delta.stop_details?.category };
                     }
                     // Emit usage with the final output_token count from message_delta
                     const u = (event as Anthropic.MessageDeltaEvent).usage;
@@ -193,11 +240,15 @@ export class AnthropicProvider implements AIProvider {
 
     async completeChat(request: CompletionRequest): Promise<string> {
         const messages = this.convertMessages(request.messages);
+        const thinking = resolveThinkingConfig(request.model);
+        const outputConfig = resolveOutputConfig(request.model, thinking, request.effort ?? DEFAULT_EFFORT);
 
         const response = await this.client.messages.create({
             model: request.model,
-            max_tokens: request.maxTokens,
+            max_tokens: floorMaxTokensForThinking(request.maxTokens, thinking),
             ...(request.systemPrompt && { system: request.systemPrompt }),
+            ...(thinking ? { thinking } : {}),
+            ...(outputConfig ? { output_config: outputConfig } : {}),
             messages,
         });
 
@@ -205,7 +256,11 @@ export class AnthropicProvider implements AIProvider {
         const textBlocks = response.content.filter(
             (b): b is Anthropic.TextBlock => b.type === 'text'
         );
-        return textBlocks.map(b => b.text).join('') || '';
+        const text = textBlocks.map(b => b.text).join('');
+        if (!text.trim() || response.stop_reason === 'max_tokens' || response.stop_reason === 'refusal') {
+            throw new Error(`Completion unusable: stop_reason=${response.stop_reason}`);
+        }
+        return text;
     }
 
     private convertMessages(messages: ProviderMessage[]): Anthropic.MessageParam[] {
@@ -215,25 +270,12 @@ export class AnthropicProvider implements AIProvider {
             if (msg.role === 'user') {
                 result.push({ role: 'user', content: msg.content });
             } else if (msg.role === 'assistant') {
-                const contentBlocks: Anthropic.ContentBlockParam[] = [];
-
-                // Add thinking blocks first (required for multi-turn thinking continuity)
-                if (msg.thinkingBlocks?.length) {
-                    for (const tb of msg.thinkingBlocks) {
-                        if (tb.type === 'thinking') {
-                            contentBlocks.push({
-                                type: 'thinking',
-                                thinking: tb.thinking,
-                                signature: tb.signature,
-                            });
-                        } else {
-                            contentBlocks.push({
-                                type: 'redacted_thinking',
-                                data: tb.data,
-                            });
-                        }
-                    }
+                if (msg.blocks?.length) {
+                    result.push({ role: 'assistant', content: msg.blocks as Anthropic.ContentBlockParam[] });
+                    continue;
                 }
+
+                const contentBlocks: Anthropic.ContentBlockParam[] = [];
 
                 // Add text if present
                 if (msg.content) {
@@ -243,17 +285,11 @@ export class AnthropicProvider implements AIProvider {
                 // Convert tool calls to tool_use content blocks
                 if (msg.toolCalls?.length) {
                     for (const tc of msg.toolCalls) {
-                        let input: unknown;
-                        try {
-                            input = JSON.parse(tc.arguments || '{}');
-                        } catch {
-                            input = {};
-                        }
                         contentBlocks.push({
                             type: 'tool_use',
                             id: tc.id,
                             name: tc.name,
-                            input: input as Record<string, unknown>,
+                            input: parseToolInput(tc.arguments) as Record<string, unknown>,
                         });
                     }
                 }

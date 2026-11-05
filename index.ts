@@ -30,7 +30,7 @@ import {
     setUser,
     getAllUsers,
     getAllRoutines,
-    getAllTasks, getTask, Task, updateUserTask,
+    getAllTasks, getTask, Task, updateUserTask, getRecentMessageHistory,
     cleanupOldTasks,
     addImageToCache,
     getTrackedStatNames, getLatestStat, getStatCount,
@@ -40,13 +40,14 @@ import {
     isTokenConsentPending,
 } from "./userStore";
 import {addUserTask, generateShortId, addMessageToHistory} from './userStore';
-import {AIService} from './aiService';
+import {AIService, messagesSinceUserWrote} from './aiService';
 import {safeSend, stripSystemTags, textify} from './telegramFormat';
 import {runHistoryCompaction} from './historyCompaction';
 import {runStyleScan} from './styleScan';
 import {runCollisionFixer} from './taskCollisionFixer';
 import {CronExpressionParser} from 'cron-parser';
-import {formatDateHuman, formatCronHuman, getCurrentTime} from './dateUtils';
+import {formatDateHuman, formatDateWithOffset, formatCronHuman, getCurrentTime} from './dateUtils';
+import {nextPingFloor, settleRemindedTask} from './tools.tasks';
 import {initializeMediaParser, getMediaParser} from './mediaParser';
 import {initStatTools} from './tools.stats';
 import {initStickerCacheTools} from './tools.stickercache';
@@ -455,10 +456,10 @@ Routines/Schedule:
 ${activeRoutines.map(r => `id: ${r.id} cron: ${r.cron} defaultAnnoyance: ${r.defaultAnnoyance} name: ${stripSystemTags(r.name)} timesCompleted: ${r.stats.completed} timesFailed: ${r.stats.failed}`).join('\n') || 'no active routines'}
 
 Pending Tasks:
-${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${stripSystemTags(t.name)}`).join('\n') || 'no active tasks'}
+${pendingTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?formatDateWithOffset(t.dueAt):'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} name: ${stripSystemTags(t.name)}`).join('\n') || 'no active tasks'}
 
 Tasks awaiting a reminder decision — remind the user out loud NOW, then set the next ping (or fail if the deadline passed); never change their schedule without a visible message:
-${replanningTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?t.dueAt.toISOString():'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} postponeCount: ${t.postponeCount} name: ${stripSystemTags(t.name)}`).join('\n') || 'none'}
+${replanningTasks.map(t => `id: ${t.id} dueAt: ${t.dueAt?formatDateWithOffset(t.dueAt):'none'} pingAt: ${formatDateHuman(t.pingAt)} annoyance: ${t.annoyance} name: ${stripSystemTags(t.name)}`).join('\n') || 'none'}
 
 Memory (stale entries may not reflect current state — treat older facts with appropriate skepticism):${formatMemoryBlock(memoryRecords)}
 
@@ -556,15 +557,8 @@ async function replyToUser(
     }
 }
 
-// Per-annoyance backoff for the recovery path — when a batch reminder turn
-// leaves an action task un-rescheduled, it's reset to pending this far out so
-// it re-pings on schedule instead of vanishing (mirrors the intervals the
-// reminder prompt asks the model to use).
-const REPING_MS: Record<string, number> = {
-    low: 150 * 60_000, // ~2.5h
-    med: 45 * 60_000,
-    high: 4 * 60_000,
-};
+// Enough rows to find what the bot said since the user last wrote.
+const REMINDER_HISTORY_ROWS = 8;
 
 // Check routines and tasks every minute. `isRunning` guard prevents overlap
 // if a slow AI call from a previous tick hasn't finished yet (otherwise two
@@ -717,15 +711,21 @@ cron.schedule('* * * * *', async () => {
 
                     const memory = await getCurrentInfo(user.userId);
                     const anyAction = survivors.some(t => t.requiresAction);
+                    // One moment for the limit the model is shown and the limit
+                    // enforced after the turn, so obeying it never fails by seconds.
+                    const remindedAt = new Date();
                     const batch: BatchReminderTask[] = survivors.map(t => ({
                         id: t.id, name: t.name, requiresAction: t.requiresAction,
                         annoyance: t.annoyance, dueAt: t.dueAt,
+                        earliestNextPing: nextPingFloor(t, remindedAt) ?? undefined,
                     }));
+
+                    const sinceUserWrote = messagesSinceUserWrote(await getRecentMessageHistory(user.userId, REMINDER_HISTORY_ROWS));
 
                     let delivered = false;
                     const result = await AIService.streamAIResponse({
                         userId: user.userId,
-                        userMessage: BATCH_REMINDER_PROMPT(memory, batch),
+                        userMessage: BATCH_REMINDER_PROMPT(memory, batch, sinceUserWrote),
                         systemPromptCachePrefix: getSystemPrompt(),
                         systemPrompt: '', // memory inlined into the batch prompt
                         bot,
@@ -761,26 +761,10 @@ cron.schedule('* * * * *', async () => {
                         if (sent) delivered = true;
                     }
 
-                    // Recovery: any ACTION task the model didn't reschedule/fail is
-                    // still needs_replanning — reset it to pending on an
-                    // annoyance-based backoff so batching never strands a task (it
-                    // re-pings on schedule instead of vanishing until the user next
-                    // chats). Deterministic backstop for "reminded but forgot to
-                    // set the next ping".
+                    // Deterministic backstop: settle what the model left behind, so
+                    // batching never strands a task and no ping lands too soon.
                     for (const dt of survivors) {
-                        if (!dt.requiresAction) continue;
-                        const fresh = await getTask(user.userId, dt.id);
-                        if (fresh && fresh.status === 'needs_replanning') {
-                            const backoff = REPING_MS[fresh.annoyance] ?? REPING_MS.med;
-                            await updateUserTask(user.userId, dt.id, (t) => {
-                                if (t.status !== 'needs_replanning') return;
-                                t.status = 'pending';
-                                t.pingAt = new Date(Date.now() + backoff);
-                            });
-                            console.log(`♻️ Reset un-rescheduled task to pending (+${Math.round(backoff / 60_000)}min):`, {
-                                userId: user.userId, taskId: dt.id, name: dt.name,
-                            });
-                        }
+                        if (dt.requiresAction) await settleRemindedTask(user.userId, dt.id, remindedAt);
                     }
 
                     console.log(result);
@@ -796,11 +780,7 @@ cron.schedule('* * * * *', async () => {
                     for (const dt of marked) {
                         if (!dt.requiresAction) continue;
                         try {
-                            await updateUserTask(user.userId, dt.id, (t) => {
-                                if (t.status !== 'needs_replanning') return;
-                                t.status = 'pending';
-                                t.pingAt = new Date(Date.now() + (REPING_MS[t.annoyance] ?? REPING_MS.med));
-                            });
+                            await settleRemindedTask(user.userId, dt.id);
                         } catch { /* best effort */ }
                     }
                 }
