@@ -54,6 +54,24 @@ class ReleaseGuardTest(unittest.TestCase):
     def test_missing_tag_can_be_published(self):
         self.assertEqual(verify(LOCAL, TAG, SHA, LATEST, FakeDocker()), 'missing')
 
+    def test_missing_tag_is_recognized_on_the_containerd_image_store(self):
+        error = f'Error response from daemon: failed to resolve reference "{TAG}": {TAG}: not found'
+        self.assertEqual(verify(LOCAL, TAG, SHA, LATEST, FakeDocker(pull_error=error)), 'missing')
+
+    def test_other_not_found_failures_stay_blocked(self):
+        for error in [
+            'dial tcp: lookup registry on 127.0.0.53:53: not found',
+            f'failed to resolve reference "{TAG}": failed to authorize: not found',
+            'registry/bot:' + 'b' * 40 + ': not found',
+        ]:
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(RuntimeError, 'Cannot establish'):
+                    verify(LOCAL, TAG, SHA, LATEST, FakeDocker(pull_error=error))
+
+    def test_a_blocked_release_reports_what_docker_said(self):
+        with self.assertRaisesRegex(RuntimeError, 'Docker said: connection timed out'):
+            verify(LOCAL, TAG, SHA, LATEST, FakeDocker(pull_error='connection timed out'))
+
     def test_identical_tag_is_harmless_on_rerun(self):
         self.assertEqual(verify(LOCAL, TAG, SHA, LATEST,
                                 FakeDocker(tag_id='candidate', latest_id='candidate', latest_revision=SHA)), 'present')

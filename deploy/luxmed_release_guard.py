@@ -42,10 +42,15 @@ def verify(local, sha_tag, revision, watched_tag, call=docker):
         if remote_id != local_id:
             raise RuntimeError('The SHA tag already exists with different image bytes.')
         return 'present'
-    error = (pull.stdout + pull.stderr).lower()
+    output = (pull.stdout + pull.stderr).strip()
+    error = output.lower()
     if 'manifest unknown' in error or 'manifest not found' in error or 'unknown manifest' in error:
         return 'missing'
-    raise RuntimeError('Cannot establish whether the SHA tag exists; registry publication is blocked.')
+    # The containerd image store, the default on Docker 29, reports a missing tag by
+    # naming it. Match this exact tag, because other failures also end in "not found".
+    if f'{sha_tag.lower()}: not found' in error:
+        return 'missing'
+    raise RuntimeError(f'Cannot establish whether the SHA tag exists; registry publication is blocked. Docker said: {output[:300]}')
 
 
 def make_pin(image, revision, run_id, call=docker):
