@@ -466,10 +466,18 @@ export function compactMessages(userId: number, startId: number, endId: number, 
     // Keep the first message's row (preserves ID ordering), update its content,
     // then delete the rest of the run. This avoids creating a new high-ID row
     // that would break ORDER BY id DESC queries.
+    // Compaction only ever rewrites the bot's own rows. Checked here as well as in the
+    // caller, because a wrong range deletes history and nothing can bring it back.
+    const userRows = db.prepare<[number, number, number], CountRow>(
+        `SELECT COUNT(*) as count FROM message_history WHERE user_id = ? AND id >= ? AND id <= ? AND role != 'assistant'`
+    ).get(userId, startId, endId)?.count ?? 0;
+    if (userRows > 0) {
+        throw new Error(`Refusing to compact ${startId}..${endId}: the range holds ${userRows} non-assistant rows`);
+    }
     const compact = db.transaction(() => {
         stmts.updateMessageContent.run(compactedContent, startId, userId);
         if (startId < endId) {
-            db.prepare('DELETE FROM message_history WHERE user_id = ? AND id > ? AND id <= ?')
+            db.prepare(`DELETE FROM message_history WHERE user_id = ? AND id > ? AND id <= ? AND role = 'assistant'`)
                 .run(userId, startId, endId);
         }
     });

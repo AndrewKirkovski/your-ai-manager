@@ -31,8 +31,11 @@ export function findCompactableRuns(history: MessageHistory[]): CompactableRun[]
 
     const addRun = (start: number, end: number) => {
         const firstCompactable = start > 0 ? start + 1 : start;
-        const msgs = history.slice(firstCompactable, end - VERBATIM_RUN_TAIL);
-        if (msgs.length < MIN_COMPACTABLE_ROWS) return;
+        const lastCompactable = end - VERBATIM_RUN_TAIL;
+        // Measured, not sliced first: near the start of a history this end index goes
+        // negative, and slice() would read it as counting from the end of the array.
+        if (lastCompactable - firstCompactable < MIN_COMPACTABLE_ROWS) return;
+        const msgs = history.slice(firstCompactable, lastCompactable);
         runs.push({
             startId: msgs[0].id,
             endId: msgs[msgs.length - 1].id,
