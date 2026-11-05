@@ -2,6 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { blankUser, scriptedProvider } from './ai-fixture.ts';
 
+// runStyleScan logs for every user, and each test here adds more users. The test runner
+// reads results from this process's stdout, and that much logging intermittently broke
+// the stream with "Unable to deserialize cloned data".
+console.log = () => {};
+
 process.env.DB_PATH = ':memory:';
 const { runStyleScan, userWordsInRow } = await import('../styleScan.ts');
 const { addMessageToHistory, getUserMemory, setUser, updateUserMemory } = await import('../userStore.ts');
